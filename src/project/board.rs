@@ -10,6 +10,7 @@ use crate::db::Db;
 use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, NewCard, Project};
+use crate::review::DiffCache;
 use crate::tmpl::Tmpl;
 
 pub const PERMISSION_MODES: &[(&str, &str)] = &[
@@ -149,6 +150,7 @@ pub fn delete_card(
     db: &State<Db>,
     agents: &State<Agents>,
     settings: &State<Settings>,
+    cache: &State<DiffCache>,
     id: i64,
 ) -> Result<Redirect, Status> {
     let project_id = {
@@ -156,7 +158,7 @@ pub fn delete_card(
         Card::find(&conn, id).ok_or(Status::NotFound)?.project_id
     };
 
-    session::teardown(db, agents, settings, id);
+    session::teardown(db, agents, settings, cache, id);
     Card::delete(&db.lock(), id).map_err(|_| Status::InternalServerError)?;
 
     Ok(Redirect::to(format!("/projects/{project_id}")))

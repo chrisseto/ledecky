@@ -1,14 +1,25 @@
-<div class="diff" id="diff">
+<div class="diff" id="diff"
+     data-diff-url="/cards/{{ card.id }}/diff"
+     data-scope="{{ scope }}"
+     data-context="{{ context }}">
   <div class="diff-bar">
-    <select class="scope" data-diff-scope="/cards/{{ card.id }}/diff">
-      {% for option in options %}
+    <select data-diff-param="scope">
+      {% for option in scopes %}
         <option value="{{ option.key }}" {% if option.selected %}selected{% endif %}>
           {{ option.label }}
         </option>
       {% endfor %}
     </select>
 
-    <a class="btn ghost" href="/cards/{{ card.id }}/diff?scope={{ scope }}"
+    <select data-diff-param="context" title="Context lines">
+      {% for option in contexts %}
+        <option value="{{ option.key }}" {% if option.selected %}selected{% endif %}>
+          {{ option.label }}
+        </option>
+      {% endfor %}
+    </select>
+
+    <a class="btn ghost" href="/cards/{{ card.id }}/diff?scope={{ scope }}&amp;context={{ context }}"
        up-follow up-target="#diff" title="Refresh">{{ icon("loader") }}</a>
 
     <span class="spacer"></span>
@@ -16,6 +27,7 @@
     {% if drafts %}
       <form method="post" action="/cards/{{ card.id }}/review" up-submit up-target="#diff">
         <input type="hidden" name="scope" value="{{ scope }}" />
+        <input type="hidden" name="context" value="{{ context }}" />
         <button class="primary" type="submit">
           {{ icon("message-square") }} Submit review ({{ drafts }})
         </button>
@@ -73,6 +85,7 @@
                                 action="/cards/{{ card.id }}/comments/{{ comment.id }}/delete"
                                 up-submit up-target="#diff">
                             <input type="hidden" name="scope" value="{{ scope }}" />
+                            <input type="hidden" name="context" value="{{ context }}" />
                             <button class="ghost" type="submit">{{ icon("trash-2") }}</button>
                           </form>
                         {% else %}
@@ -96,6 +109,7 @@
     <input type="hidden" name="side" />
     <input type="hidden" name="line" />
     <input type="hidden" name="scope" value="{{ scope }}" />
+    <input type="hidden" name="context" value="{{ context }}" />
     <textarea name="body" rows="3" placeholder="Leave a comment for the agent…"></textarea>
     <div class="comment-actions">
       <button class="primary" type="submit">{{ icon("check") }} Add comment</button>

@@ -185,14 +185,17 @@ up.compiler(".diff", (diff) => {
   form.querySelector("[data-cancel-comment]").addEventListener("click", close);
 });
 
-// ---- diff scope -------------------------------------------------------------
+// ---- diff scope and context -------------------------------------------------
+// The pane carries its own endpoint and current view, so a selector only has to
+// say which parameter it changes.
 
-up.compiler("[data-diff-scope]", (select) => {
+up.compiler("[data-diff-param]", (select) => {
   select.addEventListener("change", () => {
-    up.render({
-      target: "#diff",
-      url: `${select.dataset.diffScope}?scope=${encodeURIComponent(select.value)}`,
-      cache: false,
-    });
+    const diff = select.closest("[data-diff-url]");
+    const view = { scope: diff.dataset.scope, context: diff.dataset.context };
+    view[select.dataset.diffParam] = select.value;
+
+    const query = new URLSearchParams(view);
+    up.render({ target: "#diff", url: `${diff.dataset.diffUrl}?${query}`, cache: false });
   });
 });

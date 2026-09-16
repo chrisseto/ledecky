@@ -11,7 +11,7 @@ use crate::config::Settings;
 use crate::db::Db;
 use crate::hooks::HookAuth;
 use crate::project::{Card, Project};
-use crate::review;
+use crate::review::{self, DiffCache};
 use crate::tmpl::Tmpl;
 
 #[get("/cards/<id>?<scope>")]
@@ -19,6 +19,7 @@ pub fn focus(
     db: &State<Db>,
     agents: &State<Agents>,
     settings: &State<Settings>,
+    cache: &State<DiffCache>,
     id: i64,
     scope: Option<&str>,
 ) -> Result<Tmpl, Status> {
@@ -28,7 +29,7 @@ pub fn focus(
     drop(conn);
 
     let live = agents.get(id).is_some_and(|a| a.is_running());
-    let diff = review::routes::context(db, settings, id, scope)?;
+    let diff = review::routes::initial(db, settings, cache, id, scope)?;
 
     Ok(Tmpl("card.html", context! { project, live, ..diff }))
 }

@@ -329,7 +329,7 @@ header.top .branch { font-size: 12px; }
   background: var(--bg-sunken);
 }
 .diff-bar .spacer { flex: 1; }
-.diff-bar select.scope { width: auto; min-width: 150px; }
+.diff-bar select { width: auto; min-width: 120px; }
 
 .file {
   margin-bottom: 14px;
@@ -452,4 +452,30 @@ tr.l.commenting { outline: 1px solid var(--accent); }
   background: var(--bg-raised);
   font-size: 13px;
   white-space: pre-wrap;
+}
+
+/* ---- diff syntax tokens ---- */
+/*
+ * Delta emits a known palette which the server maps to these classes, so the
+ * colours live here rather than baked into the markup. Values are the
+ * base16-ocean.dark ones the pane used before, so the diff looks unchanged.
+ */
+
+.tok-keyword { color: #b48ead; }
+.tok-fn      { color: #8fa1b3; }
+.tok-type    { color: #ebcb8b; }
+.tok-string  { color: #a3be8c; }
+.tok-number  { color: #d08770; }
+.tok-comment { color: #65737e; font-style: italic; }
+.tok-punct   { color: #96b5b4; }
+.tok-text    { color: var(--fg); }
+
+/* The part of a line that actually changed, as opposed to the whole line. */
+tr.l-added .chg {
+  background: rgba(134, 201, 127, 0.28);
+  border-radius: 2px;
+}
+tr.l-removed .chg {
+  background: rgba(242, 119, 122, 0.28);
+  border-radius: 2px;
 }

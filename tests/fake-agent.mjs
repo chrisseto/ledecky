@@ -18,7 +18,7 @@
 // the base branch for real.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 
 const ESC = "\u001b";
 const PASTE_START = `${ESC}[200~`;
@@ -145,6 +145,13 @@ async function submit(prompt) {
     // Record the whole prompt so a test can prove what actually reached the agent.
     const detail = prompt.replace(/\s+/g, " ").trim().slice(0, 300);
     appendFileSync("main.rs", `// turn ${turn}: ${detail}\n`);
+
+    // Also rewrite one word of an existing line. An appended line has no
+    // counterpart to diff against, so without this there is no within-line
+    // change for the review pane to highlight.
+    const before = readFileSync("main.rs", "utf8");
+    writeFileSync("main.rs", before.replace(/"(hi|turn-\d+)"/, `"turn-${turn}"`));
+
     summary = `applied turn ${turn}`;
   }
 

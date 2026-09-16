@@ -10,6 +10,7 @@ use crate::db::Db;
 use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
+use crate::review::DiffCache;
 
 /// How long the TUI needs before it will accept pasted input.
 ///
@@ -143,7 +144,13 @@ pub fn stop(db: &Db, agents: &Agents, card_id: i64) {
 }
 
 /// Kills the agent and removes the worktree. Turn refs are kept.
-pub fn teardown(db: &Db, agents: &Agents, settings: &Settings, card_id: i64) {
+pub fn teardown(
+    db: &Db,
+    agents: &Agents,
+    settings: &Settings,
+    cache: &DiffCache,
+    card_id: i64,
+) {
     stop(db, agents, card_id);
 
     let conn = db.lock();
@@ -162,6 +169,8 @@ pub fn teardown(db: &Db, agents: &Agents, settings: &Settings, card_id: i64) {
         .map(PathBuf::from)
         .unwrap_or_else(|| settings.worktree_path(card_id));
     git::remove_worktree(&project.repo(), &worktree);
+    // The card's refs go with it, so anything parsed from them is dead weight.
+    cache.forget(&project.repo());
 
     Card::detach_worktree(&db.lock(), card_id);
 }
@@ -227,7 +236,13 @@ fn merge_landed(before: Option<&str>, after: &str, base_tree: Option<&str>, turn
 }
 
 /// Called after each turn snapshot while a merge is outstanding.
-pub fn check_merge(db: &Db, agents: &Agents, settings: &Settings, card_id: i64) {
+pub fn check_merge(
+    db: &Db,
+    agents: &Agents,
+    settings: &Settings,
+    cache: &DiffCache,
+    card_id: i64,
+) {
     let conn = db.lock();
     let Some(card) = Card::find(&conn, card_id).filter(|c| c.merge_requested) else {
         return;
@@ -262,7 +277,7 @@ pub fn check_merge(db: &Db, agents: &Agents, settings: &Settings, card_id: i64) 
         Card::set_lane(&conn, card_id, Lane::Done);
         Card::clear_merge_request(&conn, card_id);
     }
-    teardown(db, agents, settings, card_id);
+    teardown(db, agents, settings, cache, card_id);
 }
 
 /// Kills agents left behind by a server that did not shut down cleanly.

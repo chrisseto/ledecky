@@ -61,9 +61,10 @@ test("the diff pane renders the change with scopes for each turn", async ({ page
 
   const diff = page.locator("#diff");
   await expect(diff.locator(".file-head")).toContainText("main.rs");
-  await expect(diff.locator("tr.l-added")).toContainText(TASK);
+  // Two lines change per turn now: the appended record, and a rewritten word.
+  await expect(diff.locator("tr.l-added", { hasText: TASK })).toBeVisible();
 
-  await expect(diff.locator("select.scope option")).toHaveText([
+  await expect(diff.locator("[data-diff-param='scope'] option")).toHaveText([
     /All changes/,
     /Turn 1/,
     /Since turn 1/,
@@ -71,6 +72,52 @@ test("the diff pane renders the change with scopes for each turn", async ({ page
 
   // The agent's closing message is surfaced outside the terminal.
   await expect(diff.locator(".last-message")).toContainText("applied turn 1");
+});
+
+test("only the word that changed is marked, not the whole line", async ({ page }) => {
+  await page.goto(`/cards/${cardId}`);
+
+  // The agent rewrote `"hi"` to `"turn-1"` on an existing line.
+  const rewritten = page.locator("#diff tr.l-added", { hasText: "println!" });
+  await expect(rewritten).toBeVisible();
+
+  const marked = rewritten.locator(".chg");
+  await expect(marked).toHaveText("turn-1");
+
+  // `println!` is untouched, so it must not carry the marker.
+  await expect(rewritten.locator(".chg", { hasText: "println" })).toHaveCount(0);
+});
+
+test("syntax highlighting arrives as classes the page controls", async ({ page }) => {
+  await page.goto(`/cards/${cardId}`);
+
+  const diff = page.locator("#diff");
+  await expect(diff.locator(".tok-string").first()).toBeVisible();
+  await expect(diff.locator(".tok-comment").first()).toBeVisible();
+
+  // Colour belongs to the stylesheet, so nothing should carry an inline one.
+  await expect(diff.locator("td.code [style*='color']")).toHaveCount(0);
+});
+
+test("the context selector widens the window without another diff run", async ({ page }) => {
+  await page.goto(`/cards/${cardId}`);
+
+  const rows = page.locator("#diff tr.l");
+  const narrow = await rows.count();
+
+  // Selected by label: the value is usize::MAX, which JS cannot hold exactly.
+  await page.locator("[data-diff-param='context']").selectOption({ label: "Whole file" });
+
+  // Whole-file context shows strictly more of the file.
+  await expect.poll(() => rows.count()).toBeGreaterThan(narrow);
+
+  // And the widened view survives a comment landing on it.
+  await page.locator("#diff tr.l").first().click();
+  await page.locator(".comment-form textarea").fill("still wide?");
+  await page.getByRole("button", { name: "Add comment" }).click();
+
+  await expect(page.locator("#diff .comment")).toBeVisible();
+  await expect.poll(() => rows.count()).toBeGreaterThan(narrow);
 });
 
 test("a review comment goes back to the agent and produces its own turn", async ({ page }) => {

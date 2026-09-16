@@ -10,7 +10,7 @@ use crate::config::Settings;
 use crate::db::Db;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
-use crate::review::Turn;
+use crate::review::{DiffCache, Turn};
 
 /// Receives Claude Code's HTTP hooks. Always answers 200 with an empty decision:
 /// a hook that blocks or errors would stall the agent, and nothing here is worth
@@ -21,6 +21,7 @@ pub fn receive(
     agents: &State<Agents>,
     auth: &State<HookAuth>,
     settings: &State<Settings>,
+    cache: &State<DiffCache>,
     token: &str,
     card_id: i64,
     event: &str,
@@ -41,7 +42,7 @@ pub fn receive(
     match event {
         "prompt" => session::set_state(db, card_id, AgentState::Running),
         "permission" => session::set_state(db, card_id, AgentState::AwaitingPermission),
-        "stop" => on_stop(db, agents, settings, card_id, &payload),
+        "stop" => on_stop(db, agents, settings, cache, card_id, &payload),
         "end" => session::set_state(db, card_id, AgentState::Stopped),
         _ => {}
     }
@@ -49,7 +50,14 @@ pub fn receive(
     Ok(Json(json!({})))
 }
 
-fn on_stop(db: &Db, agents: &Agents, settings: &Settings, card_id: i64, payload: &Value) {
+fn on_stop(
+    db: &Db,
+    agents: &Agents,
+    settings: &Settings,
+    cache: &DiffCache,
+    card_id: i64,
+    payload: &Value,
+) {
     let last_message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
@@ -74,7 +82,7 @@ fn on_stop(db: &Db, agents: &Agents, settings: &Settings, card_id: i64, payload:
 
     // Last, so that a merge landing this turn overrides the lane and state set
     // above with Done and a torn-down worktree.
-    session::check_merge(db, agents, settings, card_id);
+    session::check_merge(db, agents, settings, cache, card_id);
 }
 
 /// A non-empty `background_tasks` means the turn ended but work is still in

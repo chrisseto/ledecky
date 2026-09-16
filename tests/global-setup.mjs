@@ -23,7 +23,13 @@ export default function globalSetup() {
   git(REPO, "config", "user.email", "e2e@kanban2.test");
   git(REPO, "config", "user.name", "kanban2 e2e");
   // The fake agent edits this file; keeping it small keeps diff assertions legible.
-  writeFileSync(join(REPO, "main.rs"), 'fn main() {\n    println!("hi");\n}\n');
+  // Long enough that a 3-line context window does not already show the whole
+  // file, so widening it is observable.
+  const filler = Array.from({ length: 24 }, (_, i) => `fn spare_${i}() -> u32 { ${i} }`);
+  writeFileSync(
+    join(REPO, "main.rs"),
+    `${filler.join("\n")}\n\nfn main() {\n    println!("hi");\n}\n`,
+  );
   writeFileSync(join(REPO, "README.md"), "# scratch\n");
   git(REPO, "add", "-A");
   git(REPO, "commit", "-qm", "init");

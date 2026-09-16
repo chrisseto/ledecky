@@ -47,6 +47,7 @@ fn rocket() -> _ {
         .manage(db)
         .manage(templates)
         .manage(agent::Agents::default())
+        .manage(review::DiffCache::default())
         .manage(hooks::HookAuth::new(port))
         .mount("/static", FileServer::from("static"))
         .mount("/", project::routes())

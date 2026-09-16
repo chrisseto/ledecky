@@ -40,8 +40,23 @@ own index is never disturbed.
 This is what makes the diff scopes work: `base..turn-N` for everything,
 `turn-(N-1)..turn-N` for one round, `turn-N..latest` for everything since.
 
-**Review.** Click any diff line to comment. *Submit review* formats the drafts
-into one message and pastes it into the agent's terminal.
+**Review.** The diff is rendered by piping `git diff` through [delta][] at full
+context. Full context is what makes highlighting correct: a block comment or
+string opened above the visible window would otherwise leave everything after it
+mis-coloured. Delta also marks the part of a line that actually changed, so a
+one-word edit reads as one word rather than a replaced line.
+
+Delta is run with its backgrounds pinned to sentinel colours, so its output is a
+vocabulary we control; `src/review/ansi.rs` maps those and the syntax palette to
+CSS classes, keeping the actual colours in `app.css`.
+
+The parse is cached per resolved commit pair and is independent of the context
+window, so the 3 / 10 / whole-file selector is a re-slice rather than another run.
+
+Click any diff line to comment. *Submit review* formats the drafts into one
+message and pastes it into the agent's terminal.
+
+[delta]: https://github.com/dandavison/delta
 
 **Merge.** Available in In Review. The server asks the agent to land its commits
 on the base branch and never rewrites branches itself. On the next turn it

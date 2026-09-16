@@ -29,6 +29,8 @@
             pkgs.nodejs_22
             pkgs.pnpm
             pkgs.esbuild
+            # The diff pane shells out to this; there is no fallback path.
+            pkgs.delta
           ];
 
           # Playwright's own browser download produces binaries that will not run
