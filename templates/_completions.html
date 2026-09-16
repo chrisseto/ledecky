@@ -1,0 +1,14 @@
+<ul class="completions" id="completions">
+  {% for entry in entries | default([]) %}
+    <li>
+      <button type="button" data-path="{{ entry.path }}/">
+        {% if entry.is_repo %}
+          <span class="repo">{{ icon("folder-git-2") }}</span>
+        {% else %}
+          <span class="dim">{{ icon("folder") }}</span>
+        {% endif %}
+        &nbsp;{{ entry.name }}
+      </button>
+    </li>
+  {% endfor %}
+</ul>

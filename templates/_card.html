@@ -1,0 +1,11 @@
+<article class="card" data-card-id="{{ card.id }}">
+  <a class="card-title" href="/cards/{{ card.id }}">{{ card.title }}</a>
+  <div class="card-meta">
+    <span class="branch mono">{{ icon("git-branch") }} {{ card.base_branch }}</span>
+    {% if card.agent_state != "stopped" %}
+      <span class="state state-{{ card.agent_state }}">
+        {{ icon("circle-dot") }} {{ card.agent_state_label }}
+      </span>
+    {% endif %}
+  </div>
+</article>

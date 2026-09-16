@@ -1,0 +1,17 @@
+{
+  "name": "kanban2-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "icons": "node web/scripts/icons.mjs",
+    "build": "pnpm icons && esbuild web/src/app.js --bundle --minify --format=iife --outfile=static/app.js && esbuild web/src/app.css --bundle --minify --outfile=static/app.css",
+    "watch": "pnpm icons && esbuild web/src/app.js web/src/app.css --bundle --sourcemap --format=iife --outdir=static --watch"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "lucide-static": "^0.563.0",
+    "sortablejs": "^1.15.6",
+    "unpoly": "^3.10.2"
+  }
+}

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}{{ card.title }} — kanban2{% endblock %}
+
+{% block breadcrumb %}
+  <a class="dim" href="/projects/{{ project.id }}">
+    {{ icon("arrow-left") }} {{ project.name }}
+  </a>
+  <span class="dim">/</span>
+  <strong>{{ card.title }}</strong>
+  <span class="branch mono dim">{{ icon("git-branch") }} {{ card.base_branch }}</span>
+{% endblock %}
+
+{% block actions %}
+  {% if card.lane == "in_review" %}
+    <form method="post" action="/cards/{{ card.id }}/merge" up-submit up-target="body">
+      <button class="primary" type="submit"
+              title="Ask the agent to apply its commits onto {{ card.base_branch }}">
+        {{ icon("git-merge") }} Merge into {{ card.base_branch }}
+      </button>
+    </form>
+  {% endif %}
+
+  {% if live %}
+    <form method="post" action="/cards/{{ card.id }}/stop" up-submit up-target="body">
+      <button class="ghost" type="submit">{{ icon("square") }} Stop agent</button>
+    </form>
+  {% else %}
+    <form method="post" action="/cards/{{ card.id }}/start" up-submit up-target="body">
+      <button class="primary" type="submit">{{ icon("play") }} Start agent</button>
+    </form>
+  {% endif %}
+{% endblock %}
+
+{% block main %}
+  <div class="split">
+    <section class="pane">
+      <header class="pane-head">
+        {{ icon("terminal") }} Agent
+        <span class="spacer"></span>
+        {% include "_state.html" %}
+      </header>
+      {% if live %}
+        <div class="terminal" data-terminal="/cards/{{ card.id }}/terminal"
+             data-resize-url="/cards/{{ card.id }}/resize"></div>
+      {% else %}
+        <div class="pane-body">
+          <p class="empty">
+            No agent running. Move this card to <strong>In Progress</strong>, or start one here.
+          </p>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="pane">
+      <header class="pane-head">{{ icon("file-diff") }} Review</header>
+      <div class="pane-body">
+        {% include "_diff.html" %}
+      </div>
+    </section>
+  </div>
+{% endblock %}

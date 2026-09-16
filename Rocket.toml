@@ -1,0 +1,5 @@
+[default]
+address = "127.0.0.1"
+# Fixed on purpose: hook URLs handed to `claude --settings` must be stable, and
+# stable enough for a user to put in `allowedHttpHookUrls` if they ever set it.
+port = 8770

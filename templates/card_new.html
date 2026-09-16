@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}New card — {{ project.name }}{% endblock %}
+
+{% block breadcrumb %}
+  <a class="dim" href="/projects/{{ project.id }}">
+    {{ icon("arrow-left") }} {{ project.name }}
+  </a>
+{% endblock %}
+
+{% block main %}
+  <div class="form-narrow">
+    <h1>New card</h1>
+
+    {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
+
+    <form method="post" action="/projects/{{ project.id }}/cards">
+      <label>
+        <span>Title</span>
+        <input name="title" autofocus required />
+      </label>
+
+      <label>
+        <span>Description — this becomes the agent's opening prompt</span>
+        <textarea name="description" rows="6"></textarea>
+      </label>
+
+      <label>
+        <span>Base branch</span>
+        <select name="base_branch" class="mono">
+          {% for branch in branches %}<option value="{{ branch }}">{{ branch }}</option>{% endfor %}
+        </select>
+      </label>
+
+      <label>
+        <span>Permissions</span>
+        <select name="permission_mode">
+          {% for mode, label in permission_modes %}
+            <option value="{{ mode }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        <span>Model</span>
+        <select name="model">
+          {% for value, label in models %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+      </label>
+
+      <button class="primary" type="submit">{{ icon("check") }} Create card</button>
+    </form>
+  </div>
+{% endblock %}
