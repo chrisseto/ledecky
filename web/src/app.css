@@ -184,13 +184,15 @@ label > span {
   display: grid;
   grid-template-columns: repeat(4, minmax(240px, 1fr));
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
+  min-height: calc(100vh - 48px - 48px);
 }
 
 .lane {
   display: flex;
   flex-direction: column;
   min-height: 120px;
+  max-height: calc(100vh - 48px - 48px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-sunken);
@@ -224,6 +226,8 @@ label > span {
   gap: 8px;
   padding: 8px;
   min-height: 60px;
+  flex: 1;
+  overflow-y: auto;
 }
 
 .card {
@@ -268,7 +272,7 @@ label > span {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
-  height: calc(100vh - 48px - 48px);
+  height: calc(100vh - 48px - 24px);
 }
 
 .pane {

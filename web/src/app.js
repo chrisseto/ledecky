@@ -1,9 +1,12 @@
-import up from "unpoly";
+// NB: unpoly ships a CommonJS bundle that only assigns `window.up` — it has no
+// usable default export, so this is an import for the side effect. Reading the
+// global is the supported way to reach the API.
+import "unpoly";
 import Sortable from "sortablejs";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-up.log.disable();
+const { up } = window;
 
 // ---- server-rendered autocomplete -------------------------------------------
 // The input names its own target and endpoint; every keystroke re-renders that
@@ -80,7 +83,7 @@ up.compiler("[data-terminal]", (host) => {
   const term = new Terminal({
     convertEol: false,
     cursorBlink: true,
-    fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono"),
+    fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono").trim(),
     fontSize: 13,
     scrollback: 5000,
     theme: { background: "#0a0c10", foreground: "#dbe0ea" },

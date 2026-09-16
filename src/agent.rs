@@ -187,7 +187,7 @@ impl Agents {
             })
             .context("opening a pty")?;
 
-        let mut cmd = CommandBuilder::new("claude");
+        let mut cmd = CommandBuilder::new(agent_bin());
         cmd.arg("--permission-mode");
         cmd.arg(&card.permission_mode);
         // Restarting a card picks the conversation back up rather than starting
@@ -315,4 +315,10 @@ mod tests {
         assert_eq!(paste_needle("go go go"), "go go go");
         assert_eq!(paste_needle(""), "");
     }
+}
+
+/// The Claude Code executable to spawn. Overridable so the end-to-end suite can
+/// substitute a scripted stand-in instead of a real agent.
+fn agent_bin() -> String {
+    std::env::var("KANBAN2_AGENT_BIN").unwrap_or_else(|_| "claude".into())
 }

@@ -2,3 +2,7 @@
 /static
 /node_modules
 .direnv
+
+tests/.artifacts
+tests/.report
+tests/.shots

@@ -1,0 +1,260 @@
+#!/usr/bin/env node
+//
+// A scripted stand-in for `claude`, used by the end-to-end suite.
+//
+// It imitates only the parts of the real TUI that kanban2 actually couples to:
+//
+//   * a full-height screen with the input box pinned near the bottom, because
+//     the server looks for its pasted text in the last rows of the terminal;
+//   * bracketed-paste handling, collapsing long pastes to "Pasted text" exactly
+//     as the real client does;
+//   * a modal that swallows pastes and treats a bare Enter as "exit", which is
+//     how the bypass-permissions consent dialog behaves — blind-Entering into
+//     one used to kill agents outright;
+//   * the HTTP hooks named in its own --settings argument.
+//
+// Each submitted prompt appends a line to main.rs so turn snapshots have
+// something to capture, and the merge prompt is understood well enough to move
+// the base branch for real.
+
+import { execFileSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
+
+const ESC = "\u001b";
+const PASTE_START = `${ESC}[200~`;
+const PASTE_END = `${ESC}[201~`;
+const ROWS = 40;
+
+const argv = process.argv.slice(2);
+const flag = (name) => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+
+const settings = JSON.parse(flag("--settings") ?? "{}");
+const hookUrl = (event) => settings.hooks?.[event]?.[0]?.hooks?.[0]?.url;
+const repo = flag("--add-dir");
+const title = flag("--name") ?? "card";
+const permissionMode = flag("--permission-mode") ?? "default";
+const sessionId = flag("--resume") ?? `fake-${process.pid}`;
+
+const out = (s) => process.stdout.write(s);
+const transcript = [
+  `fake-agent - ${title}`,
+  `cwd ${process.cwd()}`,
+  `mode ${permissionMode}`,
+  "",
+];
+
+// bypassPermissions shows a one-time consent dialog before anything else runs.
+let modal = permissionMode === "bypassPermissions" ? "consent" : null;
+/** The full text the composer holds. */
+let buffer = "";
+/** What the composer displays, which collapses for a long paste. */
+let shown = "";
+let turn = 0;
+
+function render() {
+  out(`${ESC}[2J${ESC}[H`);
+  out(transcript.slice(-20).join("\r\n"));
+
+  // Pin the input box near the bottom; the server only searches the last rows.
+  out(`${ESC}[${ROWS - 2};1H`);
+  if (modal === "consent") {
+    out("WARNING: Bypass Permissions mode\r\n  1. No, exit   2. Yes, I accept\r\nEnter to confirm");
+  } else if (modal === "permission") {
+    out("Bash command needs approval\r\n  1. Yes   2. No\r\nEnter to confirm");
+  } else {
+    out(`> ${shown}`);
+  }
+}
+
+async function hook(event, body) {
+  const url = hookUrl(event);
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        hook_event_name: event,
+        cwd: process.cwd(),
+        ...body,
+      }),
+    });
+  } catch {
+    // The server going away mid-run is not the fake agent's problem.
+  }
+}
+
+const git = (cwd, ...args) =>
+  execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+
+/** Applies the merge prompt: commit here, then fast-forward the base branch. */
+function performMerge(prompt) {
+  const branch = prompt.match(/Land it on `([^`]+)`/)?.[1];
+  if (!branch || !repo) return "could not work out the base branch";
+
+  git(process.cwd(), "add", "-A");
+  try {
+    git(
+      process.cwd(),
+      "-c",
+      "user.email=fake@agent",
+      "-c",
+      "user.name=fake agent",
+      "commit",
+      "-qm",
+      `work for ${title}`,
+    );
+  } catch {
+    // Nothing left to commit.
+  }
+
+  const sha = git(process.cwd(), "rev-parse", "HEAD");
+  git(repo, "merge", "--ff-only", sha);
+  return `merged ${sha} into ${branch}`;
+}
+
+async function submit(prompt) {
+  buffer = "";
+  shown = "";
+  turn += 1;
+  transcript.push(`> ${prompt.split("\n")[0]}`);
+  render();
+
+  await hook("UserPromptSubmit", { prompt });
+
+  // A marker in the prompt drives the permission path on demand.
+  if (prompt.includes("[needs-permission]")) {
+    modal = "permission";
+    render();
+    await hook("PermissionRequest", { tool_name: "Bash" });
+    return; // the turn resumes once the modal is answered
+  }
+
+  let summary;
+  if (prompt.startsWith("The reviewer approved this work.")) {
+    try {
+      summary = performMerge(prompt);
+    } catch (err) {
+      summary = `merge failed: ${err.message}`;
+    }
+  } else {
+    // Record the whole prompt so a test can prove what actually reached the agent.
+    const detail = prompt.replace(/\s+/g, " ").trim().slice(0, 300);
+    appendFileSync("main.rs", `// turn ${turn}: ${detail}\n`);
+    summary = `applied turn ${turn}`;
+  }
+
+  transcript.push(`* ${summary}`);
+  render();
+  await hook("Stop", {
+    last_assistant_message: summary,
+    background_tasks: [],
+    session_crons: [],
+  });
+}
+
+function answerModal(key) {
+  if (modal === "consent") {
+    if (key === "2") {
+      modal = null;
+      transcript.push("* bypass permissions accepted");
+      render();
+      return true;
+    }
+    if (key === "1" || key === "\r" || key === "\n") {
+      // Enter takes the highlighted option, which is "No, exit". The server is
+      // expected never to send a bare Enter into a modal.
+      transcript.push("* declined bypass permissions, exiting");
+      render();
+      hook("SessionEnd", { reason: "declined" }).then(() => process.exit(0));
+      return true;
+    }
+    return true; // everything else is swallowed by the modal
+  }
+
+  if (modal === "permission") {
+    if (key !== "1" && key !== "2") return true;
+    modal = null;
+    const allowed = key === "1";
+    transcript.push(allowed ? "* approved" : "* denied");
+    if (allowed) appendFileSync("main.rs", `// turn ${turn}: approved\n`);
+    render();
+    hook("Stop", {
+      last_assistant_message: allowed ? "approved and applied" : "denied",
+      background_tasks: [],
+    });
+    return true;
+  }
+
+  return false;
+}
+
+// ---- input ------------------------------------------------------------------
+
+let pasting = null; // accumulates while a bracketed paste is being received
+
+process.stdin.setRawMode?.(true);
+process.stdin.on("data", (chunk) => {
+  let text = chunk.toString("utf8");
+
+  while (text.length) {
+    if (pasting !== null) {
+      const end = text.indexOf(PASTE_END);
+      if (end === -1) {
+        pasting += text;
+        return;
+      }
+      pasting += text.slice(0, end);
+      text = text.slice(end + PASTE_END.length);
+
+      // A modal owns the keyboard, so the paste is dropped, as with the real client.
+      if (!modal) {
+        buffer = pasting;
+        shown =
+          pasting.length > 200
+            ? `[Pasted text #1 +${pasting.split("\n").length} lines]`
+            : pasting.replace(/\n/g, " ");
+      }
+      pasting = null;
+      render();
+      continue;
+    }
+
+    const start = text.indexOf(PASTE_START);
+    if (start !== -1) {
+      pasting = "";
+      text = text.slice(start + PASTE_START.length);
+      continue;
+    }
+
+    const key = text[0];
+    text = text.slice(1);
+
+    if (answerModal(key)) continue;
+
+    if (key === "\r" || key === "\n") {
+      if (buffer.trim()) submit(buffer);
+      continue;
+    }
+
+    if (key >= " ") {
+      buffer += key;
+      shown += key;
+      render();
+    }
+  }
+});
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.on(signal, () => {
+    hook("SessionEnd", { reason: signal }).finally(() => process.exit(0));
+  });
+}
+
+// Keep the process alive on a pty even while stdin is quiet.
+setInterval(() => {}, 1 << 30);
+render();

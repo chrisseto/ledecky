@@ -66,3 +66,38 @@ git -C <project> worktree prune
 git -C <project> for-each-ref --format='%(refname)' 'refs/kanban2/**' |
   xargs -n1 git -C <project> update-ref -d
 ```
+
+## Tests
+
+```sh
+cargo test    # diff parsing, paste-needle selection, scope round-tripping
+pnpm e2e      # end-to-end, in a real browser
+pnpm e2e:ui   # the same, in Playwright's interactive runner
+```
+
+The end-to-end suite drives Chromium from the nix store — `PLAYWRIGHT_BROWSERS_PATH`
+comes from the flake, because Playwright's own browser download produces binaries
+that will not run on NixOS. The npm `@playwright/test` version must match
+`playwright-driver` in nixpkgs; `$PLAYWRIGHT_VERSION` in the dev shell tells you
+which that is.
+
+Each run wipes `/tmp/kanban2-e2e`, builds a scratch repository there, and points
+the server at it via `XDG_DATA_HOME` — nothing touches a real board.
+
+### The fake agent
+
+`tests/fake-agent.mjs` stands in for `claude`, selected through
+`KANBAN2_AGENT_BIN`. It imitates only what the app couples to: an input box at
+the bottom of the screen, bracketed-paste handling that collapses long pastes,
+a modal that swallows pastes and reads a bare Enter as "exit", and the HTTP
+hooks named in its own `--settings`. That makes worktrees, turn snapshots, lane
+transitions, review submission and merge deterministic and free to run.
+
+`tests/modals.spec.mjs` is the regression guard worth knowing about: injection
+must verify its own paste landed before sending Enter, because a modal would
+otherwise be answered by it. Both it and the JS-boot coverage were checked by
+reintroducing the original bugs and confirming the suite goes red.
+
+`pnpm e2e tests/screenshots.spec.mjs` writes `tests/.shots/` for eyeballing the
+UI. The dev shell supplies fonts so that rendering is representative; without
+them the container has no monospace face at all.
