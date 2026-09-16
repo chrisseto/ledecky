@@ -4,64 +4,54 @@ extern crate rocket;
 mod agent;
 mod config;
 mod db;
-mod diff;
 mod git;
 mod hooks;
-mod models;
-mod queries;
-mod routes;
-mod session;
+mod project;
+mod review;
 mod tmpl;
 
 use anyhow::Context;
 use rocket::fairing::AdHoc;
+use rocket::figment::providers::Env;
 use rocket::fs::FileServer;
+
+use crate::config::Settings;
 
 #[launch]
 fn rocket() -> _ {
-    let db = db::Db::open()
+    // Rocket's own figment reads `Rocket.toml` and `ROCKET_*`; layering
+    // `KANBAN2_*` on top gives this app's keys an override that reads naturally
+    // and does not collide with Rocket's.
+    let figment = rocket::Config::figment().merge(Env::prefixed("KANBAN2_").global());
+    let rocket = rocket::custom(&figment);
+
+    let settings = Settings::from(&figment)
+        .context("reading settings")
+        .unwrap_or_else(|err| panic!("{err:#}"));
+
+    let db = db::Db::open(&settings)
         .context("opening the database")
-        .unwrap_or_else(|e| panic!("{e:#}"));
+        .unwrap_or_else(|err| panic!("{err:#}"));
 
     let templates = tmpl::Templates::load()
         .context("loading templates")
-        .unwrap_or_else(|e| panic!("{e:#}"));
+        .unwrap_or_else(|err| panic!("{err:#}"));
 
-    let rocket = rocket::build();
-    let port: u16 = rocket.figment().extract_inner("port").unwrap_or(8000);
+    // A previous run may have been killed without getting to its shutdown hook.
+    agent::session::sweep_orphans(&db, &settings);
+
+    let port: u16 = figment.extract_inner("port").unwrap_or(8000);
 
     rocket
+        .manage(settings)
         .manage(db)
         .manage(templates)
         .manage(agent::Agents::default())
         .manage(hooks::HookAuth::new(port))
         .mount("/static", FileServer::from("static"))
-        .mount(
-            "/",
-            routes![
-                routes::projects::index,
-                routes::projects::new,
-                routes::projects::create,
-                routes::projects::complete,
-                routes::board::board,
-                routes::board::new_card,
-                routes::board::create_card,
-                routes::board::move_card,
-                routes::board::delete_card,
-                routes::card::focus,
-                routes::card::state,
-                routes::card::merge,
-                routes::card::start,
-                routes::card::stop,
-                routes::card::resize,
-                routes::card::terminal,
-                routes::hooks::receive,
-                routes::review::diff_pane,
-                routes::review::add_comment,
-                routes::review::delete_comment,
-                routes::review::submit_review,
-            ],
-        )
+        .mount("/", project::routes())
+        .mount("/", agent::routes())
+        .mount("/", review::routes())
         // Live agents are children of this process; leaving them behind on exit
         // would strand worktrees with nothing driving them.
         .attach(AdHoc::on_shutdown("kill agents", |rocket| {

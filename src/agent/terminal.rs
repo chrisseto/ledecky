@@ -6,43 +6,38 @@ use rocket::{get, post, State};
 use rocket_ws as ws;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::agent::Agents;
+use crate::agent::{session, Agents};
+use crate::config::Settings;
 use crate::db::Db;
 use crate::hooks::HookAuth;
-use crate::queries;
-use crate::session;
-use crate::routes::review;
+use crate::project::{Card, Project};
+use crate::review;
 use crate::tmpl::Tmpl;
 
 #[get("/cards/<id>?<scope>")]
 pub fn focus(
     db: &State<Db>,
     agents: &State<Agents>,
+    settings: &State<Settings>,
     id: i64,
     scope: Option<&str>,
 ) -> Result<Tmpl, Status> {
     let conn = db.lock();
-    let card = queries::card(&conn, id).ok_or(Status::NotFound)?;
-    let project = queries::project(&conn, card.project_id).ok_or(Status::NotFound)?;
+    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
+    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
     drop(conn);
 
     let live = agents.get(id).is_some_and(|a| a.is_running());
-    let diff = review::diff_context(db, id, scope)?;
+    let diff = review::routes::context(db, settings, id, scope)?;
 
-    Ok(Tmpl(
-        "card.html",
-        context! { project, live, ..diff },
-    ))
+    Ok(Tmpl("card.html", context! { project, live, ..diff }))
 }
 
 /// Just the agent-state chip, so the focus view can poll it without re-running a
 /// diff every few seconds.
 #[get("/cards/<id>/state")]
 pub fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
-    let conn = db.lock();
-    let card = queries::card(&conn, id).ok_or(Status::NotFound)?;
-    drop(conn);
-
+    let card = Card::find(&db.lock(), id).ok_or(Status::NotFound)?;
     Ok(Tmpl("_state.html", context! { card }))
 }
 
@@ -51,12 +46,13 @@ pub fn start(
     db: &State<Db>,
     agents: &State<Agents>,
     auth: &State<HookAuth>,
+    settings: &State<Settings>,
     id: i64,
 ) -> Result<Status, Status> {
-    match session::start(db, agents, auth, id) {
+    match session::start(db, agents, auth, settings, id) {
         Ok(_) => Ok(Status::NoContent),
         Err(err) => {
-            error!("starting card {id}: {err:#}");
+            error!("card {id}: {err:#}");
             Err(Status::InternalServerError)
         }
     }
@@ -66,6 +62,17 @@ pub fn start(
 pub fn stop(db: &State<Db>, agents: &State<Agents>, id: i64) -> Status {
     session::stop(db, agents, id);
     Status::NoContent
+}
+
+#[post("/cards/<id>/merge")]
+pub fn merge(db: &State<Db>, agents: &State<Agents>, id: i64) -> Result<Status, Status> {
+    match session::request_merge(db, agents, id) {
+        Ok(()) => Ok(Status::NoContent),
+        Err(err) => {
+            warn!("card {id}: merge request failed: {err:#}");
+            Err(Status::Conflict)
+        }
+    }
 }
 
 #[derive(rocket::FromForm)]
@@ -88,7 +95,7 @@ pub fn resize(agents: &State<Agents>, id: i64, form: Form<ResizeForm>) -> Status
 /// Raw pty bytes in both directions. Everything else — resize, injection, merge —
 /// goes over ordinary HTTP so this socket stays a dumb pipe.
 #[get("/cards/<id>/terminal")]
-pub fn terminal(agents: &State<Agents>, id: i64, socket: ws::WebSocket) -> ws::Channel<'static> {
+pub fn socket(agents: &State<Agents>, id: i64, socket: ws::WebSocket) -> ws::Channel<'static> {
     let agent = agents.get(id);
 
     socket.channel(move |mut stream| {
@@ -124,15 +131,4 @@ pub fn terminal(agents: &State<Agents>, id: i64, socket: ws::WebSocket) -> ws::C
             Ok(())
         })
     })
-}
-
-#[post("/cards/<id>/merge")]
-pub fn merge(db: &State<Db>, agents: &State<Agents>, id: i64) -> Result<Status, Status> {
-    match session::request_merge(db, agents, id) {
-        Ok(()) => Ok(Status::NoContent),
-        Err(err) => {
-            warn!("card {id}: merge request failed: {err:#}");
-            Err(Status::Conflict)
-        }
-    }
 }

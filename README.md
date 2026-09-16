@@ -50,13 +50,36 @@ before marking the card Done and pruning the worktree. Turn refs are kept.
 
 ## Configuration
 
-`APP_SLUG` in `src/config.rs` names both the data directory and the git ref
-namespace. The port is fixed in `Rocket.toml` because hook URLs have to be
-stable.
+Settings live in `Rocket.toml` beside Rocket's own and are read from the same
+figment, so any of them can be overridden per-run with a `KANBAN2_` environment
+variable:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `app_slug` | `kanban2` | Names the data directory and the `refs/<slug>/` namespace |
+| `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
+| `agent_bin` | `claude` | The executable spawned for an agent |
+
+The port is fixed in `Rocket.toml` because hook URLs have to be stable.
 
 Per-card permission mode and model are set on the card form. `bypassPermissions`
 shows a one-time consent dialog in the terminal — answer it there; the card
 reports `needs permission` until you do.
+
+## Layout
+
+Code is grouped by domain rather than by kind, so a change usually lands in one
+folder:
+
+```
+src/project/   project.rs card.rs board.rs   models, their SQL, their routes
+src/agent/     agent.rs session.rs terminal.rs webhooks.rs
+src/review/    turn.rs comment.rs scope.rs diff.rs routes.rs
+src/           config.rs db.rs git.rs hooks.rs tmpl.rs
+```
+
+Each entity owns its own queries — `Card::find`, `Turn::latest`,
+`Comment::drafts` — rather than a shared query module.
 
 ## Cleaning up
 

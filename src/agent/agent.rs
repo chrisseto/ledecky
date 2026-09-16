@@ -8,7 +8,8 @@ use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
 
-use crate::models::Card;
+use crate::config::Settings;
+use crate::project::Card;
 
 const DEFAULT_ROWS: u16 = 40;
 const DEFAULT_COLS: u16 = 120;
@@ -24,6 +25,9 @@ const COMPOSER_ROWS: usize = 15;
 
 /// One live `claude` process attached to a pty.
 pub struct Agent {
+    /// Recorded so a later server run can sweep this up if we die without
+    /// getting the chance to.
+    pub pid: Option<i64>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -166,6 +170,7 @@ impl Agents {
     /// in the worktree.
     pub fn spawn(
         &self,
+        settings: &Settings,
         card: &Card,
         worktree: &Path,
         repo: &Path,
@@ -187,7 +192,7 @@ impl Agents {
             })
             .context("opening a pty")?;
 
-        let mut cmd = CommandBuilder::new(agent_bin());
+        let mut cmd = CommandBuilder::new(&settings.agent_bin);
         cmd.arg("--permission-mode");
         cmd.arg(&card.permission_mode);
         // Restarting a card picks the conversation back up rather than starting
@@ -226,6 +231,7 @@ impl Agents {
         let child = pty.slave.spawn_command(cmd).context("spawning claude")?;
         drop(pty.slave);
 
+        let pid = child.process_id().map(i64::from);
         let reader = pty.master.try_clone_reader()?;
         let writer = pty.master.take_writer()?;
 
@@ -237,12 +243,13 @@ impl Agents {
         )));
 
         let agent = Arc::new(Agent {
+            pid,
             master: Mutex::new(pty.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             screen: screen.clone(),
             output: output.clone(),
-            pending_prompt: Mutex::new(opening_prompt(card)),
+            pending_prompt: Mutex::new(card.opening_prompt()),
         });
 
         // portable-pty hands back a blocking reader, so it gets its own thread.
@@ -270,22 +277,6 @@ fn pump(
             }
         }
     }
-}
-
-/// The task to send once the TUI is up, or nothing when resuming — the agent
-/// already has the task in its transcript.
-fn opening_prompt(card: &Card) -> Option<String> {
-    if card.session_id.is_some() {
-        return None;
-    }
-
-    let description = card.description.trim();
-    let prompt = if description.is_empty() {
-        card.title.trim().to_owned()
-    } else {
-        format!("{}\n\n{description}", card.title.trim())
-    };
-    Some(prompt).filter(|p| !p.is_empty())
 }
 
 
@@ -317,8 +308,3 @@ mod tests {
     }
 }
 
-/// The Claude Code executable to spawn. Overridable so the end-to-end suite can
-/// substitute a scripted stand-in instead of a real agent.
-fn agent_bin() -> String {
-    std::env::var("KANBAN2_AGENT_BIN").unwrap_or_else(|_| "claude".into())
-}

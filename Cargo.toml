@@ -8,6 +8,7 @@ anyhow = "1"
 bytes = "1"
 minijinja = { version = "2", features = ["loader"] }
 portable-pty = "0.9"
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 rocket = { version = "0.5", features = ["json"] }
 rocket_ws = "0.1"
 rusqlite = { version = "0.40", features = ["bundled"] }

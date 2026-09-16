@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Result};
 
-use crate::config;
+use crate::config::Settings;
 
 /// Runs a git command in `repo` and returns trimmed stdout.
 pub fn run(repo: &Path, args: &[&str]) -> Result<String> {
@@ -44,7 +44,13 @@ pub fn head_branch(repo: &Path) -> Option<String> {
 
 /// Creates a detached worktree at `path` based on `base_branch`, and records the
 /// starting commit as `refs/{APP_SLUG}/<card>/base` so diffs have a fixed origin.
-pub fn create_worktree(repo: &Path, path: &Path, base_branch: &str, card_id: i64) -> Result<String> {
+pub fn create_worktree(
+    settings: &Settings,
+    repo: &Path,
+    path: &Path,
+    base_branch: &str,
+    card_id: i64,
+) -> Result<String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -58,7 +64,7 @@ pub fn create_worktree(repo: &Path, path: &Path, base_branch: &str, card_id: i64
         repo,
         &["worktree", "add", "--detach", &path.to_string_lossy(), &base_sha],
     )?;
-    run(repo, &["update-ref", &config::base_ref(card_id), &base_sha])?;
+    run(repo, &["update-ref", &settings.base_ref(card_id), &base_sha])?;
 
     Ok(base_sha)
 }
@@ -101,13 +107,14 @@ fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> 
 /// agent's own git commands on `index.lock`, and leave our staging behind for
 /// its next `git status` to report.
 pub fn snapshot_turn(
+    settings: &Settings,
     repo: &Path,
     worktree: &Path,
     card_id: i64,
     n: i64,
     parent: &str,
 ) -> Result<Option<String>> {
-    let index = config::card_dir(card_id).join("snapshot.index");
+    let index = settings.card_dir(card_id).join("snapshot.index");
     std::fs::create_dir_all(index.parent().unwrap())?;
     let _ = std::fs::remove_file(&index);
 
@@ -123,9 +130,9 @@ pub fn snapshot_turn(
     }
 
     let identity: &[(&str, &str)] = &[
-        ("GIT_AUTHOR_NAME", config::APP_SLUG),
+        ("GIT_AUTHOR_NAME", &settings.app_slug),
         ("GIT_AUTHOR_EMAIL", "kanban2@localhost"),
-        ("GIT_COMMITTER_NAME", config::APP_SLUG),
+        ("GIT_COMMITTER_NAME", &settings.app_slug),
         ("GIT_COMMITTER_EMAIL", "kanban2@localhost"),
     ];
     let sha = run_env(
@@ -134,6 +141,6 @@ pub fn snapshot_turn(
         identity,
     )?;
 
-    run(repo, &["update-ref", &config::turn_ref(card_id, n), &sha])?;
+    run(repo, &["update-ref", &settings.turn_ref(card_id, n), &sha])?;
     Ok(Some(sha))
 }
