@@ -147,11 +147,24 @@ pub struct NewCard<'a> {
     pub model: Option<&'a str>,
 }
 
+/// What a card's form can still change, before an agent has seen any of it.
+pub struct CardEdit<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+    pub base_branch: &'a str,
+    pub permission_mode: &'a str,
+    pub model: Option<&'a str>,
+}
+
 impl Card {
     const COLUMNS: &'static str =
         "id, project_id, title, description, base_branch, lane, position, \
          permission_mode, model, worktree_path, session_id, agent_pid, agent_state, \
          merge_requested, created_at, updated_at";
+
+    /// [`Card::editable`] as a `WHERE` clause, so the test and the write it
+    /// guards are one statement.
+    const EDITABLE: &'static str = "lane = 'todo' AND session_id IS NULL";
 
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let agent_state = AgentState::parse(&row.get::<_, String>("agent_state")?);
@@ -178,6 +191,12 @@ impl Card {
         })
     }
 
+    /// Whether the task can still be rewritten. Nothing has read it yet: the
+    /// card is waiting in To Do with no session behind it.
+    pub fn editable(&self) -> bool {
+        self.lane == Lane::Todo && self.session_id.is_none()
+    }
+
     /// The opening message for a fresh session, or nothing when resuming — the
     /// agent already has the task in its transcript.
     pub fn opening_prompt(&self) -> Option<String> {
@@ -193,6 +212,21 @@ impl Card {
         };
 
         Some(prompt).filter(|p| !p.is_empty())
+    }
+
+    /// The one field the card form edits, back out of the title and description.
+    pub fn task(&self) -> String {
+        let description = self.description.trim();
+        if description.is_empty() {
+            return self.title.clone();
+        }
+
+        // NB: a title that had to be shortened is a prefix of the task, which the
+        // description already holds whole — joining the two would repeat it.
+        match self.title.strip_suffix('…') {
+            Some(head) if description.starts_with(head) => description.to_owned(),
+            _ => format!("{}\n\n{description}", self.title),
+        }
     }
 
     // ---- queries ------------------------------------------------------------
@@ -256,6 +290,28 @@ impl Card {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Rewrites a card that has not been handed to an agent yet, reporting
+    /// whether it was still editable when the write landed.
+    pub fn update(conn: &Connection, id: i64, edit: CardEdit<'_>) -> rusqlite::Result<bool> {
+        let rows = conn.execute(
+            &format!(
+                "UPDATE cards SET title = ?1, description = ?2, base_branch = ?3,
+                     permission_mode = ?4, model = ?5, updated_at = datetime('now')
+                 WHERE id = ?6 AND {}",
+                Self::EDITABLE
+            ),
+            rusqlite::params![
+                edit.title,
+                edit.description,
+                edit.base_branch,
+                edit.permission_mode,
+                edit.model,
+                id
+            ],
+        )?;
+        Ok(rows > 0)
     }
 
     pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
@@ -513,5 +569,112 @@ mod tests {
         assert_eq!(candidates[0].id, live);
         assert_eq!(candidates[0].agent_pid, Some(4321));
         assert_eq!(Card::find(&conn, idle).unwrap().agent_pid, None);
+    }
+
+    #[test]
+    fn the_form_gets_its_task_back_whole() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        let bare = add(&conn, project_id, "Teach it to whistle");
+        assert_eq!(
+            Card::find(&conn, bare).unwrap().task(),
+            "Teach it to whistle"
+        );
+
+        let task = "Teach it to whistle\n\nOn startup, in C.";
+        let (title, description) = ("Teach it to whistle", "On startup, in C.");
+        let id = Card::create(
+            &conn,
+            NewCard {
+                project_id,
+                title,
+                description,
+                base_branch: "main",
+                permission_mode: "acceptEdits",
+                model: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(Card::find(&conn, id).unwrap().task(), task);
+    }
+
+    #[test]
+    fn a_shortened_title_is_not_repeated_in_the_task() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        // What the form's split hands back for an over-long first line: the
+        // description is the whole task, and the title a cut of its front.
+        let task = "x".repeat(70);
+        let id = Card::create(
+            &conn,
+            NewCard {
+                project_id,
+                title: &(task.chars().take(60).collect::<String>() + "…"),
+                description: &task,
+                base_branch: "main",
+                permission_mode: "acceptEdits",
+                model: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(Card::find(&conn, id).unwrap().task(), task);
+    }
+
+    fn rewrite(conn: &Connection, id: i64) -> bool {
+        Card::update(
+            conn,
+            id,
+            CardEdit {
+                title: "Teach it to hum",
+                description: "Quietly.",
+                base_branch: "release",
+                permission_mode: "plan",
+                model: Some("opus"),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_card_waiting_in_todo_can_still_be_rewritten() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        let id = add(&conn, project_id, "Teach it to whistle");
+        assert!(Card::find(&conn, id).unwrap().editable());
+        assert!(rewrite(&conn, id));
+
+        let card = Card::find(&conn, id).unwrap();
+        assert_eq!(card.task(), "Teach it to hum\n\nQuietly.");
+        assert_eq!(card.base_branch, "release");
+        assert_eq!(card.permission_mode, "plan");
+        assert_eq!(card.model.as_deref(), Some("opus"));
+        // The rewritten task is what the agent will be opened with.
+        assert_eq!(
+            card.opening_prompt().unwrap(),
+            "Teach it to hum\n\nQuietly."
+        );
+    }
+
+    #[test]
+    fn a_card_an_agent_has_seen_is_left_alone() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        let moved = add(&conn, project_id, "moved");
+        Card::set_lane(&conn, moved, Lane::InProgress);
+
+        // Back in To Do, but the session already holds the original task.
+        let started = add(&conn, project_id, "started");
+        Card::set_session_id(&conn, started, "session-1");
+
+        for id in [moved, started] {
+            assert!(!Card::find(&conn, id).unwrap().editable());
+            assert!(!rewrite(&conn, id));
+            assert_ne!(Card::find(&conn, id).unwrap().title, "Teach it to hum");
+        }
     }
 }

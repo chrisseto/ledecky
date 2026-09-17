@@ -4,7 +4,7 @@ pub mod board;
 pub mod card;
 pub mod project;
 
-pub use card::{AgentState, Card, Lane, NewCard};
+pub use card::{AgentState, Card, CardEdit, Lane, NewCard};
 pub use project::Project;
 
 /// Every route this domain serves.
@@ -18,6 +18,8 @@ pub fn routes() -> Vec<rocket::Route> {
         board::switcher,
         board::new_card,
         board::create_card,
+        board::edit_card,
+        board::update_card,
         board::move_card,
         board::move_card_to_lane,
         board::delete_card,

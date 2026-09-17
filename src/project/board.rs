@@ -9,7 +9,7 @@ use crate::config::Settings;
 use crate::db::Db;
 use crate::git;
 use crate::hooks::HookAuth;
-use crate::project::{AgentState, Card, Lane, NewCard, Project};
+use crate::project::{AgentState, Card, CardEdit, Lane, NewCard, Project};
 use crate::review::{DiffCache, Turn};
 use crate::tmpl::Tmpl;
 
@@ -34,6 +34,8 @@ pub const MODELS: &[(&str, &str)] = &[
 /// a card.
 const TITLE_MAX: usize = 60;
 
+const EMPTY_TASK: &str = "A card needs a task for the agent.";
+
 /// What is open over the board.
 ///
 /// The board is the only page: projects, a card and both forms are drawers and
@@ -43,6 +45,7 @@ pub const NOTHING: &str = "";
 pub const PROJECTS: &str = "projects";
 pub const CARD: &str = "card";
 pub const NEW_CARD: &str = "newcard";
+pub const EDIT_CARD: &str = "editcard";
 pub const ADD_PROJECT: &str = "addproject";
 
 /// Renders the board with an overlay over it.
@@ -172,24 +175,40 @@ pub fn new_card(
     id: i64,
 ) -> Result<Tmpl, Status> {
     let project = Project::find(&db.lock(), id).ok_or(Status::NotFound)?;
-    let branches = git::branches(&project.repo());
+    let form = form_context(&project, None, Fields::default(), None);
 
     Ok(Shell {
         db,
         settings,
         cache,
     }
-    .render(
-        Some(project),
-        NEW_CARD,
-        context! {
-            branches,
-            permission_modes => PERMISSION_MODES,
-            models => MODELS,
-            task => "",
-            error => Option::<String>::None,
-        },
-    ))
+    .render(Some(project), NEW_CARD, form))
+}
+
+/// The card form, on a card that has not been started yet.
+#[get("/cards/<id>/edit")]
+pub fn edit_card(
+    db: &State<Db>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    id: i64,
+) -> Result<Tmpl, Status> {
+    let conn = db.lock();
+    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
+    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
+    drop(conn);
+
+    if !card.editable() {
+        return Err(Status::Conflict);
+    }
+
+    let form = form_context(&project, Some(&card), Fields::of(&card), None);
+    Ok(Shell {
+        db,
+        settings,
+        cache,
+    }
+    .render(Some(project), EDIT_CARD, form))
 }
 
 #[derive(rocket::FromForm)]
@@ -201,6 +220,60 @@ pub struct CardForm {
     /// Set by the second submit button, which keeps the form open for the next
     /// card rather than returning to the board.
     more: Option<String>,
+}
+
+/// What the card form holds, wherever it came from: a card being edited, a
+/// submission that came back with an error, or the defaults.
+#[derive(Default)]
+struct Fields {
+    task: String,
+    base_branch: String,
+    permission_mode: String,
+    model: String,
+}
+
+impl Fields {
+    fn of(card: &Card) -> Self {
+        Self {
+            task: card.task(),
+            base_branch: card.base_branch.clone(),
+            permission_mode: card.permission_mode.clone(),
+            model: card.model.clone().unwrap_or_default(),
+        }
+    }
+
+    fn submitted(form: &CardForm) -> Self {
+        Self {
+            task: form.task.clone(),
+            base_branch: form.base_branch.clone(),
+            permission_mode: form.permission_mode.clone(),
+            model: form.model.clone(),
+        }
+    }
+}
+
+/// Everything `_modal_card.html` renders from. `card` is what makes it an edit
+/// rather than a new card.
+fn form_context(
+    project: &Project,
+    card: Option<&Card>,
+    fields: Fields,
+    error: Option<&str>,
+) -> minijinja::Value {
+    let branches = git::branches(&project.repo());
+    let base_branch = match fields.base_branch.is_empty() {
+        true => branches.first().cloned().unwrap_or_default(),
+        false => fields.base_branch,
+    };
+
+    context! {
+        card, error, branches, base_branch,
+        task => fields.task,
+        permission_mode => fields.permission_mode,
+        model => fields.model,
+        permission_modes => PERMISSION_MODES,
+        models => MODELS,
+    }
 }
 
 #[post("/projects/<id>/cards", data = "<form>")]
@@ -218,23 +291,13 @@ pub fn create_card(
 
     let (title, description) = split_task(&form.task);
     if title.is_empty() {
-        let branches = git::branches(&project.repo());
+        let context = form_context(&project, None, Fields::submitted(&form), Some(EMPTY_TASK));
         return Err(Shell {
             db,
             settings,
             cache,
         }
-        .render(
-            Some(project),
-            NEW_CARD,
-            context! {
-                branches,
-                permission_modes => PERMISSION_MODES,
-                models => MODELS,
-                task => form.task.clone(),
-                error => Some("A card needs a task for the agent."),
-            },
-        ));
+        .render(Some(project), NEW_CARD, context));
     }
 
     let created = Card::create(
@@ -257,6 +320,58 @@ pub fn create_card(
         Some(_) => Redirect::to(format!("/projects/{id}/cards/new")),
         None => Redirect::to(format!("/projects/{id}")),
     })
+}
+
+/// Rewrites a card that has not been started. Everything the form sets is only
+/// read when the session opens, so until then it is all still a draft.
+#[post("/cards/<id>", data = "<form>")]
+pub fn update_card(
+    db: &State<Db>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    id: i64,
+    form: Form<CardForm>,
+) -> Result<Result<Redirect, Tmpl>, Status> {
+    let conn = db.lock();
+    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
+    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
+    drop(conn);
+
+    let (title, description) = split_task(&form.task);
+    if title.is_empty() {
+        let context = form_context(
+            &project,
+            Some(&card),
+            Fields::submitted(&form),
+            Some(EMPTY_TASK),
+        );
+        return Ok(Err(Shell {
+            db,
+            settings,
+            cache,
+        }
+        .render(Some(project), EDIT_CARD, context)));
+    }
+
+    let edited = Card::update(
+        &db.lock(),
+        id,
+        CardEdit {
+            title: &title,
+            description: &description,
+            base_branch: form.base_branch.trim(),
+            permission_mode: permission_mode(&form.permission_mode),
+            model: Some(form.model.trim()).filter(|m| !m.is_empty()),
+        },
+    );
+
+    match edited {
+        Ok(true) => Ok(Ok(Redirect::to(format!("/cards/{id}")))),
+        // The card was started while the form was open: the agent has the old
+        // task already, so this edit would only pretend to have changed it.
+        Ok(false) => Err(Status::Conflict),
+        Err(_) => Err(Status::InternalServerError),
+    }
 }
 
 /// The card's title and the agent's opening prompt, out of the one field the

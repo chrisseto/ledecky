@@ -58,6 +58,11 @@
       </form>
     {% endif %}
 
+    {% if editable %}
+      <a class="btn" href="/cards/{{ card.id }}/edit" up-follow up-target="#overlay"
+         title="Change the task before an agent sees it">{{ icon("pencil") }} Edit</a>
+    {% endif %}
+
     {% if live %}
       <form method="post" action="/cards/{{ card.id }}/stop" up-submit up-target="body">
         <button class="btn accent" type="submit">{{ icon("square") }} Stop agent</button>

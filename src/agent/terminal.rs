@@ -38,7 +38,11 @@ pub fn focus(
         settings,
         cache,
     }
-    .render(Some(project), board::CARD, context! { live, ..review }))
+    .render(
+        Some(project),
+        board::CARD,
+        context! { live, editable => card.editable(), ..review },
+    ))
 }
 
 /// Just the agent-state chip, so the focus view can poll it without re-running a

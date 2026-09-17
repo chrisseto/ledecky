@@ -1,6 +1,15 @@
-<div class="modal modal-card" role="dialog" aria-label="New card">
-  <form method="post" action="/projects/{{ project.id }}/cards" up-submit up-target="body"
-        data-submit-shortcuts>
+{#
+  One form for both a new card and a card that has not been started yet: `card`
+  is what tells them apart. Nothing here is read until the session opens, so
+  until then every field is still a draft.
+#}
+{% set editing = card is defined and card %}
+
+<div class="modal modal-card" role="dialog"
+     aria-label="{% if editing %}Edit card{% else %}New card{% endif %}">
+  <form method="post"
+        action="{% if editing %}/cards/{{ card.id }}{% else %}/projects/{{ project.id }}/cards{% endif %}"
+        up-submit up-target="body" data-submit-shortcuts>
     {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
 
     <label>
@@ -13,7 +22,7 @@
       <label class="combo">
         <span>Base branch</span>
         <input name="base_branch" class="mono" autocomplete="off" spellcheck="false"
-               value="{{ branches[0] | default('') }}" placeholder="Search branches…"
+               value="{{ base_branch }}" placeholder="Search branches…"
                data-branch-filter />
         <div class="combo-menu" hidden>
           {% for branch in branches %}
@@ -26,7 +35,9 @@
       <label>
         <span>Model</span>
         <select name="model">
-          {% for value, label in models %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+          {% for value, label in models %}
+            <option value="{{ value }}" {% if value == model %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
         </select>
       </label>
     </div>
@@ -35,7 +46,7 @@
       <span>Permissions</span>
       <select name="permission_mode">
         {% for mode, label in permission_modes %}
-          <option value="{{ mode }}">{{ label }}</option>
+          <option value="{{ mode }}" {% if mode == permission_mode %}selected{% endif %}>{{ label }}</option>
         {% endfor %}
       </select>
     </label>
@@ -44,12 +55,20 @@
       <span class="dim">in {{ project.name }}</span>
       <span class="spacer"></span>
 
-      <button class="btn" type="submit" name="more" value="1">
-        Create more <kbd class="mono" aria-hidden="true">⌘⇧↵</kbd>
-      </button>
-      <button class="btn accent" type="submit">
-        Create <kbd class="mono" aria-hidden="true">⌘↵</kbd>
-      </button>
+      {% if editing %}
+        <a class="btn" href="/cards/{{ card.id }}" up-follow up-target="#overlay"
+           data-close-overlay>Cancel</a>
+        <button class="btn accent" type="submit">
+          {{ icon("check") }} Save <kbd class="mono" aria-hidden="true">⌘↵</kbd>
+        </button>
+      {% else %}
+        <button class="btn" type="submit" name="more" value="1">
+          Create more <kbd class="mono" aria-hidden="true">⌘⇧↵</kbd>
+        </button>
+        <button class="btn accent" type="submit">
+          Create <kbd class="mono" aria-hidden="true">⌘↵</kbd>
+        </button>
+      {% endif %}
     </footer>
   </form>
 </div>

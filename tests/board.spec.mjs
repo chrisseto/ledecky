@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, lane, moveCard, pollsOf } from "./support/board.mjs";
+import { addCard, addProject, cardIn, lane, moveCard, openCard, pollsOf } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -207,4 +207,59 @@ test("a card with nothing to review still offers the range picker", async ({ pag
   await expect(picker).toBeDisabled();
   await expect(picker.locator("option")).toHaveText([/All changes/]);
   await expect(page.locator("#diff-lines > .empty")).toContainText("Nothing yet on main");
+});
+
+test("a card waiting in To Do can have its task rewritten", async ({ page }) => {
+  await addCard(page, projectUrl, {
+    title: "Draft errand",
+    description: "First attempt.",
+    permissions: "acceptEdits",
+  });
+  const id = await cardIn(page, "todo", "Draft errand").getAttribute("data-card-id");
+
+  await openCard(page, id);
+  await page.locator(".drawer-card").getByRole("link", { name: "Edit" }).click();
+
+  // The form opens on the task as one field again, not the split the card stores.
+  const form = page.locator(".modal-card");
+  await expect(form.getByLabel("Task")).toHaveValue("Draft errand\n\nFirst attempt.");
+  await expect(form.getByLabel("Base branch")).toHaveValue("main");
+  await expect(form.getByLabel("Permissions")).toHaveValue("acceptEdits");
+
+  await form.getByLabel("Task").fill("Rewritten errand\n\nSecond attempt.");
+  await form.getByLabel("Base branch").fill("release");
+  await form.getByLabel("Permissions").selectOption("plan");
+  await form.getByRole("button", { name: "Save" }).click();
+
+  // Saving lands back on the card it edited.
+  await expect(page.locator(".drawer-card h2")).toHaveText("Rewritten errand");
+  await expect(page.locator(".drawer-card .branch")).toContainText("release");
+
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "todo", "Rewritten errand")).toBeVisible();
+  await expect(cardIn(page, "todo", "Draft errand")).toHaveCount(0);
+
+  // The whole task is what the form hands back, and what the agent would get.
+  await page.goto(`/cards/${id}/edit`);
+  await expect(form.getByLabel("Task")).toHaveValue("Rewritten errand\n\nSecond attempt.");
+  await expect(form.getByLabel("Permissions")).toHaveValue("plan");
+});
+
+test("a card that has left To Do is no longer a draft", async ({ page }) => {
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "todo", "Rewritten errand").getAttribute("data-card-id");
+  await moveCard(page, id, "done", 0);
+
+  await openCard(page, id);
+  await expect(page.locator(".drawer-card").getByRole("link", { name: "Edit" })).toHaveCount(0);
+
+  // And not just hidden: the endpoints turn it down too.
+  expect((await page.request.get(`/cards/${id}/edit`)).status()).toBe(409);
+  const refused = await page.request.post(`/cards/${id}`, {
+    form: { task: "Too late", base_branch: "main", permission_mode: "plan", model: "" },
+  });
+  expect(refused.status()).toBe(409);
+
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "done", "Rewritten errand")).toBeVisible();
 });

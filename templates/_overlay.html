@@ -5,12 +5,15 @@
   an open drawer is never torn down by something happening beside it.
 #}
 {% if overlay %}
-  <a class="scrim" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
+  {# Closing lands where the overlay was opened from: the edit form over a card
+     goes back to that card, everything else to the board. #}
+  <a class="scrim"
+     href="{% if overlay == 'editcard' %}/cards/{{ card.id }}{% elif project %}/projects/{{ project.id }}{% else %}/{% endif %}"
      up-follow up-target="#overlay" aria-label="Close" data-close-overlay></a>
 
   {% if overlay == "card" %}{% include "_drawer_card.html" %}
   {% elif overlay == "projects" %}{% include "_drawer_projects.html" %}
-  {% elif overlay == "newcard" %}{% include "_modal_card.html" %}
+  {% elif overlay == "newcard" or overlay == "editcard" %}{% include "_modal_card.html" %}
   {% elif overlay == "addproject" %}{% include "_modal_project.html" %}
   {% endif %}
 {% endif %}
