@@ -107,20 +107,14 @@ impl Agent {
         false
     }
 
-    /// The lines of the input box and of any dialog over it.
-    ///
-    /// NB: only the last few rows are searched, and only lines carrying the
-    /// TUI's prompt marker. The transcript above echoes earlier messages, and
-    /// the box's own border can carry a *queued* message — either would match a
-    /// whole-screen search and fire the submit key at nothing.
-    fn prompt_lines(&self) -> Vec<String> {
+    /// The input box, or the dialog standing in for it.
+    fn composer(&self) -> Vec<String> {
         let screen = self.screen.lock().unwrap();
         let contents = screen.screen().contents();
 
         let lines: Vec<&str> = contents.lines().collect();
-        lines[lines.len().saturating_sub(COMPOSER_ROWS)..]
+        composer_block(&lines)
             .iter()
-            .filter(|line| is_prompt_line(line))
             .map(|line| (*line).to_owned())
             .collect()
     }
@@ -130,18 +124,22 @@ impl Agent {
     /// A client that has not drawn one yet is still starting up, and a dialog
     /// over it leaves only its own highlighted options behind.
     pub fn is_composing(&self) -> bool {
-        self.prompt_lines().iter().any(|line| !is_menu_option(line))
+        self.composer()
+            .first()
+            .is_some_and(|line| !is_menu_option(line))
     }
 
     /// Whether a dialog is holding the keyboard, which is the user's to answer.
     pub fn is_blocked(&self) -> bool {
-        self.prompt_lines().iter().any(|line| is_menu_option(line))
+        self.composer()
+            .first()
+            .is_some_and(|line| is_menu_option(line))
     }
 
     /// True once `needle`, or the placeholder the TUI collapses a long paste to,
     /// is in the input box.
     fn holds(&self, needle: &str) -> bool {
-        self.prompt_lines()
+        self.composer()
             .iter()
             .any(|line| line.contains(needle) || line.contains("Pasted text"))
     }
@@ -336,6 +334,22 @@ fn pump(
     }
 }
 
+/// The prompt marker nearest the bottom of the screen, and everything under it.
+/// Empty while the client has yet to draw an input box.
+///
+/// NB: anchored at the marker rather than filtered to the lines carrying one.
+/// The client marks a message's *first* line only, so the words worth looking
+/// for usually sit on a continuation line — anchoring takes those in. It still
+/// leaves out the transcript above, which echoes what was just submitted and
+/// would otherwise read as a message still sitting unsent in the box.
+fn composer_block<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let window = lines.len().saturating_sub(COMPOSER_ROWS);
+    match lines.iter().rposition(|line| is_prompt_line(line)) {
+        Some(at) if at >= window => &lines[at..],
+        _ => &[],
+    }
+}
+
 /// Whether a line is one the TUI takes input on: its input box, or a dialog's
 /// highlighted option. `❯` is what the current client draws; `>` is what older
 /// ones — and the test stand-in — use.
@@ -368,7 +382,84 @@ fn paste_needle(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_menu_option, is_prompt_line, paste_needle};
+    use super::{composer_block, is_menu_option, is_prompt_line, paste_needle, COMPOSER_ROWS};
+
+    /// The composer holding a pasted message, as the client actually draws it:
+    /// the marker on the first line only, the rest plain.
+    const PASTED: &[&str] = &[
+        "  ⏺ an earlier turn that also said Investigate",
+        "────────────────────────────────────────────",
+        "❯ The board flashes whenever the poll returns",
+        "",
+        "  Investigate the unpoly fragment swapping.",
+        "────────────────────────────────────────────",
+        "  -- INSERT -- ⏸ plan mode on (shift+tab to cycle)",
+    ];
+
+    /// The same message a moment later: submitted, so it has moved up into the
+    /// transcript and the box is empty again.
+    const SUBMITTED: &[&str] = &[
+        "  The board flashes whenever the poll returns",
+        "  Investigate the unpoly fragment swapping.",
+        "  ⏺ Worked for 1s",
+        "────────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────────",
+        "  -- INSERT -- ⏸ plan mode on (shift+tab to cycle)",
+    ];
+
+    fn holds(lines: &[&str], needle: &str) -> bool {
+        composer_block(lines).iter().any(|l| l.contains(needle))
+    }
+
+    #[test]
+    fn a_pasted_message_is_found_on_its_continuation_line() {
+        // `paste_needle` picks the longest word, which lands below the marker.
+        assert_eq!(paste_needle("The board flashes whenever the poll returns\n\nInvestigate the unpoly fragment swapping."), "Investigate");
+        assert!(holds(PASTED, "Investigate"));
+    }
+
+    #[test]
+    fn the_transcript_above_the_box_is_not_the_box() {
+        // The words are still on screen, but they have been sent. Reading them
+        // as unsent is what re-pastes a message that already went in.
+        assert!(!holds(SUBMITTED, "Investigate"));
+        assert!(composer_block(SUBMITTED)
+            .first()
+            .is_some_and(|l| l.trim() == "❯"));
+    }
+
+    #[test]
+    fn an_echo_of_an_earlier_turn_is_left_above_the_anchor() {
+        assert!(!composer_block(PASTED)
+            .iter()
+            .any(|l| l.contains("an earlier turn")));
+    }
+
+    #[test]
+    fn a_client_with_no_input_box_yet_has_no_composer() {
+        let booting = &["  Loading…", "  ─────────", "  starting up"];
+        assert!(composer_block(booting).is_empty());
+    }
+
+    #[test]
+    fn a_dialog_is_the_composer_while_it_is_up() {
+        let dialog = &[
+            "  Do you trust the files in this folder?",
+            "❯ 1. Yes, I trust this folder",
+            "  2. No, exit",
+            "  Enter to confirm · Esc to cancel",
+        ];
+        let block = composer_block(dialog);
+        assert!(block.first().is_some_and(|l| is_menu_option(l)));
+    }
+
+    #[test]
+    fn a_marker_scrolled_out_of_the_window_is_not_reached_for() {
+        let mut lines = vec!["❯ far above"];
+        lines.extend(std::iter::repeat_n("  filler", COMPOSER_ROWS + 2));
+        assert!(composer_block(&lines).is_empty());
+    }
 
     #[test]
     fn the_input_box_is_a_prompt_line() {

@@ -9,6 +9,8 @@
 //   * a startup window with no input box at all, where anything sent is queued
 //     on the box's border rather than typed — text on screen that no Enter will
 //     submit, which the server must not mistake for a delivered prompt;
+//   * a composer that marks only the first line of a pasted message, leaving
+//     the rest plain — the server's needle usually lands on one of those;
 //   * bracketed-paste handling, collapsing long pastes to "Pasted text" exactly
 //     as the real client does;
 //   * a modal that swallows pastes and treats a bare Enter as "exit", which is
@@ -72,22 +74,38 @@ function render() {
   out(`${ESC}[2J${ESC}[H`);
   out(transcript.slice(-20).join("\r\n"));
 
-  // Pin the input box near the bottom; the server only searches the last rows.
-  // A modal replaces it with its own choices, marking the highlighted one the
-  // way the real client does — that marker is how the server tells a dialog
-  // holding the keyboard from a client that has not drawn a box yet.
-  out(`${ESC}[${ROWS - 3};1H`);
+  // A modal replaces the input box with its own choices, marking the
+  // highlighted one the way the real client does — that marker is how the
+  // server tells a dialog holding the keyboard from a client that has not drawn
+  // a box yet.
+  let block;
   if (booting) {
-    out(`${"─".repeat(20)} ${queued} ──\r\nstarting…`);
-    return;
-  }
-  if (modal === "consent") {
-    out("WARNING: Bypass Permissions mode\r\n❯ 1. No, exit\r\n  2. Yes, I accept\r\nEnter to confirm");
+    block = [border(), "starting…"];
+  } else if (modal === "consent") {
+    block = ["WARNING: Bypass Permissions mode", "❯ 1. No, exit", "  2. Yes, I accept", "Enter to confirm"];
   } else if (modal === "permission") {
-    out("Bash command needs approval\r\n❯ 1. Yes\r\n  2. No\r\nEnter to confirm");
+    block = ["Bash command needs approval", "❯ 1. Yes", "  2. No", "Enter to confirm"];
   } else {
-    out(`${"─".repeat(20)} ${queued} ──\r\n> ${shown}`);
+    block = composer();
   }
+
+  // Pin it to the bottom; the server only searches the last rows.
+  out(`${ESC}[${ROWS - block.length};1H`);
+  out(block.join("\r\n"));
+}
+
+const border = () => `${"─".repeat(20)} ${queued} ──`;
+
+/**
+ * The input box.
+ *
+ * A pasted message keeps the prompt marker on its first line only and runs
+ * plain from there, exactly as the real client draws it — so the word the
+ * server looks for is usually *not* on the marked line.
+ */
+function composer() {
+  const [first = "", ...rest] = shown.split("\n");
+  return [border(), `> ${first}`, ...rest.map((line) => `  ${line}`)];
 }
 
 async function hook(event, body) {
@@ -249,7 +267,7 @@ process.stdin.on("data", (chunk) => {
         shown =
           pasting.length > 200
             ? `[Pasted text #1 +${pasting.split("\n").length} lines]`
-            : pasting.replace(/\n/g, " ");
+            : pasting;
       }
       pasting = null;
       render();
