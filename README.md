@@ -1,4 +1,4 @@
-# kanban2
+# ledecky
 
 A local kanban board for Claude Code agents. Each card that reaches **In
 Progress** gets its own detached git worktree and a live `claude` process; the
@@ -29,7 +29,7 @@ toolchain on purpose, so `cargo` stays whatever you already use.
 `build.rs` runs `pnpm build` into `static/`, so the bundle the server reads off
 disk cannot be older than the server itself. It rebuilds when `web/` or the
 package files change, and when `static/` has gone missing — git ignores it, so
-nothing else would put it back. `KANBAN2_SKIP_ASSETS=1` leaves it alone, for a
+nothing else would put it back. `LEDECKY_SKIP_ASSETS=1` leaves it alone, for a
 build with no node toolchain to hand.
 
 `pnpm watch` rebuilds assets on change. Templates reload without a restart.
@@ -37,12 +37,12 @@ build with no node toolchain to hand.
 ## How it works
 
 **Worktrees.** Entering In Progress runs `git worktree add --detach` under
-`$XDG_DATA_HOME/kanban2/worktrees/<card>` and records the starting commit as
-`refs/kanban2/<card>/base`.
+`$XDG_DATA_HOME/ledecky/worktrees/<card>` and records the starting commit as
+`refs/ledecky/<card>/base`.
 
 **Turns.** Claude Code HTTP hooks, passed per-session via `--settings`, report
 each `Stop`. The server then commits the *working tree* as
-`refs/kanban2/<card>/turn-<n>` — the agent does not have to commit for a turn to
+`refs/ledecky/<card>/turn-<n>` — the agent does not have to commit for a turn to
 be captured. Staging happens in a scratch `GIT_INDEX_FILE`, so the worktree's
 own index is never disturbed.
 
@@ -101,12 +101,12 @@ before marking the card Done and pruning the worktree. Turn refs are kept.
 ## Configuration
 
 Settings live in `Rocket.toml` beside Rocket's own and are read from the same
-figment, so any of them can be overridden per-run with a `KANBAN2_` environment
+figment, so any of them can be overridden per-run with a `LEDECKY_` environment
 variable:
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `app_slug` | `kanban2` | Names the data directory and the `refs/<slug>/` namespace |
+| `app_slug` | `ledecky` | Names the data directory and the `refs/<slug>/` namespace |
 | `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
 | `agent_bin` | `claude` | The executable spawned for an agent |
 | `poll_interval` | `4000` | How often a polled fragment re-checks the server, in ms |
@@ -139,12 +139,25 @@ and one place that decides what is on screen.
 Each entity owns its own queries — `Card::find`, `Turn::latest`,
 `Comment::drafts` — rather than a shared query module.
 
+## Migrating an existing board
+
+The slug names the data directory, the database file, and the ref namespace,
+and the database stores absolute worktree paths and literal ref names — so a
+board created under an older slug needs more than a rename of the directory.
+`scripts/migrate-data-dir.sh` moves the directory, rewrites those rows, renames
+`refs/<old>/**` in every registered project, and repairs the worktrees:
+
+```sh
+DRY_RUN=1 scripts/migrate-data-dir.sh   # print the plan
+scripts/migrate-data-dir.sh             # then, with the server stopped
+```
+
 ## Cleaning up
 
 ```sh
-rm -rf ~/.local/share/kanban2
+rm -rf ~/.local/share/ledecky
 git -C <project> worktree prune
-git -C <project> for-each-ref --format='%(refname)' 'refs/kanban2/**' |
+git -C <project> for-each-ref --format='%(refname)' 'refs/ledecky/**' |
   xargs -n1 git -C <project> update-ref -d
 ```
 
@@ -162,13 +175,13 @@ that will not run on NixOS. The npm `@playwright/test` version must match
 `playwright-driver` in nixpkgs; `$PLAYWRIGHT_VERSION` in the dev shell tells you
 which that is.
 
-Each run wipes `/tmp/kanban2-e2e`, builds a scratch repository there, and points
+Each run wipes `/tmp/ledecky-e2e`, builds a scratch repository there, and points
 the server at it via `XDG_DATA_HOME` — nothing touches a real board.
 
 ### The fake agent
 
 `tests/fake-agent.mjs` stands in for `claude`, selected through
-`KANBAN2_AGENT_BIN`. It imitates only what the app couples to: an input box at
+`LEDECKY_AGENT_BIN`. It imitates only what the app couples to: an input box at
 the bottom of the screen, a startup window with no box at all where anything
 sent is queued out of its reach, bracketed-paste handling that collapses long
 pastes, a modal that swallows pastes and reads a bare Enter as "exit", and the

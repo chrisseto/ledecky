@@ -2,7 +2,7 @@
 //
 // A scripted stand-in for `claude`, used by the end-to-end suite.
 //
-// It imitates only the parts of the real TUI that kanban2 actually couples to:
+// It imitates only the parts of the real TUI that ledecky actually couples to:
 //
 //   * a full-height screen with the input box pinned near the bottom, because
 //     the server looks for its pasted text in the last rows of the terminal;

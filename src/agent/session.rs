@@ -457,7 +457,7 @@ mod tests {
     fn sweep_settings(data_dir: &Path) -> Settings {
         Settings::from(
             &rocket::figment::Figment::new()
-                .merge(Serialized::default("app_slug", "kanban2"))
+                .merge(Serialized::default("app_slug", "ledecky"))
                 .merge(Serialized::default(
                     "data_dir",
                     data_dir.to_string_lossy().to_string(),
@@ -478,7 +478,7 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("kanban2-sweep-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("ledecky-sweep-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path

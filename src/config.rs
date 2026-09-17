@@ -6,12 +6,11 @@ use rocket::serde::Deserialize;
 /// Application settings, read from the same figment Rocket uses.
 ///
 /// Keys live under `[default]` in `Rocket.toml` alongside Rocket's own, and can
-/// be overridden per-run with `KANBAN2_*` environment variables.
+/// be overridden per-run with `LEDECKY_*` environment variables.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(crate = "rocket::serde")]
 pub struct Settings {
-    /// Names this app's data directory and its git ref namespace. Distinct from
-    /// a bare `kanban` so the refs cannot collide with other tooling.
+    /// Names this app's data directory and its git ref namespace.
     pub app_slug: String,
 
     /// Root for the database, worktrees and per-card scratch space. Defaults to
@@ -30,7 +29,7 @@ pub struct Settings {
 impl Settings {
     /// Reads the settings, filling in the defaults that depend on `app_slug`.
     pub fn from(figment: &Figment) -> Result<Self, rocket::figment::Error> {
-        let app_slug: String = figment.extract_inner("app_slug").unwrap_or_else(|_| "kanban2".into());
+        let app_slug: String = figment.extract_inner("app_slug").unwrap_or_else(|_| "ledecky".into());
 
         let data_dir = figment
             .extract_inner::<PathBuf>("data_dir")
@@ -105,10 +104,10 @@ mod tests {
     #[test]
     fn defaults_come_from_the_slug() {
         let s = settings(&[("data_dir", "/srv/board")]);
-        assert_eq!(s.app_slug, "kanban2");
+        assert_eq!(s.app_slug, "ledecky");
         assert_eq!(s.agent_bin, "claude");
         assert_eq!(s.poll_interval, 4000);
-        assert_eq!(s.db_path(), PathBuf::from("/srv/board/kanban2.db"));
+        assert_eq!(s.db_path(), PathBuf::from("/srv/board/ledecky.db"));
     }
 
     #[test]

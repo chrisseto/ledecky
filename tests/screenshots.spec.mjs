@@ -18,7 +18,7 @@ test("capture the whole flow", async ({ page }) => {
   await shot(page, "01-empty");
 
   await page.goto("/projects/new");
-  await page.getByLabel("Repository directory").fill("/tmp/kanban2-e2e/");
+  await page.getByLabel("Repository directory").fill("/tmp/ledecky-e2e/");
   await expect(page.locator(".completions li").first()).toBeVisible();
   await shot(page, "02-add-project");
 

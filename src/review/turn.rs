@@ -156,8 +156,8 @@ mod tests {
         use rocket::figment::providers::Serialized;
         Settings::from(
             &rocket::figment::Figment::new()
-                .merge(Serialized::default("app_slug", "kanban2"))
-                .merge(Serialized::default("data_dir", "/tmp/kanban2-turn-test")),
+                .merge(Serialized::default("app_slug", "ledecky"))
+                .merge(Serialized::default("data_dir", "/tmp/ledecky-turn-test")),
         )
         .unwrap()
     }

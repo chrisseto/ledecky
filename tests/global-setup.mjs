@@ -15,8 +15,8 @@ export default function globalSetup() {
   mkdirSync(REPO, { recursive: true });
 
   git(REPO, "init", "-q", "-b", "main");
-  git(REPO, "config", "user.email", "e2e@kanban2.test");
-  git(REPO, "config", "user.name", "kanban2 e2e");
+  git(REPO, "config", "user.email", "e2e@ledecky.test");
+  git(REPO, "config", "user.name", "ledecky e2e");
   // The fake agent edits this file; keeping it small keeps diff assertions legible.
   // Long enough that a 3-line context window does not already show the whole
   // file, so widening it is observable.

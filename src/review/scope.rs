@@ -79,7 +79,7 @@ mod tests {
     fn settings() -> Settings {
         Settings::from(
             &rocket::figment::Figment::new()
-                .merge(Serialized::default("app_slug", "kanban2"))
+                .merge(Serialized::default("app_slug", "ledecky"))
                 .merge(Serialized::default("data_dir", "/tmp/x")),
         )
         .unwrap()
@@ -116,7 +116,7 @@ mod tests {
         let turns = [turn(1, "sha1"), turn(2, "sha2")];
         assert_eq!(
             Scope::All.revisions(&settings(), 7, &turns),
-            Some(("refs/kanban2/7/base".into(), "sha2".into()))
+            Some(("refs/ledecky/7/base".into(), "sha2".into()))
         );
     }
 
@@ -125,7 +125,7 @@ mod tests {
         let turns = [turn(1, "sha1"), turn(2, "sha2")];
         assert_eq!(
             Scope::Turn(1).revisions(&settings(), 7, &turns),
-            Some(("refs/kanban2/7/base".into(), "sha1".into()))
+            Some(("refs/ledecky/7/base".into(), "sha1".into()))
         );
     }
 

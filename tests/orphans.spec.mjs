@@ -8,7 +8,7 @@ import { expect, test } from "@playwright/test";
 // This spec runs its own server so it can kill it outright, which would take the
 // shared one down with it.
 const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const ROOT = "/tmp/kanban2-orphans";
+const ROOT = "/tmp/ledecky-orphans";
 const PORT = 8781;
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -53,7 +53,7 @@ function agentPid(worktreesDir) {
 function build() {
   execFileSync("cargo", ["build", "--quiet"], { cwd: PROJECT, stdio: "inherit" });
   const target = process.env.CARGO_TARGET_DIR ?? join(PROJECT, "target");
-  return join(target, "debug", "kanban2");
+  return join(target, "debug", "ledecky");
 }
 
 async function boot({ agentBin }) {
@@ -64,7 +64,7 @@ async function boot({ agentBin }) {
       ROCKET_PORT: String(PORT),
       ROCKET_LOG_LEVEL: "critical",
       XDG_DATA_HOME: join(ROOT, "data"),
-      KANBAN2_AGENT_BIN: agentBin,
+      LEDECKY_AGENT_BIN: agentBin,
     },
     stdio: "ignore",
   });
@@ -114,8 +114,8 @@ test.beforeEach(() => {
 
   const repo = join(ROOT, "repo");
   git(repo, "init", "-q", "-b", "main");
-  git(repo, "config", "user.email", "e2e@kanban2.test");
-  git(repo, "config", "user.name", "kanban2 e2e");
+  git(repo, "config", "user.email", "e2e@ledecky.test");
+  git(repo, "config", "user.name", "ledecky e2e");
   writeFileSync(join(repo, "main.rs"), "fn main() {}\n");
   git(repo, "add", "-A");
   git(repo, "commit", "-qm", "init");
@@ -132,7 +132,7 @@ test("SIGKILLing the server takes its agents with it", async ({ request }) => {
   server = await boot({ agentBin: join(PROJECT, "tests/fake-agent.mjs") });
   await startCard(request);
 
-  const worktrees = join(ROOT, "data/kanban2/worktrees");
+  const worktrees = join(ROOT, "data/ledecky/worktrees");
   await expect.poll(() => agentPid(worktrees), { timeout: 20_000 }).toBeTruthy();
   const pid = Number(agentPid(worktrees));
 

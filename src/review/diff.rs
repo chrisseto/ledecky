@@ -681,7 +681,7 @@ index 7b16f1f..333b15b 100644
         from: &str,
         to: &str,
     ) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kanban2-diff-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ledecky-diff-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -695,8 +695,8 @@ index 7b16f1f..333b15b 100644
         };
 
         git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "test@kanban2"]);
-        git(&["config", "user.name", "kanban2 test"]);
+        git(&["config", "user.email", "test@ledecky"]);
+        git(&["config", "user.name", "ledecky test"]);
         std::fs::write(dir.join(file), body).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "base"]);

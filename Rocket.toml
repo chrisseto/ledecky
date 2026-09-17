@@ -4,9 +4,8 @@ address = "127.0.0.1"
 # stable enough for a user to put in `allowedHttpHookUrls` if they ever set it.
 port = 8770
 
-# Names the data directory and the `refs/<app_slug>/<card>/` namespace. Not a
-# bare `kanban`, so the refs cannot collide with other tooling.
-app_slug = "kanban2"
+# Names the data directory and the `refs/<app_slug>/<card>/` namespace.
+app_slug = "ledecky"
 
 # The executable spawned for an agent. The end-to-end suite points this at a
 # scripted stand-in.

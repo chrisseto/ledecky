@@ -352,7 +352,7 @@ mod tests {
 
     /// Per-test directory; tests run concurrently, so the name has to be unique.
     fn tempdir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("kanban2-test-{}-{name}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ledecky-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path

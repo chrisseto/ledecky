@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 /// Set to serve whatever is already in `static/`, for builds without a node
 /// toolchain to hand.
-const SKIP: &str = "KANBAN2_SKIP_ASSETS";
+const SKIP: &str = "LEDECKY_SKIP_ASSETS";
 
 const SOURCES: &[&str] = &["web/src", "web/scripts", "package.json", "pnpm-lock.yaml"];
 const OUTPUTS: &[&str] = &["static/app.js", "static/app.css", "static/icons"];

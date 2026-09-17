@@ -40,8 +40,8 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
     .toMatch(new RegExp(`worktrees/${cardId}\\s+\\w+ \\(detached HEAD\\)`));
 
   // The starting commit is pinned so diffs have a fixed origin.
-  expect(git("for-each-ref", "--format=%(refname)", `refs/kanban2/${cardId}/base`)).toBe(
-    `refs/kanban2/${cardId}/base`,
+  expect(git("for-each-ref", "--format=%(refname)", `refs/ledecky/${cardId}/base`)).toBe(
+    `refs/ledecky/${cardId}/base`,
   );
 });
 
@@ -65,7 +65,7 @@ test("the opening task is delivered and the finished turn moves the card to In R
   await expect(cardIn(page, "in_review", TITLE).locator(".stat")).toContainText("+");
 
   // The snapshot captured the working tree even though the agent never committed.
-  expect(addedLines(`refs/kanban2/${cardId}/base`, `refs/kanban2/${cardId}/turn-1`)).toContain(TASK);
+  expect(addedLines(`refs/ledecky/${cardId}/base`, `refs/ledecky/${cardId}/turn-1`)).toContain(TASK);
 });
 
 test("the review pane lists the changed files with scopes for each turn", async ({ page }) => {
@@ -170,7 +170,7 @@ test("a review comment goes back to the agent and produces its own turn", async 
   await expectTurns(2);
 
   // Scoping to the second turn shows only what the review round added.
-  const scoped = addedLines(`refs/kanban2/${cardId}/turn-1`, `refs/kanban2/${cardId}/turn-2`);
+  const scoped = addedLines(`refs/ledecky/${cardId}/turn-1`, `refs/ledecky/${cardId}/turn-2`);
   expect(scoped).toContain("Say hello instead.");
   expect(scoped).not.toContain(TASK);
 });

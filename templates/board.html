@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>
       {% if card %}{{ card.title }} — {{ project.name }}
-      {% elif project %}{{ project.name }} — kanban2
-      {% else %}kanban2{% endif %}
+      {% elif project %}{{ project.name }} — ledecky
+      {% else %}ledecky{% endif %}
     </title>
     <link rel="stylesheet" href="/static/app.css" />
     <script src="/static/app.js" defer></script>
   </head>
   <body>
     <header class="top">
-      <span class="brand">kanban2</span>
+      <span class="brand">ledecky</span>
 
       {% if project %}
         <a class="switcher" href="/projects?board={{ project.id }}"

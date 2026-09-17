@@ -1,5 +1,5 @@
 {
-  description = "kanban2 — Claude Code kanban agent manager";
+  description = "ledecky — Claude Code kanban agent manager";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -31,6 +31,8 @@
             pkgs.esbuild
             # The diff pane shells out to this; there is no fallback path.
             pkgs.delta
+            # `scripts/migrate-data-dir.sh` rewrites the board database.
+            pkgs.sqlite
           ];
 
           # Playwright's own browser download produces binaries that will not run

@@ -20,9 +20,9 @@ use crate::config::Settings;
 #[launch]
 fn rocket() -> _ {
     // Rocket's own figment reads `Rocket.toml` and `ROCKET_*`; layering
-    // `KANBAN2_*` on top gives this app's keys an override that reads naturally
+    // `LEDECKY_*` on top gives this app's keys an override that reads naturally
     // and does not collide with Rocket's.
-    let figment = rocket::Config::figment().merge(Env::prefixed("KANBAN2_").global());
+    let figment = rocket::Config::figment().merge(Env::prefixed("LEDECKY_").global());
     let rocket = rocket::custom(&figment);
 
     let settings = Settings::from(&figment)

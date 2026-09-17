@@ -6,10 +6,10 @@ import { REPO } from "./paths.mjs";
 export const git = (...args) =>
   execFileSync("git", ["-C", REPO, ...args], { encoding: "utf8" }).trim();
 
-export const refs = (pattern = "refs/kanban2/**") =>
+export const refs = (pattern = "refs/ledecky/**") =>
   git("for-each-ref", "--format=%(refname)", pattern).split("\n").filter(Boolean);
 
-export const turnRefs = (cardId) => refs(`refs/kanban2/${cardId}/turn-*`);
+export const turnRefs = (cardId) => refs(`refs/ledecky/${cardId}/turn-*`);
 
 /**
  * The lines a range *adds*, without the surrounding context.

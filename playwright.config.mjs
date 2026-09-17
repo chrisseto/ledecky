@@ -2,7 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 import { DATA_HOME } from "./tests/support/paths.mjs";
 
-const PORT = Number(process.env.KANBAN2_TEST_PORT ?? 8771);
+const PORT = Number(process.env.LEDECKY_TEST_PORT ?? 8771);
 
 export const POLL_INTERVAL = 250;
 
@@ -42,10 +42,10 @@ export default defineConfig({
       // a test run never touches a real board. This has to be the same value
       // global-setup wipes, or a stale database survives into the next run.
       XDG_DATA_HOME: DATA_HOME,
-      KANBAN2_AGENT_BIN: process.env.KANBAN2_AGENT_BIN ?? new URL("tests/fake-agent.mjs", import.meta.url).pathname,
+      LEDECKY_AGENT_BIN: process.env.LEDECKY_AGENT_BIN ?? new URL("tests/fake-agent.mjs", import.meta.url).pathname,
       // Polls are conditional, so a fast interval costs a 304 and nothing else.
       // Tests can then observe several ticks without waiting in real time.
-      KANBAN2_POLL_INTERVAL: String(POLL_INTERVAL),
+      LEDECKY_POLL_INTERVAL: String(POLL_INTERVAL),
     },
   },
 });

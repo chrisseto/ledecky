@@ -151,9 +151,9 @@ pub fn snapshot_turn(
 
     let identity: &[(&str, &str)] = &[
         ("GIT_AUTHOR_NAME", &settings.app_slug),
-        ("GIT_AUTHOR_EMAIL", "kanban2@localhost"),
+        ("GIT_AUTHOR_EMAIL", "ledecky@localhost"),
         ("GIT_COMMITTER_NAME", &settings.app_slug),
-        ("GIT_COMMITTER_EMAIL", "kanban2@localhost"),
+        ("GIT_COMMITTER_EMAIL", "ledecky@localhost"),
     ];
     let sha = run_env(
         worktree,
