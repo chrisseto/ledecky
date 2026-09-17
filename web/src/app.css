@@ -565,28 +565,15 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 .drawer-card:has(#tab-agent:checked) .pane-agent,
 .drawer-card:has(#tab-review:checked) .pane-review { display: flex; }
 
-.pane-agent { padding: 16px; gap: 10px; }
+.pane-agent { padding: 16px; }
 .pane-agent .empty { margin: auto; max-width: 420px; }
-
-.terminal-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--border-card);
-  border-bottom: 0;
-  border-radius: 5px 5px 0 0;
-  background: var(--bg-raised);
-  font-size: 11px;
-  color: var(--fg-dim);
-}
 
 .terminal {
   flex: 1;
   min-height: 0;
   padding: 8px 10px;
   border: 1px solid var(--border-card);
-  border-radius: 0 0 5px 5px;
+  border-radius: 5px;
   background: var(--bg-deep);
 }
 .terminal .xterm { height: 100%; }

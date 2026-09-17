@@ -74,12 +74,6 @@
 
   <section class="pane pane-agent">
     {% if live %}
-      <div class="terminal-head mono">
-        <span class="pulse state-{{ card.agent_state }}"></span>
-        <span>{{ card.base_branch }}</span>
-        <span class="spacer"></span>
-        <span>pty</span>
-      </div>
       <div class="terminal" data-terminal="/cards/{{ card.id }}/terminal"
            data-resize-url="/cards/{{ card.id }}/resize"></div>
     {% else %}
