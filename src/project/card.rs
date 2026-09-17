@@ -284,6 +284,11 @@ impl Card {
         );
     }
 
+    /// Forgets the recorded session, so the next start opens a fresh one.
+    pub fn clear_session_id(conn: &Connection, id: i64) {
+        let _ = conn.execute("UPDATE cards SET session_id = NULL WHERE id = ?1", [id]);
+    }
+
     pub fn attach_worktree(conn: &Connection, id: i64, worktree: &str, pid: Option<i64>) {
         let _ = conn.execute(
             "UPDATE cards SET worktree_path = ?1, agent_pid = ?2, updated_at = datetime('now')

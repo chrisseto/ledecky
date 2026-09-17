@@ -35,8 +35,19 @@ pub fn receive(
 
     // Every event carries `session_id`, and `SessionStart` is unavailable over
     // HTTP, so learn it from whichever hook arrives first.
+    //
+    // NB: only if its transcript is on disk. With transcript saving off the
+    // client still reports an id, but `--resume` will never find it — and a
+    // card holding one of those could not be started again.
     if let Some(session_id) = payload.get("session_id").and_then(Value::as_str) {
-        Card::set_session_id(&db.lock(), card_id, session_id);
+        let saved = payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| std::path::Path::new(path).exists());
+
+        if saved {
+            Card::set_session_id(&db.lock(), card_id, session_id);
+        }
     }
 
     match event {

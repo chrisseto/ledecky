@@ -22,6 +22,10 @@ const READY_DELAY: Duration = Duration::from_millis(2500);
 /// concluding our URLs are not reaching us.
 const HOOK_GRACE: Duration = Duration::from_secs(15);
 
+/// How long to wait for a resumed session to prove itself one way or the other.
+const RESUME_POLL: Duration = Duration::from_millis(100);
+const RESUME_CHECKS: u32 = 50;
+
 /// How long to keep retrying the opening prompt while a modal holds the keyboard.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -63,7 +67,7 @@ pub fn start(
         Card::find(&conn, card_id).context("card vanished")?
     };
 
-    let agent = agents
+    let mut agent = agents
         .spawn(
             settings,
             &card,
@@ -73,6 +77,26 @@ pub fn start(
         )
         .context("spawning the agent")?;
 
+    // A recorded session can stop being resumable — a transcript that was never
+    // written, or one since pruned. `--resume` then exits before drawing
+    // anything, which would leave the card unable to start at all, so forget the
+    // session and come back without it.
+    if card.session_id.is_some() && !resumed(&agent) {
+        warn!("card {card_id}: the recorded session is gone; starting a fresh one");
+        Card::clear_session_id(&db.lock(), card_id);
+
+        let card = Card::find(&db.lock(), card_id).context("card vanished")?;
+        agent = agents
+            .spawn(
+                settings,
+                &card,
+                &worktree,
+                &repo,
+                &auth.settings_json(card_id),
+            )
+            .context("spawning the agent")?;
+    }
+
     Card::set_agent_pid(&db.lock(), card_id, agent.pid);
 
     let started = agent.clone();
@@ -80,6 +104,25 @@ pub fn start(
     std::thread::spawn(move || deliver_opening_prompt(db, started, card_id));
 
     Ok(agent)
+}
+
+/// Whether a `--resume` took.
+///
+/// The client draws its input box when the conversation was found and exits
+/// without drawing anything when it was not, so the two outcomes are told apart
+/// as soon as either shows — no waiting out the whole budget on a good start.
+/// An undecided run is treated as fine; the ordinary delivery path handles it.
+fn resumed(agent: &Agent) -> bool {
+    for _ in 0..RESUME_CHECKS {
+        if !agent.is_running() {
+            return false;
+        }
+        if agent.is_composing() || agent.is_blocked() {
+            return true;
+        }
+        std::thread::sleep(RESUME_POLL);
+    }
+    true
 }
 
 /// Keeps trying to hand the agent its opening task.

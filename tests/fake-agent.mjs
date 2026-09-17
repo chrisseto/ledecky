@@ -23,7 +23,8 @@
 // the base branch for real.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const ESC = "\u001b";
 const PASTE_START = `${ESC}[200~`;
@@ -41,7 +42,21 @@ const hookUrl = (event) => settings.hooks?.[event]?.[0]?.hooks?.[0]?.url;
 const repo = flag("--add-dir");
 const title = flag("--name") ?? "card";
 const permissionMode = flag("--permission-mode") ?? "default";
-const sessionId = flag("--resume") ?? `fake-${process.pid}`;
+const resuming = flag("--resume");
+const sessionId = resuming ?? `fake-${process.pid}`;
+
+// Sessions live on disk, as the real client's do, so that resuming one that was
+// never written — or has since been pruned — fails the way the real one fails:
+// a single line on stdout and a non-zero exit, with no TUI in between.
+const SESSIONS = join(process.env.XDG_DATA_HOME ?? "/tmp", "fake-agent-sessions");
+const transcriptPath = join(SESSIONS, `${sessionId}.jsonl`);
+
+if (resuming && !existsSync(transcriptPath)) {
+  process.stdout.write(`No conversation found with session ID: ${resuming}\n`);
+  process.exit(1);
+}
+mkdirSync(SESSIONS, { recursive: true });
+appendFileSync(transcriptPath, `${JSON.stringify({ session: sessionId })}\n`);
 
 const out = (s) => process.stdout.write(s);
 const transcript = [
@@ -117,6 +132,7 @@ async function hook(event, body) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         session_id: sessionId,
+        transcript_path: transcriptPath,
         hook_event_name: event,
         cwd: process.cwd(),
         ...body,
