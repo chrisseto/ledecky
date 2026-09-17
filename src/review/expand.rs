@@ -50,7 +50,8 @@ impl FileExpansion {
                     let Some(at) = term.find(['u', 'd']) else {
                         continue;
                     };
-                    let (Ok(index), Ok(lines)) = (term[..at].parse(), term[at + 1..].parse()) else {
+                    let (Ok(index), Ok(lines)) = (term[..at].parse(), term[at + 1..].parse())
+                    else {
                         continue;
                     };
 

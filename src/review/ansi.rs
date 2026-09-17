@@ -198,10 +198,7 @@ impl State {
     /// foreground in one sequence — so comparing the full parameter list would
     /// miss exactly the changed-region spans we care about.
     fn apply(&mut self, params: &str) {
-        let codes: Vec<u32> = params
-            .split(';')
-            .map(|p| p.parse().unwrap_or(0))
-            .collect();
+        let codes: Vec<u32> = params.split(';').map(|p| p.parse().unwrap_or(0)).collect();
 
         let mut i = 0;
         while i < codes.len() {
@@ -329,7 +326,10 @@ mod tests {
     fn an_unknown_colour_degrades_to_plain_text() {
         // What a palette drift looks like: readable, unstyled, not a crash.
         let raw = "\u{1b}[48;2;2;2;2m+\u{1b}[38;2;12;34;56mmystery\u{1b}[0m";
-        assert_eq!(classes(&parse_line(raw).unwrap()), [("mystery", DEFAULT_CLASS, false)]);
+        assert_eq!(
+            classes(&parse_line(raw).unwrap()),
+            [("mystery", DEFAULT_CLASS, false)]
+        );
     }
 
     #[test]
@@ -349,8 +349,12 @@ mod tests {
 
     #[test]
     fn adjacent_runs_of_the_same_style_are_merged() {
-        let raw = "\u{1b}[48;2;2;2;2m+\u{1b}[38;2;129;161;193mfn\u{1b}[38;2;129;161;193m x\u{1b}[0m";
-        assert_eq!(classes(&parse_line(raw).unwrap()), [("fn x", "tok-keyword", false)]);
+        let raw =
+            "\u{1b}[48;2;2;2;2m+\u{1b}[38;2;129;161;193mfn\u{1b}[38;2;129;161;193m x\u{1b}[0m";
+        assert_eq!(
+            classes(&parse_line(raw).unwrap()),
+            [("fn x", "tok-keyword", false)]
+        );
     }
 
     #[test]
@@ -358,7 +362,10 @@ mod tests {
         let raw = "\u{1b}[48;2;2;2;2m+\u{1b}[38;2;129;161;193m<T>\u{1b}[0m & plain";
         let html = parse_line(raw).unwrap().to_html();
 
-        assert_eq!(html, "<span class=\"tok-keyword\">&lt;T&gt;</span> &amp; plain");
+        assert_eq!(
+            html,
+            "<span class=\"tok-keyword\">&lt;T&gt;</span> &amp; plain"
+        );
     }
 
     #[test]

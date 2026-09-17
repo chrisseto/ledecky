@@ -46,7 +46,12 @@ impl Scope {
     ) -> Option<(String, String)> {
         let latest = turns.last()?;
         let base = settings.base_ref(card_id);
-        let at = |n: i64| turns.iter().find(|t| t.n == n).map(|t| t.commit_sha.clone());
+        let at = |n: i64| {
+            turns
+                .iter()
+                .find(|t| t.n == n)
+                .map(|t| t.commit_sha.clone())
+        };
 
         match self {
             Self::All => Some((base, latest.commit_sha.clone())),

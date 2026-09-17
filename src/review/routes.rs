@@ -211,8 +211,7 @@ fn pane(
 
             let ticked = viewed.contains(&file.path);
             // Asking for a big file once is enough; the expansion carries it.
-            let held_back =
-                (!ticked && !opened.shown() && length > MAX_LINES).then_some(length);
+            let held_back = (!ticked && !opened.shown() && length > MAX_LINES).then_some(length);
 
             let hunks: Vec<HunkView> = match ticked || held_back.is_some() || file.binary {
                 true => Vec::new(),
@@ -221,8 +220,22 @@ fn pane(
                     .into_iter()
                     .map(|hunk| HunkView {
                         header: hunk.header,
-                        above: gap(&link, &expansion, index, hunk.gaps.first, Dir::Up, hunk.gaps.above),
-                        below: gap(&link, &expansion, index, hunk.gaps.last, Dir::Down, hunk.gaps.below),
+                        above: gap(
+                            &link,
+                            &expansion,
+                            index,
+                            hunk.gaps.first,
+                            Dir::Up,
+                            hunk.gaps.above,
+                        ),
+                        below: gap(
+                            &link,
+                            &expansion,
+                            index,
+                            hunk.gaps.last,
+                            Dir::Down,
+                            hunk.gaps.below,
+                        ),
                         lines: hunk.lines,
                     })
                     .collect(),

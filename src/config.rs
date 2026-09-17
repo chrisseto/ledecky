@@ -29,7 +29,9 @@ pub struct Settings {
 impl Settings {
     /// Reads the settings, filling in the defaults that depend on `app_slug`.
     pub fn from(figment: &Figment) -> Result<Self, rocket::figment::Error> {
-        let app_slug: String = figment.extract_inner("app_slug").unwrap_or_else(|_| "ledecky".into());
+        let app_slug: String = figment
+            .extract_inner("app_slug")
+            .unwrap_or_else(|_| "ledecky".into());
 
         let data_dir = figment
             .extract_inner::<PathBuf>("data_dir")
@@ -74,7 +76,6 @@ impl Settings {
     pub fn turn_ref(&self, card_id: i64, n: i64) -> String {
         format!("refs/{}/{card_id}/turn-{n}", self.app_slug)
     }
-
 }
 
 fn default_data_dir(app_slug: &str) -> PathBuf {
@@ -124,9 +125,6 @@ mod tests {
     #[test]
     fn the_data_dir_follows_xdg_when_unset() {
         // Only the derivation is asserted; the process env is left alone.
-        assert_eq!(
-            default_data_dir("planner").file_name().unwrap(),
-            "planner",
-        );
+        assert_eq!(default_data_dir("planner").file_name().unwrap(), "planner",);
     }
 }

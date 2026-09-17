@@ -16,14 +16,15 @@ pub struct Templates {
 impl Templates {
     pub fn load() -> Result<Self> {
         let dir = std::path::Path::new("static/icons");
-        let entries = fs::read_dir(dir).with_context(|| {
-            format!("reading {} — run `pnpm build` first", dir.display())
-        })?;
+        let entries = fs::read_dir(dir)
+            .with_context(|| format!("reading {} — run `pnpm build` first", dir.display()))?;
 
         let mut icons = HashMap::new();
         for entry in entries {
             let path = entry?.path();
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let svg = fs::read_to_string(&path)?;
             icons.insert(name.to_owned(), normalize_svg(&svg, name));
         }

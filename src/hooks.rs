@@ -71,10 +71,7 @@ impl HookAuth {
                     url: self.url(card_id, path),
                     timeout: HOOK_TIMEOUT_SECS,
                 };
-                (
-                    (*event).to_owned(),
-                    json!([{ "hooks": [handler] }]),
-                )
+                ((*event).to_owned(), json!([{ "hooks": [handler] }]))
             })
             .collect();
 
@@ -93,10 +90,12 @@ fn random_token() -> String {
         .try_fill_bytes(&mut bytes)
         .expect("the OS random number generator is unavailable");
 
-    bytes.iter().fold(String::with_capacity(32), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 #[cfg(test)]
@@ -116,12 +115,7 @@ mod tests {
     #[test]
     fn only_the_issuing_token_is_accepted() {
         let auth = HookAuth::new(8770);
-        let token = auth
-            .url(1, "stop")
-            .split('/')
-            .nth(4)
-            .unwrap()
-            .to_owned();
+        let token = auth.url(1, "stop").split('/').nth(4).unwrap().to_owned();
 
         assert!(auth.matches(&token));
         assert!(!auth.matches("deadbeef"));

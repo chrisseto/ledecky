@@ -435,7 +435,10 @@ index 7b16f1f..333b15b 100644
     fn the_headers_never_read_as_content() {
         // `--- a/x` and `+++ b/x` start with diff markers but are not lines.
         let parsed = parse(SAMPLE).pop().unwrap();
-        assert_eq!(parsed.hunks(&FileExpansion::default()).hunks[0].lines.len(), 5);
+        assert_eq!(
+            parsed.hunks(&FileExpansion::default()).hunks[0].lines.len(),
+            5
+        );
     }
 
     #[test]
@@ -444,7 +447,10 @@ index 7b16f1f..333b15b 100644
             parse("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n")
                 .pop()
                 .unwrap();
-        assert_eq!(parsed.hunks(&FileExpansion::default()).hunks[0].lines.len(), 2);
+        assert_eq!(
+            parsed.hunks(&FileExpansion::default()).hunks[0].lines.len(),
+            2
+        );
     }
 
     #[test]
@@ -506,7 +512,10 @@ index 7b16f1f..333b15b 100644
 
     #[test]
     fn a_file_with_no_changes_has_no_hunks() {
-        assert!(sketch("cccc").hunks(&FileExpansion::default()).hunks.is_empty());
+        assert!(sketch("cccc")
+            .hunks(&FileExpansion::default())
+            .hunks
+            .is_empty());
     }
 
     // ---- expansion ----------------------------------------------------------

@@ -193,9 +193,11 @@ mod tests {
         Turn::record(&conn, &settings, card_id, 1, "sha1", "base", "");
 
         let ref_name: String = conn
-            .query_row("SELECT ref_name FROM turns WHERE card_id = ?1", [card_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT ref_name FROM turns WHERE card_id = ?1",
+                [card_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(ref_name, format!("refs/planner/{card_id}/turn-1"));
     }
