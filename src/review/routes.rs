@@ -19,6 +19,13 @@ use crate::tmpl::Tmpl;
 /// Lines one click of an expander opens up.
 const STEP: usize = 10;
 
+/// Rendered lines beyond which a file is held back behind a button.
+///
+/// Every file in the range is on the page at once and the whole pane re-renders
+/// on each comment, expansion and tick, so one regenerated lockfile would
+/// otherwise put megabytes on the wire every time.
+const MAX_LINES: usize = 2000;
+
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
 struct Choice {
@@ -31,13 +38,13 @@ struct Choice {
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
 struct FileNode {
+    index: usize,
     path: String,
     name: String,
     additions: u32,
     deletions: u32,
     comments: usize,
     viewed: bool,
-    selected: bool,
 }
 
 /// The files of one directory, so the tree can fold a directory away.
@@ -48,15 +55,15 @@ struct Group {
     files: Vec<FileNode>,
 }
 
-/// Lines still folded away on one side of a hunk, and the expansions that would
-/// take a bite out of them or open them entirely.
+/// Lines still folded away on one side of a hunk, and the views that would take
+/// a bite out of them or open them entirely.
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
 struct Gap {
     lines: usize,
     step: usize,
-    step_key: String,
-    all_key: String,
+    step_href: String,
+    all_href: String,
 }
 
 #[derive(Serialize)]
@@ -68,30 +75,45 @@ struct HunkView {
     below: Option<Gap>,
 }
 
+/// One file's diff, as the stacked pane renders it.
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct FileView {
+    index: usize,
+    path: String,
+    old_path: Option<String>,
+    additions: u32,
+    deletions: u32,
+    binary: bool,
+    /// Ticked off, so the diff is folded away until the tick comes off.
+    viewed: bool,
+    /// Lines this file would render, when that is enough to hold it back.
+    held_back: Option<usize>,
+    /// Asks for a held-back file anyway.
+    show_href: String,
+    /// Opens every hunk, when something is still folded.
+    expand_all_href: Option<String>,
+    hunks: Vec<HunkView>,
+}
+
 /// What the pane is currently showing. Carried on every form and link so a
 /// re-render after a comment lands back on the same view.
 #[derive(Debug, Clone, Copy, Default)]
 struct View<'a> {
     scope: Option<&'a str>,
-    file: Option<&'a str>,
     expand: Option<&'a str>,
 }
 
-#[get("/cards/<id>/diff?<scope>&<file>&<expand>")]
+#[get("/cards/<id>/diff?<scope>&<expand>")]
 pub fn diff_pane(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
     scope: Option<&str>,
-    file: Option<&str>,
     expand: Option<&str>,
 ) -> Result<Tmpl, Status> {
-    let view = View {
-        scope,
-        file,
-        expand,
-    };
+    let view = View { scope, expand };
     Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
 }
 
@@ -154,9 +176,8 @@ fn pane(
             .push(comment.clone());
     }
 
-    // The parse is independent of what is on screen and cached, so selecting a
-    // file or opening a hunk is a re-slice rather than another run of git and
-    // delta.
+    // The parse is independent of what is on screen and cached, so opening a
+    // hunk is a re-slice rather than another run of git and delta.
     let files = match scope.revisions(settings, id, &turns) {
         Some((from, to)) => cache.get(&project.repo(), &from, &to).map_err(|err| {
             error!("card {id}: diffing {from}..{to}: {err:#}");
@@ -165,42 +186,72 @@ fn pane(
         None => Default::default(),
     };
 
-    // A file named in the query wins, but only while it is still in the diff:
-    // narrowing the scope can drop the file that was open.
-    let selected = view
-        .file
-        .filter(|path| files.iter().any(|file| file.path == *path))
-        .map(str::to_owned)
-        .or_else(|| files.first().map(|file| file.path.clone()));
-
     let counts = |path: &str| comments.iter().filter(|c| c.file_path == path).count();
-    let tree = group(&files, selected.as_deref(), &viewed, counts);
+    let tree = group(&files, &viewed, counts);
 
-    let open = selected
-        .as_deref()
-        .and_then(|path| files.iter().find(|file| file.path == path));
-    let collapsed = open.is_some_and(|file| viewed.contains(&file.path));
-
-    // A viewed file is ticked off, so its diff is folded away entirely until the
-    // tick comes off again.
-    let hunks: Vec<HunkView> = match open.filter(|_| !collapsed) {
-        Some(file) => file
-            .hunks(&expansion)
-            .hunks
-            .into_iter()
-            .map(|hunk| HunkView {
-                header: hunk.header,
-                lines: hunk.lines,
-                above: gap(&expansion, hunk.gaps.first, Dir::Up, hunk.gaps.above),
-                below: gap(&expansion, hunk.gaps.last, Dir::Down, hunk.gaps.below),
-            })
-            .collect(),
-        None => Vec::new(),
+    // Every link out of the pane is this same view with one more thing opened,
+    // built here so no template has to concatenate a query string.
+    let scope_key = scope.key();
+    let link = |expansion: &Expansion| {
+        rocket::uri!(diff_pane(
+            id = id,
+            scope = Some(scope_key.as_str()),
+            expand = Some(expansion.key())
+        ))
+        .to_string()
     };
 
-    let folded = hunks
+    let rendered: Vec<FileView> = files
         .iter()
-        .any(|hunk| hunk.above.is_some() || hunk.below.is_some());
+        .enumerate()
+        .map(|(index, file)| {
+            let opened = expansion.file(index);
+            let diff = file.hunks(&opened);
+            let length: usize = diff.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+
+            let ticked = viewed.contains(&file.path);
+            // Asking for a big file once is enough; the expansion carries it.
+            let held_back =
+                (!ticked && !opened.shown() && length > MAX_LINES).then_some(length);
+
+            let hunks: Vec<HunkView> = match ticked || held_back.is_some() || file.binary {
+                true => Vec::new(),
+                false => diff
+                    .hunks
+                    .into_iter()
+                    .map(|hunk| HunkView {
+                        header: hunk.header,
+                        above: gap(&link, &expansion, index, hunk.gaps.first, Dir::Up, hunk.gaps.above),
+                        below: gap(&link, &expansion, index, hunk.gaps.last, Dir::Down, hunk.gaps.below),
+                        lines: hunk.lines,
+                    })
+                    .collect(),
+            };
+
+            let folded = hunks
+                .iter()
+                .any(|hunk| hunk.above.is_some() || hunk.below.is_some());
+
+            FileView {
+                index,
+                path: file.path.clone(),
+                old_path: file.old_path.clone(),
+                additions: file.additions,
+                deletions: file.deletions,
+                binary: file.binary,
+                viewed: ticked,
+                held_back,
+                show_href: link(&expansion.showing(index)),
+                expand_all_href: folded.then(|| link(&expansion.whole_file(index))),
+                hunks,
+            }
+        })
+        .collect();
+
+    let totals = (
+        files.iter().map(|file| file.additions).sum::<u32>(),
+        files.iter().map(|file| file.deletions).sum::<u32>(),
+    );
 
     // The agent's closing words for the most recent turn — how a failed merge or
     // an unanswered question surfaces outside the terminal.
@@ -218,27 +269,30 @@ fn pane(
     });
 
     Ok(context! {
-        card, tree, hunks, threads, scopes, drafts, submitted, last_message, turn_note,
-        file => open.map(|file| context! {
-            path => file.path.clone(),
-            additions => file.additions,
-            deletions => file.deletions,
-            binary => file.binary,
-            collapsed,
-        }),
-        can_expand_all => folded,
+        card, tree, threads, scopes, drafts, submitted, last_message, turn_note,
+        files => rendered,
+        has_diff => !files.is_empty(),
+        additions => totals.0,
+        deletions => totals.1,
         scope => scope.key(),
         expand => expansion.key(),
     })
 }
 
 /// The expansion a button hands back, or nothing when that side is already open.
-fn gap(expansion: &Expansion, hunk: usize, dir: Dir, lines: usize) -> Option<Gap> {
+fn gap(
+    link: &impl Fn(&Expansion) -> String,
+    expansion: &Expansion,
+    file: usize,
+    hunk: usize,
+    dir: Dir,
+    lines: usize,
+) -> Option<Gap> {
     (lines > 0).then(|| Gap {
         lines,
         step: STEP.min(lines),
-        step_key: expansion.plus(hunk, dir, STEP.min(lines)).key(),
-        all_key: expansion.plus(hunk, dir, lines).key(),
+        step_href: link(&expansion.plus(file, hunk, dir, STEP.min(lines))),
+        all_href: link(&expansion.plus(file, hunk, dir, lines)),
     })
 }
 
@@ -246,26 +300,25 @@ fn gap(expansion: &Expansion, hunk: usize, dir: Dir, lines: usize) -> Option<Gap
 /// lists them.
 fn group(
     files: &[ParsedFile],
-    selected: Option<&str>,
     viewed: &std::collections::HashSet<String>,
     comments: impl Fn(&str) -> usize,
 ) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
 
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
         let (dir, name) = match file.path.rsplit_once('/') {
             Some((dir, name)) => (dir, name),
             None => ("", file.path.as_str()),
         };
 
         let node = FileNode {
+            index,
             path: file.path.clone(),
             name: name.to_owned(),
             additions: file.additions,
             deletions: file.deletions,
             comments: comments(&file.path),
             viewed: viewed.contains(&file.path),
-            selected: selected == Some(file.path.as_str()),
         };
 
         match groups.iter_mut().find(|group| group.dir == dir) {
@@ -284,7 +337,6 @@ fn group(
 pub struct ViewForm {
     #[field(default = String::new())]
     scope: String,
-    file: Option<String>,
     expand: Option<String>,
 }
 
@@ -292,7 +344,6 @@ impl ViewForm {
     fn view(&self) -> View<'_> {
         View {
             scope: Some(&self.scope),
-            file: self.file.as_deref(),
             expand: self.expand.as_deref(),
         }
     }
@@ -306,7 +357,6 @@ pub struct CommentForm {
     body: String,
     #[field(default = String::new())]
     scope: String,
-    file: Option<String>,
     expand: Option<String>,
 }
 
@@ -336,7 +386,6 @@ pub fn add_comment(
 
     let view = View {
         scope: Some(&form.scope),
-        file: form.file.as_deref(),
         expand: form.expand.as_deref(),
     };
     Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
@@ -380,10 +429,10 @@ pub struct ViewedForm {
     file_path: String,
     #[field(default = String::new())]
     scope: String,
+    expand: Option<String>,
 }
 
-/// Ticks a file off, or puts it back. The pane re-renders around the tick, so
-/// whatever hunks were open are deliberately forgotten.
+/// Ticks a file off, or puts it back.
 #[post("/cards/<id>/viewed", data = "<form>")]
 pub fn toggle_viewed(
     db: &State<Db>,
@@ -396,8 +445,7 @@ pub fn toggle_viewed(
 
     let view = View {
         scope: Some(&form.scope),
-        file: Some(&form.file_path),
-        expand: None,
+        expand: form.expand.as_deref(),
     };
     Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
 }

@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use rocket::serde::Serialize;
 
 use crate::review::ansi::{self, Marker, MINUS_BG, MINUS_EMPH_BG, PLUS_BG, PLUS_EMPH_BG};
-use crate::review::Expansion;
+use crate::review::expand::FileExpansion;
 
 /// Context large enough to cover any file, so delta sees the whole thing.
 ///
@@ -93,7 +93,7 @@ pub struct FileDiff {
 impl ParsedFile {
     /// Slices the file down to the changed regions plus [`CONTEXT`] lines either
     /// side, widened by whatever the reader has opened up.
-    pub fn hunks(&self, expansion: &Expansion) -> FileDiff {
+    pub fn hunks(&self, expansion: &FileExpansion) -> FileDiff {
         FileDiff {
             path: self.path.clone(),
             old_path: self.old_path.clone(),
@@ -111,7 +111,7 @@ impl ParsedFile {
     /// stays valid as neighbours grow into each other: when two hunks merge, the
     /// surviving run is still bounded by the first hunk's gap above and the last
     /// hunk's gap below.
-    fn windows(&self, expansion: &Expansion) -> Vec<Hunk> {
+    fn windows(&self, expansion: &FileExpansion) -> Vec<Hunk> {
         let total = self.lines.len();
 
         let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
@@ -414,7 +414,7 @@ index 7b16f1f..333b15b 100644
     #[test]
     fn numbers_lines_from_the_hunk_header() {
         let parsed = parse(SAMPLE).pop().unwrap();
-        let lines = &parsed.hunks(&Expansion::default()).hunks[0].lines;
+        let lines = &parsed.hunks(&FileExpansion::default()).hunks[0].lines;
 
         assert_eq!(lines[0].kind, LineKind::Context);
         assert_eq!((lines[0].old_line, lines[0].new_line), (Some(1), Some(1)));
@@ -435,7 +435,7 @@ index 7b16f1f..333b15b 100644
     fn the_headers_never_read_as_content() {
         // `--- a/x` and `+++ b/x` start with diff markers but are not lines.
         let parsed = parse(SAMPLE).pop().unwrap();
-        assert_eq!(parsed.hunks(&Expansion::default()).hunks[0].lines.len(), 5);
+        assert_eq!(parsed.hunks(&FileExpansion::default()).hunks[0].lines.len(), 5);
     }
 
     #[test]
@@ -444,7 +444,7 @@ index 7b16f1f..333b15b 100644
             parse("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\n")
                 .pop()
                 .unwrap();
-        assert_eq!(parsed.hunks(&Expansion::default()).hunks[0].lines.len(), 2);
+        assert_eq!(parsed.hunks(&FileExpansion::default()).hunks[0].lines.len(), 2);
     }
 
     #[test]
@@ -456,7 +456,7 @@ index 7b16f1f..333b15b 100644
         .unwrap();
 
         assert!(parsed.binary);
-        assert!(parsed.hunks(&Expansion::default()).hunks.is_empty());
+        assert!(parsed.hunks(&FileExpansion::default()).hunks.is_empty());
     }
 
     #[test]
@@ -466,7 +466,7 @@ index 7b16f1f..333b15b 100644
         ));
 
         assert_eq!(files.len(), 2);
-        let second = files[1].hunks(&Expansion::default()).hunks[0].lines[0].new_line;
+        let second = files[1].hunks(&FileExpansion::default()).hunks[0].lines[0].new_line;
         assert_eq!(second, Some(1));
     }
 
@@ -481,7 +481,7 @@ index 7b16f1f..333b15b 100644
     #[test]
     fn a_single_change_is_padded_on_both_sides() {
         let parsed = sketch("cccccaccccc");
-        let hunks = parsed.hunks(&Expansion::default()).hunks;
+        let hunks = parsed.hunks(&FileExpansion::default()).hunks;
 
         assert_eq!(hunks.len(), 1);
         // CONTEXT lines either side of the change at index 5.
@@ -490,13 +490,13 @@ index 7b16f1f..333b15b 100644
 
     #[test]
     fn distant_changes_stay_separate() {
-        assert_eq!(pair().hunks(&Expansion::default()).hunks.len(), 2);
+        assert_eq!(pair().hunks(&FileExpansion::default()).hunks.len(), 2);
     }
 
     #[test]
     fn the_window_clamps_at_the_edges_of_the_file() {
         let parsed = sketch("accca");
-        let hunks = parsed.hunks(&Expansion::default()).hunks;
+        let hunks = parsed.hunks(&FileExpansion::default()).hunks;
 
         // More padding than the file has lines yields the whole file, once.
         assert_eq!(hunks.len(), 1);
@@ -506,14 +506,14 @@ index 7b16f1f..333b15b 100644
 
     #[test]
     fn a_file_with_no_changes_has_no_hunks() {
-        assert!(sketch("cccc").hunks(&Expansion::default()).hunks.is_empty());
+        assert!(sketch("cccc").hunks(&FileExpansion::default()).hunks.is_empty());
     }
 
     // ---- expansion ----------------------------------------------------------
 
     #[test]
     fn the_gaps_report_what_is_still_folded_away() {
-        let hunks = pair().hunks(&Expansion::default()).hunks;
+        let hunks = pair().hunks(&FileExpansion::default()).hunks;
 
         // Nothing above the first hunk or below the last; the six lines between
         // them are split between the two facing gaps.
@@ -524,7 +524,7 @@ index 7b16f1f..333b15b 100644
     #[test]
     fn expanding_one_hunk_takes_lines_from_its_gap() {
         let hunks = pair()
-            .hunks(&Expansion::default().plus(0, Dir::Down, 2))
+            .hunks(&FileExpansion::default().plus(0, Dir::Down, 2))
             .hunks;
 
         assert_eq!(hunks.len(), 2);
@@ -536,7 +536,7 @@ index 7b16f1f..333b15b 100644
     #[test]
     fn hunks_merge_once_expansion_closes_the_gap() {
         let hunks = pair()
-            .hunks(&Expansion::default().plus(0, Dir::Down, 4))
+            .hunks(&FileExpansion::default().plus(0, Dir::Down, 4))
             .hunks;
 
         assert_eq!(hunks.len(), 1);
@@ -550,7 +550,7 @@ index 7b16f1f..333b15b 100644
     fn the_whole_file_expansion_does_not_overflow() {
         // Every hunk opens by usize::MAX, which naive padding would wrap.
         let hunks = pair()
-            .hunks(&Expansion::parse(Some(Expansion::WHOLE_FILE)))
+            .hunks(&FileExpansion::parse(FileExpansion::WHOLE_FILE))
             .hunks;
 
         assert_eq!(hunks.len(), 1);
@@ -562,7 +562,7 @@ index 7b16f1f..333b15b 100644
     fn an_expansion_naming_a_hunk_that_does_not_exist_is_ignored() {
         // Keys outlive the file they were made against — a stale one from
         // another file must not change what this one shows.
-        let stale = Expansion::default().plus(9, Dir::Up, 40);
+        let stale = FileExpansion::default().plus(9, Dir::Up, 40);
         assert_eq!(pair().hunks(&stale).hunks.len(), 2);
     }
 
@@ -592,7 +592,7 @@ index 7b16f1f..333b15b 100644
 
         let files = between(&repo, "HEAD~1", "HEAD").expect("the pipeline ran");
         let html: String = files[0]
-            .hunks(&Expansion::parse(Some(Expansion::WHOLE_FILE)))
+            .hunks(&FileExpansion::parse(FileExpansion::WHOLE_FILE))
             .hunks
             .iter()
             .flat_map(|h| h.lines.iter())
@@ -627,7 +627,7 @@ index 7b16f1f..333b15b 100644
 
         let files = between(&repo, "HEAD~1", "HEAD").expect("the pipeline ran");
         let added = files[0]
-            .hunks(&Expansion::default())
+            .hunks(&FileExpansion::default())
             .hunks
             .iter()
             .flat_map(|h| h.lines.clone())
@@ -658,7 +658,7 @@ index 7b16f1f..333b15b 100644
 
         let files = between(&repo, "HEAD~1", "HEAD").expect("the pipeline ran");
         let added = files[0]
-            .hunks(&Expansion::default())
+            .hunks(&FileExpansion::default())
             .hunks
             .iter()
             .flat_map(|h| h.lines.clone())
@@ -714,7 +714,7 @@ index 7b16f1f..333b15b 100644
         // the added line does not, so the sides disagree — which is the point of
         // the format.
         let parsed = sketch("ccaccc");
-        let header = &parsed.hunks(&Expansion::default()).hunks[0].header;
+        let header = &parsed.hunks(&FileExpansion::default()).hunks[0].header;
 
         assert_eq!(header, "@@ -1,5 +1,6 @@");
     }

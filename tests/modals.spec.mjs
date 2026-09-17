@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, comment, openCard, turnRefs } from "./support/board.mjs";
+import { addCard, addProject, cardIn, comment, fileSection, openCard, turnRefs } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -71,7 +71,7 @@ test("a tool permission prompt shows on the card and resumes when answered", asy
   await page.locator('label[for="tab-review"]').click();
   await comment(
     page,
-    page.locator("#review .line.l-added").first(),
+    fileSection(page, "main.rs").locator(".line.l-added").first(),
     "[needs-permission] run the formatter",
   );
   await page.getByRole("button", { name: /Send \d+ to agent/ }).click();

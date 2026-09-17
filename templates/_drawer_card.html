@@ -30,7 +30,7 @@
       socket. The agent leads while it is working; once it hands back, there is
       a diff to read and the review leads.
     #}
-    {% set reviewing = file and card.agent_state in ["idle", "stopped"] %}
+    {% set reviewing = has_diff and card.agent_state in ["idle", "stopped"] %}
     <div class="tabs">
       <input type="radio" name="tab" id="tab-agent" {% if not reviewing %}checked{% endif %} />
       <label for="tab-agent">
@@ -40,10 +40,10 @@
       <input type="radio" name="tab" id="tab-review" {% if reviewing %}checked{% endif %} />
       <label for="tab-review">
         Review
-        {% if file %}
+        {% if has_diff %}
           <span class="stat mono">
-            <span class="adds">+{{ file.additions }}</span>
-            <span class="dels">−{{ file.deletions }}</span>
+            <span class="adds">+{{ additions }}</span>
+            <span class="dels">−{{ deletions }}</span>
           </span>
         {% endif %}
       </label>

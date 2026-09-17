@@ -268,6 +268,53 @@ up.compiler(".review", (review) => {
   form.addEventListener("cancel-comment", close);
 });
 
+// ---- file tree as a jump list -----------------------------------------------
+// Every file in the range is already in the diff, so picking one out of the tree
+// is a scroll rather than a round trip. Which node is highlighted follows the
+// scroller instead of the click, so it stays honest when the reader scrolls past
+// a file on their own.
+
+up.compiler(".review", (review) => {
+  const lines = review.querySelector("#diff-lines");
+  const tree = review.querySelector(".tree-body");
+  if (!lines || !tree) return;
+
+  const nodeFor = (section) => tree.querySelector(`[href="#${section.id}"]`);
+
+  tree.addEventListener("click", (event) => {
+    const node = event.target.closest(".file-node");
+    if (!node) return;
+
+    event.preventDefault();
+    // Not the browser's own hash navigation: that pushes history, which unpoly
+    // then has to reconcile against a fragment it never navigated to.
+    review.querySelector(node.getAttribute("href"))?.scrollIntoView({ block: "start" });
+  });
+
+  // The file being read is the first one not yet scrolled past, which is what
+  // the sticky header is showing. Derived from geometry rather than from the
+  // entries, because any one entry only reports its own file.
+  const observer = new IntersectionObserver(
+    () => {
+      const sections = [...lines.querySelectorAll(".file")];
+      const top = lines.getBoundingClientRect().top;
+      const reading =
+        sections.find((section) => section.getBoundingClientRect().bottom > top + 1) ??
+        sections[sections.length - 1];
+
+      for (const section of sections) {
+        nodeFor(section)?.classList.toggle("selected", section === reading);
+      }
+      if (reading) nodeFor(reading)?.scrollIntoView({ block: "nearest" });
+    },
+    { root: lines, threshold: [0, 1] },
+  );
+
+  for (const section of lines.querySelectorAll(".file")) observer.observe(section);
+
+  return () => observer.disconnect();
+});
+
 // ---- diff range -------------------------------------------------------------
 // The pane carries its own view, so the selector only has to say what changed.
 

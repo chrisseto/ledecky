@@ -6,6 +6,7 @@ import {
   addedLines,
   cardIn,
   comment,
+  fileSection,
   git,
   openCard,
   turnRefs,
@@ -68,14 +69,18 @@ test("the opening task is delivered and the finished turn moves the card to In R
   expect(addedLines(`refs/ledecky/${cardId}/base`, `refs/ledecky/${cardId}/turn-1`)).toContain(TASK);
 });
 
-test("the review pane lists the changed files with scopes for each turn", async ({ page }) => {
+test("the review pane stacks every changed file, with scopes for each turn", async ({ page }) => {
   await openCard(page, cardId);
 
   const review = page.locator("#review");
-  await expect(review.locator(".file-node")).toHaveText([/main\.rs/]);
-  await expect(review.locator(".diff-head .path")).toContainText("main.rs");
+  await expect(review.locator(".file-node")).toHaveText([/README\.md/, /main\.rs/]);
+
+  // Both files are on the page at once, each under its own header.
+  await expect(review.locator(".file")).toHaveCount(2);
+  await expect(review.locator(".file-head .path")).toHaveText(["README.md", "main.rs"]);
+
   // Two lines change per turn now: the appended record, and a rewritten word.
-  await expect(review.locator(".line.l-added", { hasText: TASK })).toBeVisible();
+  await expect(fileSection(page, "main.rs").locator(".line.l-added", { hasText: TASK })).toBeVisible();
 
   await expect(review.locator("[data-scope-select] option")).toHaveText([
     /All changes/,
@@ -83,8 +88,49 @@ test("the review pane lists the changed files with scopes for each turn", async 
     /Since turn 1/,
   ]);
 
-  // The agent's closing message is surfaced outside the terminal.
-  await expect(review.locator(".last-message")).toContainText("applied turn 1");
+  // The agent's closing message is surfaced outside the terminal, in the tree
+  // footer rather than in the diff column where it used to crowd out the diff.
+  await expect(review.locator(".tree-foot .last-message")).toContainText("applied turn 1");
+  await expect(review.locator(".diff .last-message")).toHaveCount(0);
+});
+
+test("the tree jumps to a file instead of reloading the pane", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const lines = page.locator("#diff-lines");
+  // The diff column has room of its own, which is the complaint this replaced:
+  // an unbounded sibling used to squeeze it to nothing.
+  await expect.poll(() => lines.evaluate((el) => el.clientHeight)).toBeGreaterThan(200);
+
+  // The fixture diff is short, so shrink the window rather than pad the repo.
+  await page.setViewportSize({ width: 900, height: 400 });
+  await expect
+    .poll(() => lines.evaluate((el) => el.scrollHeight - el.clientHeight))
+    .toBeGreaterThan(0);
+
+  const top = () => lines.evaluate((el) => el.scrollTop);
+  const url = page.url();
+
+  await page.locator('.file-node[href="#file-1"]').click();
+  await expect.poll(top).toBeGreaterThan(0);
+
+  // And back up to the first file.
+  await page.locator('.file-node[href="#file-0"]').click();
+  await expect.poll(top).toBe(0);
+
+  // Both jumps were scrolls, not navigations: the tree left the URL alone.
+  expect(page.url()).toBe(url);
+});
+
+test("every link out of the pane carries a usable query", async ({ page }) => {
+  await openCard(page, cardId);
+
+  // `&amp;` written into a template variable gets escaped a second time, which
+  // silently drops the parameter after it.
+  const hrefs = await page.locator("#review a[href]").evaluateAll((els) =>
+    els.map((el) => el.getAttribute("href")),
+  );
+  expect(hrefs.filter((href) => href.includes("amp;"))).toEqual([]);
 });
 
 test("only the word that changed is marked, not the whole line", async ({ page }) => {
@@ -115,19 +161,20 @@ test("syntax highlighting arrives as classes the page controls", async ({ page }
 test("a folded hunk opens a gap at a time and stays open around a comment", async ({ page }) => {
   await openCard(page, cardId);
 
-  const lines = page.locator("#review .line");
+  const main = fileSection(page, "main.rs");
+  const lines = main.locator(".line");
   const narrow = await lines.count();
 
-  await page.getByRole("link", { name: /Expand \d+ lines above/ }).first().click();
+  await main.getByRole("link", { name: /Expand \d+ lines above/ }).first().click();
   await expect.poll(() => lines.count()).toBeGreaterThan(narrow);
 
   const opened = await lines.count();
 
   // The whole file is strictly more again, and once it is open there is nothing
   // left to expand.
-  await page.getByRole("link", { name: "Expand whole file" }).click();
+  await main.getByRole("link", { name: "Expand whole file" }).click();
   await expect.poll(() => lines.count()).toBeGreaterThan(opened);
-  await expect(page.getByRole("link", { name: /Expand/ })).toHaveCount(0);
+  await expect(main.getByRole("link", { name: /Expand/ })).toHaveCount(0);
 
   const whole = await lines.count();
 
@@ -140,23 +187,26 @@ test("a folded hunk opens a gap at a time and stays open around a comment", asyn
 test("a file can be ticked off, which folds it away until it is untucked", async ({ page }) => {
   await openCard(page, cardId);
 
-  await page.getByRole("button", { name: "Viewed" }).click();
-  await expect(page.locator("#review .collapsed")).toBeVisible();
-  await expect(page.locator("#review .file-node.viewed")).toBeVisible();
+  const main = fileSection(page, "main.rs");
+  await main.getByRole("button", { name: "Viewed" }).click();
+  await expect(main.locator(".collapsed")).toBeVisible();
+  await expect(page.locator("#review .file-node.viewed")).toHaveText([/main\.rs/]);
+  // The other file is untouched by the tick.
+  await expect(fileSection(page, "README.md").locator(".line").first()).toBeVisible();
 
   // The tick outlives the fragment it was made on.
   await page.reload();
-  await expect(page.locator("#review .collapsed")).toBeVisible();
+  await expect(main.locator(".collapsed")).toBeVisible();
 
-  await page.getByRole("button", { name: /Viewed — collapsed/ }).click();
-  await expect(page.locator("#review .line").first()).toBeVisible();
+  await main.getByRole("button", { name: /Viewed — collapsed/ }).click();
+  await expect(main.locator(".line").first()).toBeVisible();
 });
 
 test("a review comment goes back to the agent and produces its own turn", async ({ page }) => {
   await openCard(page, cardId);
 
   // Clicking a diff line opens the compose box beneath it; clicking away saves.
-  await comment(page, page.locator("#review .line.l-added").first(), "Say hello instead.");
+  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
 
   const draft = page.locator("#review .comment", { hasText: "Say hello instead." });
   await expect(draft).toBeVisible();
@@ -178,7 +228,7 @@ test("a review comment goes back to the agent and produces its own turn", async 
 test("drafts can be thrown away in one go", async ({ page }) => {
   await openCard(page, cardId);
 
-  await comment(page, page.locator("#review .line.l-added").first(), "Second thoughts.");
+  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Second thoughts.");
   await expect(page.locator("#review .comment-draft")).toBeVisible();
 
   await page.getByRole("button", { name: "Discard" }).click();

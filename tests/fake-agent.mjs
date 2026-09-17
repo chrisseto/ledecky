@@ -207,6 +207,9 @@ async function submit(prompt) {
     const before = readFileSync("main.rs", "utf8");
     writeFileSync("main.rs", before.replace(/"(hi|turn-\d+)"/, `"turn-${turn}"`));
 
+    // A second file, so the review pane has more than one to stack.
+    appendFileSync("README.md", `\n- turn ${turn}\n`);
+
     summary = `applied turn ${turn}`;
   }
 

@@ -60,12 +60,16 @@ export async function openCard(page, cardId) {
   await expect(page.locator(".drawer-card")).toBeVisible();
 }
 
+/** The stacked diff renders every changed file; this is one of them. */
+export const fileSection = (page, path) => page.locator(`#review .file[data-path="${path}"]`);
+
 /** Types a review comment on a diff line and clicks away, which saves it. */
 export async function comment(page, line, body) {
   await line.click();
   await page.locator(".compose textarea").fill(body);
-  // Blur is the save; the header is the nearest thing that is not a diff line.
-  await page.locator(".diff-head .path").click();
+  // Blur is the save; the file's own header is the nearest thing that is not a
+  // diff line and cannot scroll out from under the click.
+  await line.locator("xpath=ancestor::section[@class='file']").locator(".file-head .path").click();
 }
 
 /**

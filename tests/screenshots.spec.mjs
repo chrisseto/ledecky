@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, comment, openCard, turnRefs } from "./support/board.mjs";
+import { addCard, addProject, cardIn, comment, fileSection, openCard, turnRefs } from "./support/board.mjs";
 
 // Not assertions so much as a way to look at the thing. Run with
 // `pnpm e2e tests/screenshots.spec.mjs` and open tests/.shots/.
@@ -57,7 +57,7 @@ test("capture the whole flow", async ({ page }) => {
   await page.locator('label[for="tab-review"]').click();
   await shot(page, "09-review");
 
-  await comment(page, page.locator("#review .line.l-added").first(), "Say hello instead.");
+  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
   await expect(page.locator("#review .comment")).toBeVisible();
   await shot(page, "10-draft-comment");
 });
