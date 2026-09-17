@@ -9,8 +9,6 @@ import { expect, test } from "@playwright/test";
 // shared one down with it.
 const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = "/tmp/ledecky-orphans";
-const PORT = 8781;
-const BASE = `http://127.0.0.1:${PORT}`;
 
 const git = (cwd, ...args) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
@@ -47,8 +45,8 @@ function agentPid(worktreesDir) {
  * NB: this spec spawns it directly rather than through `cargo run`, because it
  * kills the pid it is handed. Cargo does not pass a SIGKILL on to the binary it
  * launched, so killing it would leave the server — and the agent this test is
- * about — running, and that orphan would go on to hold the port against the
- * next run.
+ * about — running, and this spec would pass with the orphan it is meant to
+ * catch still alive.
  */
 function build() {
   execFileSync("cargo", ["build", "--quiet"], { cwd: PROJECT, stdio: "inherit" });
@@ -56,38 +54,38 @@ function build() {
   return join(target, "debug", "ledecky");
 }
 
+/** Starts a server on a port of its own choosing and reports where it landed. */
 async function boot({ agentBin }) {
   const server = spawn(build(), {
     cwd: PROJECT,
     env: {
       ...process.env,
-      ROCKET_PORT: String(PORT),
+      ROCKET_PORT: "0",
       ROCKET_LOG_LEVEL: "critical",
       XDG_DATA_HOME: join(ROOT, "data"),
       LEDECKY_AGENT_BIN: agentBin,
     },
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "inherit"],
   });
 
-  for (let i = 0; i < 120; i++) {
-    // A server that died did not come up. Polling on would find whatever else
-    // is on the port and test that instead.
-    if (server.exitCode !== null) {
-      throw new Error(`the server exited with ${server.exitCode}; is ${PORT} taken?`);
-    }
-    try {
-      await fetch(`${BASE}/`);
-      return server;
-    } catch {
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-  throw new Error("server did not come up");
+  const base = await new Promise((resolve, reject) => {
+    let out = "";
+    server.stdout.setEncoding("utf8");
+    server.stdout.on("data", (chunk) => {
+      out += chunk;
+      const url = out.match(/listening on (\S+)/)?.[1];
+      if (url) resolve(url);
+    });
+    // Nothing else says where the server is, so a death here is terminal.
+    server.on("exit", (code) => reject(new Error(`the server exited with ${code}`)));
+  });
+
+  return { server, base };
 }
 
-async function startCard(request) {
-  await request.post(`${BASE}/projects`, { form: { path: join(ROOT, "repo") } });
-  await request.post(`${BASE}/projects/1/cards`, {
+async function startCard(request, base) {
+  await request.post(`${base}/projects`, { form: { path: join(ROOT, "repo") } });
+  await request.post(`${base}/projects/1/cards`, {
     form: {
       task: "orphan probe\n\nSit still.",
       base_branch: "main",
@@ -95,7 +93,7 @@ async function startCard(request) {
       model: "",
     },
   });
-  await request.post(`${BASE}/cards/1/move`, { form: { lane: "in_progress", index: 0 } });
+  await request.post(`${base}/cards/1/move`, { form: { lane: "in_progress", index: 0 } });
 }
 
 /** Held across the test so a failure before the kill still tears it down. */
@@ -129,8 +127,9 @@ test.beforeEach(() => {
 test("SIGKILLing the server takes its agents with it", async ({ request }) => {
   test.slow();
 
-  server = await boot({ agentBin: join(PROJECT, "tests/fake-agent.mjs") });
-  await startCard(request);
+  let base;
+  ({ server, base } = await boot({ agentBin: join(PROJECT, "tests/fake-agent.mjs") }));
+  await startCard(request, base);
 
   const worktrees = join(ROOT, "data/ledecky/worktrees");
   await expect.poll(() => agentPid(worktrees), { timeout: 20_000 }).toBeTruthy();

@@ -2,8 +2,6 @@ import { defineConfig } from "@playwright/test";
 
 import { DATA_HOME } from "./tests/support/paths.mjs";
 
-const PORT = Number(process.env.LEDECKY_TEST_PORT ?? 8771);
-
 export const POLL_INTERVAL = 250;
 
 export default defineConfig({
@@ -17,7 +15,9 @@ export default defineConfig({
   reporter: process.env.CI ? "list" : [["list"], ["html", { open: "never", outputFolder: "tests/.report" }]],
 
   use: {
-    baseURL: `http://127.0.0.1:${PORT}`,
+    // The server binds a free port and prints where it landed; `webServer.wait`
+    // captures that into the environment before any worker loads this file.
+    baseURL: process.env.LEDECKY_URL,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     viewport: { width: 1440, height: 900 },
@@ -30,13 +30,14 @@ export default defineConfig({
   globalSetup: "./tests/global-setup.mjs",
   webServer: {
     command: "cargo run --quiet",
-    url: `http://127.0.0.1:${PORT}/`,
-    reuseExistingServer: false,
+    wait: { stdout: /listening on (?<ledecky_url>\S+)/ },
     timeout: 180_000,
     stdout: "pipe",
     stderr: "pipe",
     env: {
-      ROCKET_PORT: String(PORT),
+      // A free port, so a run never fights the dev server or a leftover of its
+      // own for a fixed one.
+      ROCKET_PORT: "0",
       ROCKET_LOG_LEVEL: "critical",
       // Isolation: the app derives every path it writes from XDG_DATA_HOME, so
       // a test run never touches a real board. This has to be the same value

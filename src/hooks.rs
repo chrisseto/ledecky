@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use rand::rngs::SysRng;
 use rand::TryRng;
@@ -24,7 +25,7 @@ const HOOK_TIMEOUT_SECS: u32 = 10;
 /// local process cannot forge turn boundaries.
 pub struct HookAuth {
     token: String,
-    port: u16,
+    port: AtomicU16,
 }
 
 #[derive(Serialize)]
@@ -37,11 +38,19 @@ struct HttpHook {
 }
 
 impl HookAuth {
-    pub fn new(port: u16) -> Self {
+    pub fn new() -> Self {
         Self {
             token: random_token(),
-            port,
+            port: AtomicU16::new(0),
         }
+    }
+
+    /// Point callbacks at the port the server actually bound.
+    ///
+    /// NB: separate from `new` because a configured port of 0 asks for a free
+    /// one, so the answer does not exist until the listener is up.
+    pub fn bind(&self, port: u16) {
+        self.port.store(port, Ordering::Relaxed);
     }
 
     pub fn matches(&self, token: &str) -> bool {
@@ -52,7 +61,8 @@ impl HookAuth {
     pub fn url(&self, card_id: i64, event: &str) -> String {
         format!(
             "http://127.0.0.1:{}/hooks/{}/{card_id}/{event}",
-            self.port, self.token
+            self.port.load(Ordering::Relaxed),
+            self.token
         )
     }
 
@@ -114,7 +124,7 @@ mod tests {
 
     #[test]
     fn only_the_issuing_token_is_accepted() {
-        let auth = HookAuth::new(8770);
+        let auth = HookAuth::new();
         let token = auth.url(1, "stop").split('/').nth(4).unwrap().to_owned();
 
         assert!(auth.matches(&token));
@@ -124,7 +134,8 @@ mod tests {
 
     #[test]
     fn settings_register_every_event_over_http() {
-        let auth = HookAuth::new(9999);
+        let auth = HookAuth::new();
+        auth.bind(9999);
         let settings = auth.settings(42);
         let hooks = settings["hooks"].as_object().unwrap();
 
@@ -146,7 +157,7 @@ mod tests {
 
     #[test]
     fn settings_do_not_touch_the_http_hook_allowlist() {
-        let settings = HookAuth::new(8770).settings(1);
+        let settings = HookAuth::new().settings(1);
 
         // Defining this key anywhere turns the allowlist on for every hook the
         // user has, including ones we know nothing about.
@@ -156,7 +167,7 @@ mod tests {
 
     #[test]
     fn the_payload_is_valid_json_for_the_cli() {
-        let json = HookAuth::new(8770).settings_json(7);
+        let json = HookAuth::new().settings_json(7);
         let parsed: Value = serde_json::from_str(&json).unwrap();
         assert!(parsed["hooks"]["Stop"][0]["hooks"][0]["url"]
             .as_str()
