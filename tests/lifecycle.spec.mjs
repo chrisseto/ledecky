@@ -94,6 +94,22 @@ test("the review pane stacks every changed file, with scopes for each turn", asy
   await expect(review.locator(".diff .last-message")).toHaveCount(0);
 });
 
+test("an empty range keeps the picker, so there is a way back out of it", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const review = page.locator("#review");
+  const picker = review.locator("[data-scope-select]");
+
+  // With one turn, "since turn 1" is that turn against itself: no files.
+  await picker.selectOption("since-1");
+  await expect(review.locator("#diff-lines > .empty")).toBeVisible();
+  await expect(review.locator(".file")).toHaveCount(0);
+
+  await expect(picker).toHaveValue("since-1");
+  await picker.selectOption("all");
+  await expect(review.locator(".file")).toHaveCount(2);
+});
+
 test("the tree jumps to a file instead of reloading the pane", async ({ page }) => {
   await openCard(page, cardId);
 

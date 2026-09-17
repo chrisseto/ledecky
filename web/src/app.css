@@ -714,8 +714,6 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   grid-template-columns: 230px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
 }
-.review:has(> .empty) { display: grid; place-items: center; padding: 24px; }
-.review > .empty { max-width: 420px; }
 
 .tree {
   display: flex;
@@ -726,6 +724,7 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 }
 .tree-head { padding: 10px 12px 8px; border-bottom: 1px solid var(--border-soft); }
 .tree-head select { height: 28px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.tree-head select:disabled { color: var(--fg-faint); cursor: default; }
 .tree-body { flex: 1; overflow-y: auto; padding: 6px 6px 10px; }
 
 .tree-foot {
@@ -869,6 +868,7 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   font-size: 12.5px;
   line-height: 1.65;
 }
+.lines > .empty { margin: 28px auto; max-width: 420px; font-family: var(--sans); }
 
 .line {
   display: grid;

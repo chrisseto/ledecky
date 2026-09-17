@@ -193,3 +193,18 @@ test("a swap keeps each lane's scroll position", async ({ page }) => {
 
   expect(await cards.evaluate((el) => el.scrollTop)).toBe(before);
 });
+
+test("a card with nothing to review still offers the range picker", async ({ page }) => {
+  await addCard(page, projectUrl, { title: "Untouched" });
+  await page.goto(projectUrl);
+  await cardIn(page, "todo", "Untouched").click();
+
+  // Nothing has run, so the review tab is not the one that leads.
+  await page.locator('label[for="tab-review"]').click();
+
+  // The picker is always on the page; with no turns there is nothing to pick.
+  const picker = page.locator("#review [data-scope-select]");
+  await expect(picker).toBeDisabled();
+  await expect(picker.locator("option")).toHaveText([/All changes/]);
+  await expect(page.locator("#diff-lines > .empty")).toContainText("Nothing yet on main");
+});

@@ -272,6 +272,7 @@ fn pane(
         card, tree, threads, scopes, drafts, submitted, last_message, turn_note,
         files => rendered,
         has_diff => !files.is_empty(),
+        has_turns => !turns.is_empty(),
         additions => totals.0,
         deletions => totals.1,
         scope => scope.key(),
