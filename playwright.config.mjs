@@ -23,8 +23,8 @@ export default defineConfig({
 
   projects: [{ name: "chromium", use: { browserName: "chromium" } }],
 
-  // `global-setup` builds the assets and prepares a throwaway data dir; the
-  // server is started here so Playwright owns its lifetime.
+  // `global-setup` prepares a throwaway data dir; the server is started here so
+  // Playwright owns its lifetime, and building it builds the assets.
   globalSetup: "./tests/global-setup.mjs",
   webServer: {
     command: "cargo run --quiet",

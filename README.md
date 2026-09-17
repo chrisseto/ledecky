@@ -20,12 +20,17 @@ To Do  ──drag──▶  In Progress  ──agent idles──▶  In Review  
 ```sh
 direnv allow          # or: nix develop
 pnpm install
-pnpm build            # populates static/ — required before cargo run
 cargo run             # http://127.0.0.1:8770
 ```
 
 The flake supplies node, pnpm, and esbuild. Rust comes from your system
 toolchain on purpose, so `cargo` stays whatever you already use.
+
+`build.rs` runs `pnpm build` into `static/`, so the bundle the server reads off
+disk cannot be older than the server itself. It rebuilds when `web/` or the
+package files change, and when `static/` has gone missing — git ignores it, so
+nothing else would put it back. `KANBAN2_SKIP_ASSETS=1` leaves it alone, for a
+build with no node toolchain to hand.
 
 `pnpm watch` rebuilds assets on change. Templates reload without a restart.
 

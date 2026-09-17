@@ -1,20 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 import { DATA_HOME, REPO, ROOT } from "./support/paths.mjs";
-
-const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const git = (cwd, ...args) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
 export default function globalSetup() {
-  // The bundle is a build artifact the server reads off disk, so it has to be
-  // current before the server boots.
-  execFileSync("pnpm", ["build"], { cwd: PROJECT, stdio: "inherit" });
-
+  // The bundle is built by `build.rs`, so it is current by the time there is a
+  // server to run at all.
   rmSync(ROOT, { recursive: true, force: true });
   mkdirSync(DATA_HOME, { recursive: true });
   mkdirSync(REPO, { recursive: true });
