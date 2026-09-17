@@ -41,8 +41,23 @@ function agentPid(worktreesDir) {
   });
 }
 
+/**
+ * The server binary, built in place.
+ *
+ * NB: this spec spawns it directly rather than through `cargo run`, because it
+ * kills the pid it is handed. Cargo does not pass a SIGKILL on to the binary it
+ * launched, so killing it would leave the server — and the agent this test is
+ * about — running, and that orphan would go on to hold the port against the
+ * next run.
+ */
+function build() {
+  execFileSync("cargo", ["build", "--quiet"], { cwd: PROJECT, stdio: "inherit" });
+  const target = process.env.CARGO_TARGET_DIR ?? join(PROJECT, "target");
+  return join(target, "debug", "kanban2");
+}
+
 async function boot({ agentBin }) {
-  const server = spawn("cargo", ["run", "--quiet"], {
+  const server = spawn(build(), {
     cwd: PROJECT,
     env: {
       ...process.env,
@@ -55,6 +70,11 @@ async function boot({ agentBin }) {
   });
 
   for (let i = 0; i < 120; i++) {
+    // A server that died did not come up. Polling on would find whatever else
+    // is on the port and test that instead.
+    if (server.exitCode !== null) {
+      throw new Error(`the server exited with ${server.exitCode}; is ${PORT} taken?`);
+    }
     try {
       await fetch(`${BASE}/`);
       return server;
@@ -79,6 +99,16 @@ async function startCard(request) {
   await request.post(`${BASE}/cards/1/move`, { form: { lane: "in_progress", index: 0 } });
 }
 
+/** Held across the test so a failure before the kill still tears it down. */
+let server;
+
+test.afterEach(() => {
+  // On the handle rather than the pid: the test kills the server itself and the
+  // exit is not seen synchronously, so this usually has nothing left to do.
+  server?.kill("SIGKILL");
+  server = undefined;
+});
+
 test.beforeEach(() => {
   rmSync(ROOT, { recursive: true, force: true });
   mkdirSync(join(ROOT, "repo"), { recursive: true });
@@ -100,7 +130,7 @@ test.beforeEach(() => {
 test("SIGKILLing the server takes its agents with it", async ({ request }) => {
   test.slow();
 
-  const server = await boot({ agentBin: join(PROJECT, "tests/fake-agent.mjs") });
+  server = await boot({ agentBin: join(PROJECT, "tests/fake-agent.mjs") });
   await startCard(request);
 
   const worktrees = join(ROOT, "data/kanban2/worktrees");
