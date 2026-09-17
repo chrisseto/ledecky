@@ -49,11 +49,64 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
 test("the terminal streams the agent's screen", async ({ page }) => {
   await openCard(page, cardId);
 
-  const rows = page.locator(".terminal .xterm-rows");
+  const rows = page.locator("div[data-terminal] .xterm-rows");
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
   await expect(rows).toContainText(TITLE);
   // The agent is running inside the card's worktree, not the project checkout.
   await expect(rows).toContainText(`worktrees/${cardId}`);
+});
+
+test("a wheel over the terminal never reaches the page behind it", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const terminal = page.locator("div[data-terminal]");
+  await expect(terminal.locator(".xterm-rows")).toContainText("fake-agent", { timeout: 15_000 });
+
+  const box = await terminal.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+
+  // xterm only cancels a wheel it actually scrolled with, so at either end of
+  // the scrollback the page is what moves. Watching `defaultPrevented` from the
+  // document catches that whether or not this viewport happens to be scrollable.
+  for (const [dx, dy] of [
+    [0, 600],
+    [0, -600],
+    [600, 0],
+  ]) {
+    const prevented = page.evaluate(
+      () =>
+        new Promise((resolve) => {
+          document.addEventListener("wheel", (event) => resolve(event.defaultPrevented), {
+            once: true,
+            passive: true,
+          });
+        }),
+    );
+    await page.mouse.wheel(dx, dy);
+    expect(await prevented).toBe(true);
+  }
+
+  expect(
+    await page.evaluate(() => [
+      document.documentElement.scrollTop,
+      document.querySelector("#board")?.scrollLeft ?? 0,
+    ]),
+  ).toEqual([0, 0]);
+});
+
+test("the scrollback the agent printed before the drawer opened is scrollable", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const rows = page.locator("div[data-terminal] .xterm-rows");
+  await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
+
+  // The banner scrolled off the pty long before this client connected, so it is
+  // only on screen if the server replayed its scrollback.
+  const box = await page.locator("div[data-terminal]").boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let i = 0; i < 20; i++) await page.mouse.wheel(0, -600);
+
+  await expect(rows).toContainText("banner-0");
 });
 
 test("the opening task is delivered and the finished turn moves the card to In Review", async ({ page }) => {

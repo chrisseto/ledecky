@@ -105,9 +105,16 @@ pub fn resize(agents: &State<Agents>, id: i64, form: Form<ResizeForm>) -> Status
 }
 
 /// Raw pty bytes in both directions. Everything else — resize, injection, merge —
-/// goes over ordinary HTTP so this socket stays a dumb pipe.
-#[get("/cards/<id>/terminal")]
-pub fn socket(agents: &State<Agents>, id: i64, socket: ws::WebSocket) -> ws::Channel<'static> {
+/// goes over ordinary HTTP so this socket stays a dumb pipe. `rows` is the one
+/// exception: the scrollback sent ahead of the snapshot has to be sized to the
+/// client's screen, and that has to be known before the first byte goes out.
+#[get("/cards/<id>/terminal?<rows>")]
+pub fn socket(
+    agents: &State<Agents>,
+    id: i64,
+    rows: Option<u16>,
+    socket: ws::WebSocket,
+) -> ws::Channel<'static> {
     let agent = agents.get(id);
 
     socket.channel(move |mut stream| {
@@ -119,6 +126,9 @@ pub fn socket(agents: &State<Agents>, id: i64, socket: ws::WebSocket) -> ws::Cha
 
             // Subscribe before snapshotting so no output slips through the gap.
             let mut rx = agent.subscribe();
+            stream
+                .send(ws::Message::Binary(agent.history(rows)))
+                .await?;
             stream.send(ws::Message::Binary(agent.snapshot())).await?;
 
             loop {

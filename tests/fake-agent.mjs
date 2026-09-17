@@ -326,6 +326,12 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   });
 }
 
+// The real client scrolls a long transcript off the top of the screen before it
+// starts repainting in place. `render` only ever clears and redraws, so without
+// this the pty would have no scrollback at all and nothing would exercise the
+// history the server replays to a connecting client.
+for (let i = 0; i < ROWS + 20; i++) out(`banner-${i}\r\n`);
+
 // Keep the process alive on a pty even while stdin is quiet.
 setInterval(() => {}, 1 << 30);
 render();

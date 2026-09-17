@@ -166,24 +166,10 @@ up.compiler("[data-terminal]", (host) => {
   term.loadAddon(fit);
   term.open(host);
 
-  const url = new URL(host.dataset.terminal, location.href);
-  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-
-  const socket = new WebSocket(url);
-  socket.binaryType = "arraybuffer";
-
-  socket.addEventListener("open", () => resize());
-  socket.addEventListener("message", (event) => {
-    term.write(new Uint8Array(event.data));
-  });
-  socket.addEventListener("close", () => {
-    term.write("\r\n\x1b[2m-- agent disconnected --\x1b[0m\r\n");
-  });
-
-  const encoder = new TextEncoder();
-  term.onData((data) => {
-    if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
-  });
+  // xterm cancels a wheel only when it actually scrolled the viewport with it; at
+  // either end of the scrollback it lets the event through and the page behind the
+  // drawer scrolls instead. Nothing in this pane should ever move the board.
+  host.addEventListener("wheel", (event) => event.preventDefault(), { passive: false });
 
   let sent = "";
 
@@ -203,7 +189,31 @@ up.compiler("[data-terminal]", (host) => {
     up.request(host.dataset.resizeUrl, { method: "post", params: { rows, cols } });
   };
 
+  // Fitting before the socket opens is what lets `rows` below be this screen's.
   resize();
+
+  const url = new URL(host.dataset.terminal, location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  // The scrollback the server replays has to be scrolled down by a full screen
+  // before it repaints over it, and that screen is ours, not the pty's — a
+  // taller client would otherwise never see the newest history.
+  url.searchParams.set("rows", term.rows);
+
+  const socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
+
+  socket.addEventListener("open", () => resize());
+  socket.addEventListener("message", (event) => {
+    term.write(new Uint8Array(event.data));
+  });
+  socket.addEventListener("close", () => {
+    term.write("\r\n\x1b[2m-- agent disconnected --\x1b[0m\r\n");
+  });
+
+  const encoder = new TextEncoder();
+  term.onData((data) => {
+    if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
+  });
 
   let debounce;
   const observer = new ResizeObserver(() => {

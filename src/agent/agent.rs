@@ -49,6 +49,13 @@ impl Agent {
         self.screen.lock().unwrap().screen().state_formatted()
     }
 
+    /// The scrollback sitting above the current screen, oldest row first, as
+    /// ordinary output lines. Sent to a client ahead of `snapshot()` so it has
+    /// history to scroll back into; the repaint lands on top of it.
+    pub fn history(&self, client_rows: Option<u16>) -> Vec<u8> {
+        history_bytes(self.screen.lock().unwrap().screen_mut(), client_rows)
+    }
+
     pub fn write_input(&self, bytes: &[u8]) {
         let mut writer = self.writer.lock().unwrap();
         let _ = writer.write_all(bytes);
@@ -315,6 +322,55 @@ impl Agents {
     }
 }
 
+/// Renders `screen`'s scrollback as plain output lines, oldest first, followed
+/// by enough blank rows to scroll the last of them off a `client_rows`-tall
+/// screen. Leaves `screen` back on the live view.
+fn history_bytes(screen: &mut vt100::Screen, client_rows: Option<u16>) -> Vec<u8> {
+    // A full-screen app has no scrollback of its own, and the normal screen's
+    // belongs to whatever was running before it took over.
+    if screen.alternate_screen() {
+        return Vec::new();
+    }
+
+    let (rows, cols) = screen.size();
+    let rows = usize::from(rows);
+
+    // NB: `set_scrollback` clamps to what actually exists, so overshooting and
+    // reading the offset back is how many rows of history there are.
+    screen.set_scrollback(usize::MAX);
+    let total = screen.scrollback();
+
+    let mut out = Vec::new();
+    let mut emitted = 0;
+    while emitted < total {
+        // The window top sits `offset` rows above the screen, so only its first
+        // `offset` rows are still history rather than the live screen.
+        let offset = total - emitted;
+        let take = offset.min(rows);
+
+        screen.set_scrollback(offset);
+        for row in screen.rows_formatted(0, cols).take(take) {
+            out.extend_from_slice(&row);
+            out.extend_from_slice(b"\r\n");
+        }
+        emitted += take;
+    }
+
+    // NB: the last screenful of history is still *on* the client's screen here,
+    // and the repaint that follows erases in place rather than scrolling.
+    // Without pushing it off first those rows never reach the client's
+    // scrollback, leaving a hole right above the live screen. The count is the
+    // client's own height — the pty's would come up short for a taller one.
+    if total > 0 {
+        for _ in 0..client_rows.map_or(rows, usize::from) {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+
+    screen.set_scrollback(0);
+    out
+}
+
 fn pump(
     mut reader: Box<dyn Read + Send>,
     screen: Arc<Mutex<vt100::Parser>>,
@@ -382,7 +438,96 @@ fn paste_needle(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{composer_block, is_menu_option, is_prompt_line, paste_needle, COMPOSER_ROWS};
+    use super::{
+        composer_block, history_bytes, is_menu_option, is_prompt_line, paste_needle, COMPOSER_ROWS,
+    };
+
+    /// The walk steps through the scrollback a screenful at a time, and the
+    /// last step is a partial one whenever the history is not a multiple of the
+    /// screen height — the case that silently drops or repeats rows if the
+    /// window arithmetic is off.
+    #[test]
+    fn history_replays_every_scrolled_row_once_and_in_order() {
+        let mut parser = vt100::Parser::new(10, 40, 100);
+        for i in 0..37 {
+            parser.process(format!("line-{i}\r\n").as_bytes());
+        }
+
+        // 37 lines plus the blank row the last newline left the cursor on,
+        // against 10 visible rows: 28 have scrolled off.
+        let out = history_bytes(parser.screen_mut(), None);
+        let text = String::from_utf8(out).unwrap();
+        let seen: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("line-"))
+            .map(|l| l.trim_end())
+            .collect();
+
+        let expected: Vec<String> = (0..28).map(|i| format!("line-{i}")).collect();
+        assert_eq!(seen, expected);
+
+        // The live view must be back, or `inject` reads the wrong rows.
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    /// The tail of the history is still on screen when the replay ends, so it
+    /// only reaches the client's scrollback if the repaint is pushed down past
+    /// it first.
+    #[test]
+    fn history_scrolls_its_last_screenful_off_before_the_repaint() {
+        let mut parser = vt100::Parser::new(10, 40, 100);
+        for i in 0..37 {
+            parser.process(format!("line-{i}\r\n").as_bytes());
+        }
+
+        let out = history_bytes(parser.screen_mut(), None);
+        // The final terminator leaves one empty field of its own, so drop it
+        // before counting the blank rows that follow the last history line.
+        let text = String::from_utf8(out).unwrap();
+        let mut fields: Vec<&str> = text.split("\r\n").collect();
+        fields.pop();
+        let blanks = fields
+            .iter()
+            .rev()
+            .take_while(|f| f.trim().is_empty())
+            .count();
+        assert_eq!(blanks, 10);
+    }
+
+    /// Nothing to replay under a full-screen app: the scrollback on the other
+    /// side of the switch is not its history.
+    #[test]
+    fn history_is_empty_on_the_alternate_screen() {
+        let mut parser = vt100::Parser::new(10, 40, 100);
+        for i in 0..37 {
+            parser.process(format!("line-{i}\r\n").as_bytes());
+        }
+        parser.process(b"\x1b[?1049h");
+
+        assert!(history_bytes(parser.screen_mut(), None).is_empty());
+    }
+
+    /// A client taller than the pty needs a deeper flush than the pty's own
+    /// height, or the newest history is still on its screen when the repaint
+    /// erases it.
+    #[test]
+    fn history_flushes_down_by_the_clients_height_not_the_ptys() {
+        let mut parser = vt100::Parser::new(10, 40, 100);
+        for i in 0..37 {
+            parser.process(format!("line-{i}\r\n").as_bytes());
+        }
+
+        let out = history_bytes(parser.screen_mut(), Some(30));
+        let text = String::from_utf8(out).unwrap();
+        let mut fields: Vec<&str> = text.split("\r\n").collect();
+        fields.pop();
+        let blanks = fields
+            .iter()
+            .rev()
+            .take_while(|f| f.trim().is_empty())
+            .count();
+        assert_eq!(blanks, 30);
+    }
 
     /// The composer holding a pasted message, as the client actually draws it:
     /// the marker on the first line only, the rest plain.
