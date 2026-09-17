@@ -1,4 +1,4 @@
 <span class="state state-{{ card.agent_state }}" id="agent-state"
-      up-poll up-interval="4000" up-source="/cards/{{ card.id }}/state">
+      up-poll up-interval="{{ poll_interval }}" up-source="/cards/{{ card.id }}/state">
   <span class="pulse state-{{ card.agent_state }}"></span>{{ card.agent_state_label }}
 </span>

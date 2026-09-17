@@ -1,4 +1,6 @@
-<article class="card" data-card-id="{{ card.id }}">
+{# `up-keep` compares this element's own markup across a swap: unchanged cards
+   keep their live node, so a change to one card does not disturb the rest. #}
+<article class="card" id="card-{{ card.id }}" up-keep="same-html" data-card-id="{{ card.id }}">
   <a class="card-open" href="/cards/{{ card.id }}" up-follow up-target="#overlay">
     {{ card.title }}
   </a>

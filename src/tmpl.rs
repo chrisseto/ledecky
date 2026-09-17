@@ -1,9 +1,11 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 
 use anyhow::{Context, Result};
 use minijinja::{Environment, Value};
-use rocket::http::{ContentType, Status};
+use rocket::http::{ContentType, Method, Status};
 use rocket::request::Request;
 use rocket::response::{self, Responder, Response};
 
@@ -73,6 +75,27 @@ fn normalize_svg(svg: &str, name: &str) -> String {
     format!("<svg class=\"icon icon-{name}\" {body}")
 }
 
+/// A polled template writes this where the response's own ETag belongs.
+///
+/// The digest is taken over the body with the placeholder still in it and
+/// substituted afterwards, so the ETag is never an input to itself.
+const ETAG_SLOT: &str = "__up_etag__";
+
+/// Not a security boundary — a collision costs one redundant fragment swap.
+/// `DefaultHasher` is stable within a build, which is all an ETag needs.
+fn etag_of(body: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+fn if_none_match(req: &Request<'_>, etag: &str) -> bool {
+    req.headers()
+        .get("If-None-Match")
+        .flat_map(|value| value.split(','))
+        .any(|candidate| candidate.trim() == etag)
+}
+
 /// Renders a minijinja template, pulling `Templates` out of Rocket's state.
 pub struct Tmpl(pub &'static str, pub Value);
 
@@ -83,15 +106,42 @@ impl<'r> Responder<'r, 'static> for Tmpl {
             .state::<Templates>()
             .expect("Templates is not managed");
 
-        match templates.render(self.0, self.1) {
-            Ok(body) => Response::build()
-                .header(ContentType::HTML)
-                .sized_body(body.len(), std::io::Cursor::new(body))
-                .ok(),
+        let body = match templates.render(self.0, self.1) {
+            Ok(body) => body,
             Err(err) => {
                 rocket::error!("template {}: {err:#}", self.0);
-                Err(Status::InternalServerError)
+                return Err(Status::InternalServerError);
             }
+        };
+
+        let etag = etag_of(&body);
+
+        // Conditional requests only mean anything for GET. `Tmpl` is also the
+        // error arm of a couple of POSTs, where a 304 would be a lie.
+        let conditional = req.method() == Method::Get;
+
+        // NB: this is what stops the board flashing. `[up-poll]` reloads send
+        // `If-None-Match` from the fragment's `up-etag`, and a bodyless 304
+        // makes unpoly skip the render outright rather than swap in identical
+        // markup and throw away hover, scroll and selection with it.
+        if conditional && if_none_match(req, &etag) {
+            return Response::build()
+                .status(Status::NotModified)
+                .raw_header("ETag", etag)
+                .raw_header("Cache-Control", "no-cache")
+                .ok();
         }
+
+        let body = body.replace(ETAG_SLOT, &etag);
+
+        let mut res = Response::build();
+        res.header(ContentType::HTML);
+        if conditional {
+            // `no-cache` rather than `no-store`: the browser should keep the
+            // page for bfcache and revalidate, not refetch it.
+            res.raw_header("ETag", etag)
+                .raw_header("Cache-Control", "no-cache");
+        }
+        res.sized_body(body.len(), std::io::Cursor::new(body)).ok()
     }
 }

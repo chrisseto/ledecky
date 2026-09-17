@@ -44,9 +44,12 @@ pub fn focus(
 /// Just the agent-state chip, so the focus view can poll it without re-running a
 /// diff every few seconds.
 #[get("/cards/<id>/state")]
-pub fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
+pub fn state(db: &State<Db>, settings: &State<Settings>, id: i64) -> Result<Tmpl, Status> {
     let card = Card::find(&db.lock(), id).ok_or(Status::NotFound)?;
-    Ok(Tmpl("_state.html", context! { card }))
+    Ok(Tmpl(
+        "_state.html",
+        context! { card, poll_interval => settings.poll_interval },
+    ))
 }
 
 #[post("/cards/<id>/start")]

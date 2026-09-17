@@ -26,8 +26,11 @@
     </header>
 
     {% if project %}
-      <main class="board" id="board"
-            up-poll up-interval="4000" up-source="/projects/{{ project.id }}">
+      {# `up-etag` is single-quoted because the server substitutes a quoted ETag
+         into it, and unpoly sends the attribute back verbatim as
+         `If-None-Match`. #}
+      <main class="board" id="board" up-poll up-interval="{{ poll_interval }}"
+            up-source="/projects/{{ project.id }}" up-etag='__up_etag__'>
         {% for lane in lanes %}
           <section class="lane lane-{{ lane.key }}">
             <header>
@@ -41,7 +44,10 @@
                  up-follow up-target="#overlay">{{ icon("plus") }} New card</a>
             {% endif %}
 
-            <div class="lane-cards" data-sortable data-lane="{{ lane.key }}">
+            {# The id is what makes the lane a targetable viewport, so
+               `scroll: keep` can put it back where it was after a swap. #}
+            <div class="lane-cards" id="lane-{{ lane.key }}" up-viewport
+                 data-sortable data-lane="{{ lane.key }}">
               {% for card in lane.cards %}{% include "_card.html" %}{% endfor %}
             </div>
 

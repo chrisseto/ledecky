@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, lane } from "./support/board.mjs";
+import { addCard, addProject, cardIn, lane, moveCard, pollsOf } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -119,4 +119,77 @@ test("deleting a card removes it from the board", async ({ page }) => {
   await page.reload();
   await expect(lane(page, "todo").locator(".card")).toHaveCount(before - 1);
   await expect(cardIn(page, "todo", "Second card")).toHaveCount(0);
+});
+
+test("a poll that finds nothing new leaves the board alone", async ({ page }) => {
+  const polls = pollsOf(page, projectUrl);
+
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "todo", "Third card")).toBeVisible();
+
+  // Server-rendered, so even the first poll carries an If-None-Match.
+  await expect(page.locator("#board")).toHaveAttribute("up-etag", /^".+"$/);
+
+  await page.evaluate(() => {
+    window.__board = document.querySelector("#board");
+    window.__card = document.querySelector("#board .card");
+  });
+
+  // Asserting the count too, so the test cannot pass by polling never firing.
+  await expect.poll(() => polls.length).toBeGreaterThanOrEqual(3);
+  expect(polls).toEqual(polls.map(() => 304));
+
+  const kept = await page.evaluate(() => window.__board.isConnected && window.__card.isConnected);
+  expect(kept).toBe(true);
+});
+
+test("a poll picks up a change made elsewhere", async ({ page }) => {
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "todo", "Third card").getAttribute("data-card-id");
+
+  // Server-side move; this page is never told about it directly.
+  await moveCard(page, id, "in_review", 0);
+
+  await expect(cardIn(page, "in_review", "Third card")).toBeVisible();
+});
+
+test("a swap leaves the cards it did not change alone", async ({ page }) => {
+  await addCard(page, projectUrl, { title: "Neighbour" });
+  await page.goto(projectUrl);
+
+  await page.evaluate(() => {
+    window.__card = document.querySelector('[data-lane="todo"] .card');
+  });
+  const untouched = await page.evaluate(() => window.__card.id);
+
+  const id = await cardIn(page, "todo", "Neighbour").getAttribute("data-card-id");
+  await moveCard(page, id, "done", 0);
+  await expect(cardIn(page, "done", "Neighbour")).toBeVisible();
+
+  // The board really was replaced; `up-keep` is what saved this node.
+  expect(untouched).not.toBe(`card-${id}`);
+  expect(await page.evaluate(() => window.__card.isConnected)).toBe(true);
+});
+
+test("a swap keeps each lane's scroll position", async ({ page }) => {
+  await page.goto(projectUrl);
+
+  // Shrink the lane rather than seeding filler cards — every spec file shares
+  // one project. A style tag also survives the swap; an inline style would not.
+  await page.addStyleTag({ content: "#lane-todo { min-height: 0; max-height: 30px; }" });
+
+  // Set and read in one round trip: a tick landing between them would reset it.
+  const cards = lane(page, "todo");
+  const before = await cards.evaluate((el) => {
+    el.scrollTop = 60;
+    return el.scrollTop;
+  });
+  expect(before).toBeGreaterThan(0);
+
+  // Change a different lane, so this one's own content is untouched.
+  const id = await cardIn(page, "done", "Neighbour").getAttribute("data-card-id");
+  await moveCard(page, id, "in_review", 0);
+  await expect(cardIn(page, "in_review", "Neighbour")).toBeVisible();
+
+  expect(await cards.evaluate((el) => el.scrollTop)).toBe(before);
 });

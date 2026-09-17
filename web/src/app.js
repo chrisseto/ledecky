@@ -134,6 +134,10 @@ up.compiler("[data-sortable]", (lane) => {
       } finally {
         if (board) {
           up.radio.startPolling(board);
+          // This reload reconciles the optimistic move above with server truth,
+          // so it must not be answered with a 304 — a failed move would leave
+          // the card sitting in the wrong lane. The swap brings a fresh etag.
+          board.removeAttribute("up-etag");
           up.reload(board);
         }
       }

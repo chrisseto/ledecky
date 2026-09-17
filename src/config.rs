@@ -21,6 +21,10 @@ pub struct Settings {
     /// Executable spawned for an agent. Overridable so the end-to-end suite can
     /// substitute a scripted stand-in.
     pub agent_bin: String,
+
+    /// How often, in milliseconds, a polled fragment re-checks the server.
+    /// Overridable so the end-to-end suite does not have to wait in real time.
+    pub poll_interval: u64,
 }
 
 impl Settings {
@@ -36,10 +40,13 @@ impl Settings {
             .extract_inner("agent_bin")
             .unwrap_or_else(|_| "claude".to_owned());
 
+        let poll_interval = figment.extract_inner("poll_interval").unwrap_or(4000);
+
         Ok(Self {
             app_slug,
             data_dir,
             agent_bin,
+            poll_interval,
         })
     }
 
@@ -100,6 +107,7 @@ mod tests {
         let s = settings(&[("data_dir", "/srv/board")]);
         assert_eq!(s.app_slug, "kanban2");
         assert_eq!(s.agent_bin, "claude");
+        assert_eq!(s.poll_interval, 4000);
         assert_eq!(s.db_path(), PathBuf::from("/srv/board/kanban2.db"));
     }
 

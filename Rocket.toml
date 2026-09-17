@@ -12,4 +12,9 @@ app_slug = "kanban2"
 # scripted stand-in.
 agent_bin = "claude"
 
+# How often a polled fragment re-checks the server, in milliseconds. Unchanged
+# fragments answer 304 and are not re-rendered, so this is cheap. The end-to-end
+# suite shrinks it so it does not have to wait in real time.
+poll_interval = 4000
+
 # data_dir defaults to $XDG_DATA_HOME/<app_slug>; set it to override.

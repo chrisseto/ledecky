@@ -108,6 +108,7 @@ impl Shell<'_> {
             "board.html",
             context! {
                 project, lanes, overlay,
+                poll_interval => self.settings.poll_interval,
                 projects => projects.iter().zip(counts)
                     .map(|(project, cards)| context! { cards, ..minijinja::Value::from_serialize(project) })
                     .collect::<Vec<_>>(),

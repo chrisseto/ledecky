@@ -69,6 +69,22 @@ export async function comment(page, line, body) {
 }
 
 /**
+ * Collects the status of every board poll, ignoring the navigation that loaded
+ * the page. Call before `goto`; the returned array fills as ticks land.
+ */
+export function pollsOf(page, projectUrl) {
+  const path = new URL(projectUrl).pathname;
+  const statuses = [];
+
+  page.on("response", (response) => {
+    if (response.request().isNavigationRequest()) return;
+    if (new URL(response.url()).pathname === path) statuses.push(response.status());
+  });
+
+  return statuses;
+}
+
+/**
  * Drives a lane change the way the board's drag handler does.
  *
  * Synthesising HTML5 drag events against SortableJS is famously unreliable, and

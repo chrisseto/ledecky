@@ -85,6 +85,14 @@ so "sent" means sent.
 
 [delta]: https://github.com/dandavison/delta
 
+**Polling.** The board and the agent-state chip poll themselves through unpoly.
+Every template response carries an `ETag` over its own rendered bytes, so a poll
+that finds nothing new is answered `304` and unpoly skips the update entirely —
+the board is not re-rendered, and hover, selection and per-lane scroll survive.
+The board's etag is rendered into `up-etag` so even the first poll is
+conditional. When something has changed, `up-keep` on each card means only the
+cards that actually differ are replaced.
+
 **Merge.** Available in In Review. The server asks the agent to land its commits
 on the base branch and never rewrites branches itself. On the next turn it
 checks that the branch moved *and* that its tree matches the latest snapshot
@@ -101,6 +109,7 @@ variable:
 | `app_slug` | `kanban2` | Names the data directory and the `refs/<slug>/` namespace |
 | `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
 | `agent_bin` | `claude` | The executable spawned for an agent |
+| `poll_interval` | `4000` | How often a polled fragment re-checks the server, in ms |
 
 The port is fixed in `Rocket.toml` because hook URLs have to be stable.
 
