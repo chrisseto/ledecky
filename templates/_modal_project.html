@@ -1,0 +1,41 @@
+<div class="modal modal-project" role="dialog" aria-label="Add project">
+  <div class="modal-head">
+    <h2>Add project</h2>
+    <span class="spacer"></span>
+    <a class="btn icon-only" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
+       up-follow up-target="#overlay" aria-label="Close" data-close-overlay>{{ icon("x") }}</a>
+  </div>
+
+  <form method="post" action="/projects" up-submit up-target="body">
+    {% if project %}<input type="hidden" name="board" value="{{ project.id }}" />{% endif %}
+    {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
+
+    <label>
+      <span>Repository directory</span>
+      <input
+        name="path"
+        value="{{ path }}"
+        autocomplete="off"
+        autofocus
+        spellcheck="false"
+        class="mono"
+        data-complete-for="#completions"
+        data-complete-url="/projects/complete"
+      />
+    </label>
+
+    {% include "_completions.html" %}
+
+    <label>
+      <span>Name</span>
+      <input name="name" placeholder="Defaults to the folder name" />
+    </label>
+
+    <footer>
+      <span class="spacer"></span>
+      <a class="btn" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
+         up-follow up-target="#overlay" data-close-overlay>Cancel</a>
+      <button class="btn accent" type="submit">{{ icon("check") }} Add project</button>
+    </footer>
+  </form>
+</div>

@@ -1,6 +1,15 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, addedLines, cardIn, git, turnRefs } from "./support/board.mjs";
+import {
+  addCard,
+  addProject,
+  addedLines,
+  cardIn,
+  comment,
+  git,
+  openCard,
+  turnRefs,
+} from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -37,7 +46,7 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
 });
 
 test("the terminal streams the agent's screen", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
 
   const rows = page.locator(".terminal .xterm-rows");
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
@@ -52,33 +61,37 @@ test("the opening task is delivered and the finished turn moves the card to In R
   await page.goto(projectUrl);
   await expect(cardIn(page, "in_review", TITLE)).toBeVisible({ timeout: 15_000 });
 
+  // The board card carries what the turn changed.
+  await expect(cardIn(page, "in_review", TITLE).locator(".stat")).toContainText("+");
+
   // The snapshot captured the working tree even though the agent never committed.
   expect(addedLines(`refs/kanban2/${cardId}/base`, `refs/kanban2/${cardId}/turn-1`)).toContain(TASK);
 });
 
-test("the diff pane renders the change with scopes for each turn", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+test("the review pane lists the changed files with scopes for each turn", async ({ page }) => {
+  await openCard(page, cardId);
 
-  const diff = page.locator("#diff");
-  await expect(diff.locator(".file-head")).toContainText("main.rs");
+  const review = page.locator("#review");
+  await expect(review.locator(".file-node")).toHaveText([/main\.rs/]);
+  await expect(review.locator(".diff-head .path")).toContainText("main.rs");
   // Two lines change per turn now: the appended record, and a rewritten word.
-  await expect(diff.locator("tr.l-added", { hasText: TASK })).toBeVisible();
+  await expect(review.locator(".line.l-added", { hasText: TASK })).toBeVisible();
 
-  await expect(diff.locator("[data-diff-param='scope'] option")).toHaveText([
+  await expect(review.locator("[data-scope-select] option")).toHaveText([
     /All changes/,
     /Turn 1/,
     /Since turn 1/,
   ]);
 
   // The agent's closing message is surfaced outside the terminal.
-  await expect(diff.locator(".last-message")).toContainText("applied turn 1");
+  await expect(review.locator(".last-message")).toContainText("applied turn 1");
 });
 
 test("only the word that changed is marked, not the whole line", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
 
   // The agent rewrote `"hi"` to `"turn-1"` on an existing line.
-  const rewritten = page.locator("#diff tr.l-added", { hasText: "println!" });
+  const rewritten = page.locator("#review .line.l-added", { hasText: "println!" });
   await expect(rewritten).toBeVisible();
 
   const marked = rewritten.locator(".chg");
@@ -89,56 +102,71 @@ test("only the word that changed is marked, not the whole line", async ({ page }
 });
 
 test("syntax highlighting arrives as classes the page controls", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
 
-  const diff = page.locator("#diff");
-  await expect(diff.locator(".tok-string").first()).toBeVisible();
-  await expect(diff.locator(".tok-comment").first()).toBeVisible();
+  const review = page.locator("#review");
+  await expect(review.locator(".tok-string").first()).toBeVisible();
+  await expect(review.locator(".tok-comment").first()).toBeVisible();
 
   // Colour belongs to the stylesheet, so nothing should carry an inline one.
-  await expect(diff.locator("td.code [style*='color']")).toHaveCount(0);
+  await expect(review.locator(".code [style*='color']")).toHaveCount(0);
 });
 
-test("the context selector widens the window without another diff run", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+test("a folded hunk opens a gap at a time and stays open around a comment", async ({ page }) => {
+  await openCard(page, cardId);
 
-  const rows = page.locator("#diff tr.l");
-  const narrow = await rows.count();
+  const lines = page.locator("#review .line");
+  const narrow = await lines.count();
 
-  // Selected by label: the value is usize::MAX, which JS cannot hold exactly.
-  await page.locator("[data-diff-param='context']").selectOption({ label: "Whole file" });
+  await page.getByRole("link", { name: /Expand \d+ lines above/ }).first().click();
+  await expect.poll(() => lines.count()).toBeGreaterThan(narrow);
 
-  // Whole-file context shows strictly more of the file.
-  await expect.poll(() => rows.count()).toBeGreaterThan(narrow);
+  const opened = await lines.count();
+
+  // The whole file is strictly more again, and once it is open there is nothing
+  // left to expand.
+  await page.getByRole("link", { name: "Expand whole file" }).click();
+  await expect.poll(() => lines.count()).toBeGreaterThan(opened);
+  await expect(page.getByRole("link", { name: /Expand/ })).toHaveCount(0);
+
+  const whole = await lines.count();
 
   // And the widened view survives a comment landing on it.
-  await page.locator("#diff tr.l").first().click();
-  await page.locator(".comment-form textarea").fill("still wide?");
-  await page.getByRole("button", { name: "Add comment" }).click();
+  await comment(page, lines.first(), "still wide?");
+  await expect(page.locator("#review .comment")).toBeVisible();
+  await expect(lines).toHaveCount(whole);
+});
 
-  await expect(page.locator("#diff .comment")).toBeVisible();
-  await expect.poll(() => rows.count()).toBeGreaterThan(narrow);
+test("a file can be ticked off, which folds it away until it is untucked", async ({ page }) => {
+  await openCard(page, cardId);
+
+  await page.getByRole("button", { name: "Viewed" }).click();
+  await expect(page.locator("#review .collapsed")).toBeVisible();
+  await expect(page.locator("#review .file-node.viewed")).toBeVisible();
+
+  // The tick outlives the fragment it was made on.
+  await page.reload();
+  await expect(page.locator("#review .collapsed")).toBeVisible();
+
+  await page.getByRole("button", { name: /Viewed — collapsed/ }).click();
+  await expect(page.locator("#review .line").first()).toBeVisible();
 });
 
 test("a review comment goes back to the agent and produces its own turn", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
 
-  // Clicking a diff line opens the comment form beneath it.
-  await page.locator("#diff tr.l-added").first().click();
-  const form = page.locator(".comment-form");
-  await expect(form).toBeVisible();
+  // Clicking a diff line opens the compose box beneath it; clicking away saves.
+  await comment(page, page.locator("#review .line.l-added").first(), "Say hello instead.");
 
-  await form.locator("textarea").fill("Say hello instead.");
-  await form.getByRole("button", { name: "Add comment" }).click();
+  const draft = page.locator("#review .comment", { hasText: "Say hello instead." });
+  await expect(draft).toBeVisible();
+  await expect(draft.locator(".tag")).toHaveText("draft");
+  await expect(page.locator("#review .batch-label")).toContainText("pending");
 
-  const comment = page.locator("#diff .comment");
-  await expect(comment).toContainText("Say hello instead.");
-  await expect(comment.locator(".tag")).toHaveText("draft");
-
-  await page.getByRole("button", { name: /Submit review/ }).click();
+  await page.getByRole("button", { name: /Send \d+ to agent/ }).click();
 
   // Once sent the comment stays put, marked as delivered.
-  await expect(page.locator("#diff .comment .tag")).toHaveText("sent to agent");
+  await expect(draft.locator(".tag")).toHaveText("sent to agent");
   await expectTurns(2);
 
   // Scoping to the second turn shows only what the review round added.
@@ -147,11 +175,24 @@ test("a review comment goes back to the agent and produces its own turn", async 
   expect(scoped).not.toContain(TASK);
 });
 
+test("drafts can be thrown away in one go", async ({ page }) => {
+  await openCard(page, cardId);
+
+  await comment(page, page.locator("#review .line.l-added").first(), "Second thoughts.");
+  await expect(page.locator("#review .comment-draft")).toBeVisible();
+
+  await page.getByRole("button", { name: "Discard" }).click();
+
+  await expect(page.locator("#review .comment-draft")).toHaveCount(0);
+  // What was already sent is not a draft, so it stays.
+  await expect(page.locator("#review .comment-submitted")).toBeVisible();
+});
+
 test("merging lands the work on the base branch and retires the card", async ({ page }) => {
   const before = git("rev-parse", "main");
 
-  await page.goto(`/cards/${cardId}`);
-  await page.getByRole("button", { name: /Merge into main/ }).click();
+  await openCard(page, cardId);
+  await page.getByRole("button", { name: "Merge" }).click();
 
   await expect.poll(() => git("rev-parse", "main"), { timeout: 25_000 }).not.toBe(before);
 

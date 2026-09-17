@@ -1,0 +1,206 @@
+{% set view = "scope=" ~ scope ~ "&amp;file=" ~ (file.path | default("") | urlencode) %}
+{% set diff = "/cards/" ~ card.id ~ "/diff?" ~ view %}
+
+<div class="review" id="review" data-card="{{ card.id }}"
+     data-scope="{{ scope }}" data-file="{{ file.path | default('') }}" data-expand="{{ expand }}">
+  {% if not file %}
+    <p class="empty">
+      Nothing in this range yet on <span class="mono">{{ card.base_branch }}</span>.
+    </p>
+  {% else %}
+    <nav class="tree">
+      <div class="tree-head">
+        <select data-scope-select aria-label="Range">
+          {% for option in scopes %}
+            <option value="{{ option.key }}" {% if option.selected %}selected{% endif %}>
+              {{ option.label }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="tree-body">
+        {% for group in tree %}
+          {% if group.dir %}
+            <details class="dir" open>
+              <summary class="mono">
+                {{ icon("chevron-right") }}{{ group.dir }}/
+                <span class="hidden-count">{{ group.files | length }} files</span>
+              </summary>
+          {% endif %}
+
+          {% for node in group.files %}
+            <a class="file-node mono {% if node.selected %}selected{% endif %} {% if node.viewed %}viewed{% endif %}"
+               href="/cards/{{ card.id }}/diff?scope={{ scope }}&amp;file={{ node.path | urlencode }}"
+               up-follow up-target="#review" title="{{ node.path }}">
+              <span class="tick">{% if node.viewed %}{{ icon("check") }}{% endif %}</span>
+              <span class="name">{{ node.name }}</span>
+              {% if node.comments %}
+                <span class="badge" title="comments">{{ node.comments }}</span>
+              {% endif %}
+              <span class="stat">
+                <span class="adds">+{{ node.additions }}</span>
+                <span class="dels">−{{ node.deletions }}</span>
+              </span>
+            </a>
+          {% endfor %}
+
+          {% if group.dir %}</details>{% endif %}
+        {% endfor %}
+      </div>
+
+      {% if turn_note %}<p class="tree-foot">{{ turn_note }}</p>{% endif %}
+    </nav>
+
+    <div class="diff">
+      <header class="diff-head">
+        <form method="post" action="/cards/{{ card.id }}/viewed" up-submit up-target="#review">
+          <input type="hidden" name="file_path" value="{{ file.path }}" />
+          <input type="hidden" name="scope" value="{{ scope }}" />
+          <button class="viewed {% if file.collapsed %}on{% endif %}" type="submit"
+                  title="Mark this file as read">
+            <span class="box">{{ icon("check") }}</span> Viewed
+          </button>
+        </form>
+
+        <span class="path mono">{{ file.path }}</span>
+
+        <span class="spacer"></span>
+
+        {% if can_expand_all %}
+          <a class="btn small" href="{{ diff }}&amp;expand=file"
+             up-follow up-target="#review">Expand whole file</a>
+        {% endif %}
+
+        <span class="stat mono">
+          <span class="adds">+{{ file.additions }}</span>
+          <span class="dels">−{{ file.deletions }}</span>
+        </span>
+      </header>
+
+      {% if file.collapsed %}
+        <div class="collapsed">
+          <form method="post" action="/cards/{{ card.id }}/viewed" up-submit up-target="#review">
+            <input type="hidden" name="file_path" value="{{ file.path }}" />
+            <input type="hidden" name="scope" value="{{ scope }}" />
+            <button class="btn" type="submit">
+              {{ icon("check") }} Viewed — collapsed. Click to reopen.
+            </button>
+          </form>
+        </div>
+      {% elif file.binary %}
+        <p class="empty">Binary file.</p>
+      {% else %}
+        <div class="lines">
+          {% for hunk in hunks %}
+            {% if hunk.above %}
+              <div class="expander">
+                <a href="{{ diff }}&amp;expand={{ hunk.above.step_key }}" up-follow up-target="#review">
+                  {{ icon("chevron-up") }} Expand {{ hunk.above.step }} lines above
+                </a>
+                <a class="all" href="{{ diff }}&amp;expand={{ hunk.above.all_key }}"
+                   up-follow up-target="#review">all {{ hunk.above.lines }}</a>
+              </div>
+            {% endif %}
+
+            {% for line in hunk.lines %}
+              <div class="line l-{{ line.kind }}"
+                   data-file="{{ file.path }}" data-anchor="{{ line.anchor }}"
+                   title="Comment on this line">
+                <span class="add">+</span>
+                <span class="n">{{ line.old_line if line.old_line else "" }}</span>
+                <span class="n">{{ line.new_line if line.new_line else "" }}</span>
+                <span class="sign"></span>
+                <span class="code">{{ line.html | safe }}</span>
+              </div>
+
+              {% set key = file.path ~ "#" ~ line.anchor %}
+              {% if threads[key] %}
+                <div class="thread">
+                  {% for comment in threads[key] %}
+                    <div class="comment comment-{{ comment.state }}">
+                      <div class="comment-body">{{ comment.body }}</div>
+                      <div class="comment-meta">
+                        {% if comment.state == "draft" %}
+                          <span class="tag">draft</span>
+                          <form method="post"
+                                action="/cards/{{ card.id }}/comments/{{ comment.id }}/delete"
+                                up-submit up-target="#review">
+                            <input type="hidden" name="scope" value="{{ scope }}" />
+                            <input type="hidden" name="file" value="{{ file.path }}" />
+                            <input type="hidden" name="expand" value="{{ expand }}" />
+                            <button class="link" type="submit">Remove</button>
+                          </form>
+                        {% else %}
+                          <span class="tag tag-sent">sent to agent</span>
+                        {% endif %}
+                      </div>
+                    </div>
+                  {% endfor %}
+                </div>
+              {% endif %}
+            {% endfor %}
+
+            {% if hunk.below %}
+              <div class="expander">
+                <a href="{{ diff }}&amp;expand={{ hunk.below.step_key }}" up-follow up-target="#review">
+                  {{ icon("chevron-down") }} Expand {{ hunk.below.step }} lines below
+                </a>
+                <a class="all" href="{{ diff }}&amp;expand={{ hunk.below.all_key }}"
+                   up-follow up-target="#review">all {{ hunk.below.lines }}</a>
+              </div>
+            {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if last_message %}<div class="last-message">{{ last_message }}</div>{% endif %}
+
+      <footer class="batch {% if drafts %}pending{% endif %}">
+        <span class="batch-label">
+          {% if drafts %}
+            {{ drafts }} comment{{ "" if drafts == 1 else "s" }} pending
+          {% elif submitted %}
+            {{ submitted }} sent · add comments to send a batch
+          {% else %}
+            Click a line to comment
+          {% endif %}
+        </span>
+
+        <span class="spacer"></span>
+
+        {% if drafts %}
+          <form method="post" action="/cards/{{ card.id }}/comments/discard"
+                up-submit up-target="#review">
+            <input type="hidden" name="scope" value="{{ scope }}" />
+            <input type="hidden" name="file" value="{{ file.path }}" />
+            <input type="hidden" name="expand" value="{{ expand }}" />
+            <button class="btn" type="submit">Discard</button>
+          </form>
+        {% endif %}
+
+        <form method="post" action="/cards/{{ card.id }}/review" up-submit up-target="#review">
+          <input type="hidden" name="scope" value="{{ scope }}" />
+          <input type="hidden" name="file" value="{{ file.path }}" />
+          <input type="hidden" name="expand" value="{{ expand }}" />
+          <button class="btn accent" type="submit" {% if not drafts %}disabled{% endif %}>
+            {{ icon("send") }}
+            {% if drafts %}Send {{ drafts }} to agent{% else %}Send to agent{% endif %}
+          </button>
+        </form>
+      </footer>
+
+      <form class="compose" hidden method="post" action="/cards/{{ card.id }}/comments"
+            up-submit up-target="#review">
+        <input type="hidden" name="file_path" />
+        <input type="hidden" name="side" />
+        <input type="hidden" name="line" />
+        <input type="hidden" name="scope" value="{{ scope }}" />
+        <input type="hidden" name="file" value="{{ file.path }}" />
+        <input type="hidden" name="expand" value="{{ expand }}" />
+        <textarea name="body" rows="3"
+                  placeholder="Comment on this line — click away to save"></textarea>
+      </form>
+    </div>
+  {% endif %}
+</div>

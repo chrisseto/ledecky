@@ -123,6 +123,7 @@ pub struct Card {
     pub description: String,
     pub base_branch: String,
     pub lane: Lane,
+    pub lane_label: &'static str,
     pub position: f64,
     pub permission_mode: String,
     pub model: Option<String>,
@@ -147,19 +148,22 @@ pub struct NewCard<'a> {
 }
 
 impl Card {
-    const COLUMNS: &'static str = "id, project_id, title, description, base_branch, lane, position, \
+    const COLUMNS: &'static str =
+        "id, project_id, title, description, base_branch, lane, position, \
          permission_mode, model, worktree_path, session_id, agent_pid, agent_state, \
          merge_requested, created_at, updated_at";
 
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let agent_state = AgentState::parse(&row.get::<_, String>("agent_state")?);
+        let lane = Lane::parse(&row.get::<_, String>("lane")?);
         Ok(Self {
             id: row.get("id")?,
             project_id: row.get("project_id")?,
             title: row.get("title")?,
             description: row.get("description")?,
             base_branch: row.get("base_branch")?,
-            lane: Lane::parse(&row.get::<_, String>("lane")?),
+            lane,
+            lane_label: lane.label(),
             position: row.get("position")?,
             permission_mode: row.get("permission_mode")?,
             model: row.get("model")?,
@@ -407,7 +411,10 @@ mod tests {
         let second = add(&conn, project_id, "second");
 
         let cards = Card::for_project(&conn, project_id);
-        assert_eq!(cards.iter().map(|c| c.id).collect::<Vec<_>>(), [first, second]);
+        assert_eq!(
+            cards.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [first, second]
+        );
         assert!(cards.iter().all(|c| c.lane == Lane::Todo));
         assert_eq!(cards[0].agent_state, AgentState::Stopped);
     }

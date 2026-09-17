@@ -40,7 +40,7 @@ test("adding a repository opens its board", async ({ page }) => {
     await expect(page.getByText(name, { exact: true })).toBeVisible();
   }
 
-  // And it is listed back on the landing page.
-  await page.goto("/");
-  await expect(page.locator(".project-card")).toContainText("repo");
+  // And it is listed in the switcher, which opens over the board it came from.
+  await page.getByTitle("Switch project").click();
+  await expect(page.locator(".drawer-projects .project-card.current")).toContainText("repo");
 });

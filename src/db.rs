@@ -9,6 +9,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/001_init.sql"),
     include_str!("../migrations/002_merge.sql"),
     include_str!("../migrations/003_agent_pid.sql"),
+    include_str!("../migrations/004_review_viewed.sql"),
 ];
 
 /// A single connection behind a mutex.
@@ -40,7 +41,9 @@ impl Db {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -89,7 +92,14 @@ pub mod tests {
         let db = memory_db();
         let conn = db.lock();
 
-        for table in ["projects", "cards", "turns", "comments", "events"] {
+        for table in [
+            "projects",
+            "cards",
+            "turns",
+            "comments",
+            "events",
+            "review_viewed",
+        ] {
             let count: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

@@ -2,8 +2,12 @@
 
 A local kanban board for Claude Code agents. Each card that reaches **In
 Progress** gets its own detached git worktree and a live `claude` process; the
-terminal streams to the browser over a WebSocket, and a GitHub-style diff pane
+terminal streams to the browser over a WebSocket, and a GitHub-style review pane
 beside it turns review comments back into prompts.
+
+The board is the whole interface. Opening a card, switching project, and both
+forms are drawers and modals over it, each with its own URL — so a reload lands
+back where you were and the back button closes what is open.
 
 ```
 To Do  ──drag──▶  In Progress  ──agent idles──▶  In Review  ──merge──▶  Done
@@ -50,11 +54,29 @@ Delta is run with its backgrounds pinned to sentinel colours, so its output is a
 vocabulary we control; `src/review/ansi.rs` maps those and the syntax palette to
 CSS classes, keeping the actual colours in `app.css`.
 
-The parse is cached per resolved commit pair and is independent of the context
-window, so the 3 / 10 / whole-file selector is a re-slice rather than another run.
+The parse is cached per resolved commit pair and holds every line of the file, so
+selecting a file, opening a hunk, or widening to the whole file is a re-slice
+rather than another run.
 
-Click any diff line to comment. *Submit review* formats the drafts into one
-message and pastes it into the agent's terminal.
+One file is shown at a time, picked from the tree beside it. The diff opens with
+three lines of context; *Expand N lines above/below* takes a bite out of a gap
+and *Expand whole file* opens all of them. What is open lives in the pane's
+query string, so nothing about it is server state. Ticking *Viewed* folds a file
+away, and that much is remembered per card.
+
+Click any diff line to comment; clicking away saves it as a draft. *Send N to
+agent* formats the batch into one message and pastes it into the agent's
+terminal.
+
+**Talking to the terminal.** Every message the server sends the agent — the
+opening task, a review — goes in as a bracketed paste, because the TUI reads a
+bare newline as *submit*. Nothing is sent until the input box is actually on
+screen, and the submit key is not sent until the paste is visibly in it: a
+client still starting up *queues* what it is handed, somewhere the box is not
+and Enter cannot reach, and a dialog — the workspace-trust prompt, the
+`bypassPermissions` consent — swallows it, where a blind Enter would answer the
+dialog instead. Delivery is confirmed by watching the box let go of the text,
+so "sent" means sent.
 
 [delta]: https://github.com/dandavison/delta
 
@@ -77,9 +99,11 @@ variable:
 
 The port is fixed in `Rocket.toml` because hook URLs have to be stable.
 
-Per-card permission mode and model are set on the card form. `bypassPermissions`
-shows a one-time consent dialog in the terminal — answer it there; the card
-reports `needs permission` until you do.
+Per-card permission mode and model are set on the new-card form, whose one Task
+field doubles as the card's title: the first line names the card, the whole
+thing is what the agent is told. `bypassPermissions` shows a one-time consent
+dialog in the terminal — answer it there; the card reports `needs permission`
+until you do.
 
 ## Layout
 
@@ -89,9 +113,14 @@ folder:
 ```
 src/project/   project.rs card.rs board.rs   models, their SQL, their routes
 src/agent/     agent.rs session.rs terminal.rs webhooks.rs
-src/review/    turn.rs comment.rs scope.rs diff.rs routes.rs
+src/review/    turn.rs comment.rs scope.rs expand.rs viewed.rs
+               diff.rs ansi.rs cache.rs routes.rs
 src/           config.rs db.rs git.rs hooks.rs tmpl.rs
 ```
+
+`board.rs` owns the shell every page is: `Shell::render` draws the board and
+whatever overlay a route asked for, so there is one template for the whole app
+and one place that decides what is on screen.
 
 Each entity owns its own queries — `Card::find`, `Turn::latest`,
 `Comment::drafts` — rather than a shared query module.
@@ -126,10 +155,11 @@ the server at it via `XDG_DATA_HOME` — nothing touches a real board.
 
 `tests/fake-agent.mjs` stands in for `claude`, selected through
 `KANBAN2_AGENT_BIN`. It imitates only what the app couples to: an input box at
-the bottom of the screen, bracketed-paste handling that collapses long pastes,
-a modal that swallows pastes and reads a bare Enter as "exit", and the HTTP
-hooks named in its own `--settings`. That makes worktrees, turn snapshots, lane
-transitions, review submission and merge deterministic and free to run.
+the bottom of the screen, a startup window with no box at all where anything
+sent is queued out of its reach, bracketed-paste handling that collapses long
+pastes, a modal that swallows pastes and reads a bare Enter as "exit", and the
+HTTP hooks named in its own `--settings`. That makes worktrees, turn snapshots,
+lane transitions, review submission and merge deterministic and free to run.
 
 `tests/modals.spec.mjs` is the regression guard worth knowing about: injection
 must verify its own paste landed before sending Enter, because a modal would

@@ -99,9 +99,14 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64) {
         if agent.flush_pending_prompt() {
             break;
         }
-        if waited.is_zero() {
+
+        // A dialog is the user's to answer, so say so. A client that has not
+        // drawn its input box yet is only slow to start, and reporting that as a
+        // permission prompt sends them looking for one that is not there.
+        if agent.is_blocked() {
             set_state(&db, card_id, AgentState::AwaitingPermission);
         }
+
         if waited >= PROMPT_TIMEOUT {
             warn!("card {card_id}: could not deliver the opening prompt; the terminal is blocked");
             return;
@@ -110,7 +115,7 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64) {
         waited += READY_DELAY;
     }
 
-    set_state(&db, card_id, AgentState::Running);
+    mark_delivered(&db, card_id);
 
     // Silence past this point means our hook URLs are not reaching us — most
     // likely an `allowedHttpHookUrls` allowlist. Without hooks there are no turn
@@ -144,13 +149,7 @@ pub fn stop(db: &Db, agents: &Agents, card_id: i64) {
 }
 
 /// Kills the agent and removes the worktree. Turn refs are kept.
-pub fn teardown(
-    db: &Db,
-    agents: &Agents,
-    settings: &Settings,
-    cache: &DiffCache,
-    card_id: i64,
-) {
+pub fn teardown(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCache, card_id: i64) {
     stop(db, agents, card_id);
 
     let conn = db.lock();
@@ -179,6 +178,27 @@ pub fn set_state(db: &Db, card_id: i64, state: AgentState) {
     Card::set_agent_state(&db.lock(), card_id, state);
 }
 
+/// Records that the opening prompt went in — unless the hooks have already moved
+/// the card on.
+///
+/// Delivery is confirmed by watching the screen, which takes long enough that a
+/// quick agent can finish the whole turn first. Writing `running` over the
+/// `idle` its `Stop` hook just recorded would leave the card claiming to be
+/// working for as long as it sat there.
+fn mark_delivered(db: &Db, card_id: i64) {
+    let conn = db.lock();
+    let Some(card) = Card::find(&conn, card_id) else {
+        return;
+    };
+
+    if matches!(
+        card.agent_state,
+        AgentState::Starting | AgentState::AwaitingPermission
+    ) {
+        Card::set_agent_state(&conn, card_id, AgentState::Running);
+    }
+}
+
 /// Asks the agent to land its work on the base branch.
 ///
 /// The server never rewrites the user's branches itself — conflicts are exactly
@@ -199,11 +219,16 @@ pub fn request_merge(db: &Db, agents: &Agents, card_id: i64) -> Result<()> {
     let base_sha = git::run(&repo, &["rev-parse", &card.base_branch])
         .with_context(|| format!("resolving {}", card.base_branch))?;
 
+    // Recorded before the prompt goes in: the agent can land the merge and fire
+    // its `Stop` hook while delivery is still being confirmed, and a hook that
+    // arrives without this reads the turn as ordinary work.
+    Card::request_merge(&db.lock(), card_id, &base_sha);
+
     if !agent.inject(&merge_prompt(&card.base_branch, &repo)) {
+        Card::clear_merge_request(&db.lock(), card_id);
         bail!("the terminal is busy; answer the prompt showing in it first");
     }
 
-    Card::request_merge(&db.lock(), card_id, &base_sha);
     Ok(())
 }
 
@@ -228,7 +253,12 @@ fn merge_prompt(branch: &str, repo: &Path) -> String {
 /// A moved branch is not enough on its own, and ancestry does not survive a
 /// rebase, so the test is that the branch moved *and* now carries the same tree
 /// as the snapshot taken at the end of the turn.
-fn merge_landed(before: Option<&str>, after: &str, base_tree: Option<&str>, turn_tree: Option<&str>) -> bool {
+fn merge_landed(
+    before: Option<&str>,
+    after: &str,
+    base_tree: Option<&str>,
+    turn_tree: Option<&str>,
+) -> bool {
     if Some(after) == before {
         return false;
     }
@@ -236,13 +266,7 @@ fn merge_landed(before: Option<&str>, after: &str, base_tree: Option<&str>, turn
 }
 
 /// Called after each turn snapshot while a merge is outstanding.
-pub fn check_merge(
-    db: &Db,
-    agents: &Agents,
-    settings: &Settings,
-    cache: &DiffCache,
-    card_id: i64,
-) {
+pub fn check_merge(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCache, card_id: i64) {
     let conn = db.lock();
     let Some(card) = Card::find(&conn, card_id).filter(|c| c.merge_requested) else {
         return;
@@ -259,11 +283,16 @@ pub fn check_merge(
         return;
     };
 
-    let tree_of = |rev: &str| git::run(&repo, &[ "rev-parse", &format!("{rev}^{{tree}}")]).ok();
+    let tree_of = |rev: &str| git::run(&repo, &["rev-parse", &format!("{rev}^{{tree}}")]).ok();
     let base_tree = tree_of(&after);
     let turn_tree = latest.as_ref().and_then(|t| tree_of(&t.commit_sha));
 
-    if !merge_landed(before.as_deref(), &after, base_tree.as_deref(), turn_tree.as_deref()) {
+    if !merge_landed(
+        before.as_deref(),
+        &after,
+        base_tree.as_deref(),
+        turn_tree.as_deref(),
+    ) {
         info!(
             "card {card_id}: {} has not taken the work yet",
             card.base_branch
@@ -271,7 +300,10 @@ pub fn check_merge(
         return;
     }
 
-    info!("card {card_id}: merged into {} at {after}", card.base_branch);
+    info!(
+        "card {card_id}: merged into {} at {after}",
+        card.base_branch
+    );
     {
         let conn = db.lock();
         Card::set_lane(&conn, card_id, Lane::Done);
@@ -402,7 +434,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("kanban2-sweep-{}-{name}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("kanban2-sweep-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path

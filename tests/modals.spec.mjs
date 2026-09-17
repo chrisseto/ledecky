@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, turnRefs } from "./support/board.mjs";
+import { addCard, addProject, cardIn, comment, openCard, turnRefs } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -32,7 +32,7 @@ test("a consent dialog holds the opening prompt instead of being answered by it"
   await page.goto(projectUrl);
   await cardIn(page, "todo", TITLE).dragTo(page.locator('[data-lane="in_progress"]'));
 
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
   const rows = page.locator(".terminal .xterm-rows");
   await expect(rows).toContainText("Bypass Permissions mode", { timeout: 15_000 });
 
@@ -48,7 +48,7 @@ test("a consent dialog holds the opening prompt instead of being answered by it"
 });
 
 test("answering the dialog in the terminal releases the queued prompt", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
   const rows = page.locator(".terminal .xterm-rows");
   await expect(rows).toContainText("Bypass Permissions mode", { timeout: 15_000 });
 
@@ -65,17 +65,20 @@ test("answering the dialog in the terminal releases the queued prompt", async ({
 });
 
 test("a tool permission prompt shows on the card and resumes when answered", async ({ page }) => {
-  await page.goto(`/cards/${cardId}`);
+  await openCard(page, cardId);
 
   // The marker makes the fake agent raise a PermissionRequest for its next turn.
-  await page.locator("#diff tr.l-added").first().click();
-  const form = page.locator(".comment-form");
-  await form.locator("textarea").fill("[needs-permission] run the formatter");
-  await form.getByRole("button", { name: "Add comment" }).click();
-  await page.getByRole("button", { name: /Submit review/ }).click();
+  await page.locator('label[for="tab-review"]').click();
+  await comment(
+    page,
+    page.locator("#review .line.l-added").first(),
+    "[needs-permission] run the formatter",
+  );
+  await page.getByRole("button", { name: /Send \d+ to agent/ }).click();
 
   await expect(page.locator("#agent-state")).toContainText("needs permission", { timeout: 15_000 });
 
+  await page.locator('label[for="tab-agent"]').click();
   const rows = page.locator(".terminal .xterm-rows");
   await expect(rows).toContainText("needs approval");
   await page.locator(".terminal .xterm-helper-textarea").press("1");

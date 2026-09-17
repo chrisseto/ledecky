@@ -1,0 +1,16 @@
+{#
+  Everything that opens over the board. One region, one swap: every link that
+  opens or closes an overlay targets `#overlay`, and the server answers with the
+  whole page — so the board underneath is never re-rendered, and the terminal in
+  an open drawer is never torn down by something happening beside it.
+#}
+{% if overlay %}
+  <a class="scrim" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
+     up-follow up-target="#overlay" aria-label="Close" data-close-overlay></a>
+
+  {% if overlay == "card" %}{% include "_drawer_card.html" %}
+  {% elif overlay == "projects" %}{% include "_drawer_projects.html" %}
+  {% elif overlay == "newcard" %}{% include "_modal_card.html" %}
+  {% elif overlay == "addproject" %}{% include "_modal_project.html" %}
+  {% endif %}
+{% endif %}

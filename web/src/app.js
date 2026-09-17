@@ -8,6 +8,36 @@ import { FitAddon } from "@xterm/addon-fit";
 
 const { up } = window;
 
+// ---- overlays ---------------------------------------------------------------
+// Drawers and modals are server-rendered into #overlay, so closing one is a
+// navigation like any other: Escape follows the same link the scrim carries.
+
+up.on("keydown", (event) => {
+  if (event.key !== "Escape") return;
+
+  const compose = document.querySelector(".compose:not([hidden])");
+  if (compose) {
+    compose.dispatchEvent(new CustomEvent("cancel-comment", { bubbles: true }));
+    return;
+  }
+
+  document.querySelector("#overlay [data-close-overlay]")?.click();
+});
+
+// ⌘↵ submits a form; adding shift takes the second button, which keeps the form
+// open for the next one.
+up.compiler("[data-submit-shortcuts]", (form) => {
+  const submit = (event) => {
+    if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
+    event.preventDefault();
+
+    const buttons = form.querySelectorAll('button[type="submit"]');
+    (event.shiftKey ? buttons[0] : buttons[buttons.length - 1]).click();
+  };
+
+  form.addEventListener("keydown", submit);
+});
+
 // ---- server-rendered autocomplete -------------------------------------------
 // The input names its own target and endpoint; every keystroke re-renders that
 // fragment from the server. No client-side filtering or matching logic.
@@ -35,9 +65,47 @@ up.on("click", ".completions button[data-path]", (event, button) => {
   event.preventDefault();
   const input = document.querySelector("[data-complete-for]");
   if (!input) return;
+
   input.value = button.dataset.path;
   input.focus();
   input.dispatchEvent(new Event("input", { bubbles: true }));
+});
+
+// ---- branch picker ----------------------------------------------------------
+// The whole branch list is already on the page, so narrowing it is a filter over
+// the rendered options rather than a round trip.
+
+up.compiler("[data-branch-filter]", (input) => {
+  const menu = input.parentElement.querySelector(".combo-menu");
+  const options = [...menu.querySelectorAll("[data-branch]")];
+  const noMatch = menu.querySelector(".empty-match");
+
+  const filter = () => {
+    const wanted = input.value.trim().toLowerCase();
+    let shown = 0;
+
+    for (const option of options) {
+      const matches = option.textContent.trim().toLowerCase().includes(wanted);
+      option.hidden = !matches;
+      shown += matches ? 1 : 0;
+    }
+
+    noMatch.hidden = shown > 0;
+    menu.hidden = false;
+  };
+
+  input.addEventListener("focus", filter);
+  input.addEventListener("input", filter);
+  // Late enough for a click on an option to land first.
+  input.addEventListener("blur", () => setTimeout(() => { menu.hidden = true; }, 120));
+
+  menu.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-branch]");
+    if (!option) return;
+
+    input.value = option.textContent.trim();
+    menu.hidden = true;
+  });
 });
 
 // ---- kanban drag and drop ---------------------------------------------------
@@ -86,13 +154,13 @@ up.compiler("[data-terminal]", (host) => {
     fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono").trim(),
     fontSize: 13,
     scrollback: 5000,
-    theme: { background: "#0a0c10", foreground: "#dbe0ea" },
+    // The ground and text of the pane it sits in, which xterm needs as hex.
+    theme: { background: "#0f1318", foreground: "#d5d0c8" },
   });
 
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(host);
-  fit.fit();
 
   const url = new URL(host.dataset.terminal, location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -100,7 +168,7 @@ up.compiler("[data-terminal]", (host) => {
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
 
-  socket.addEventListener("open", () => postSize());
+  socket.addEventListener("open", () => resize());
   socket.addEventListener("message", (event) => {
     term.write(new Uint8Array(event.data));
   });
@@ -114,21 +182,29 @@ up.compiler("[data-terminal]", (host) => {
   });
 
   let sent = "";
-  const postSize = () => {
+
+  // NB: the review tab hides this pane, which then measures 0x0. Fitting to
+  // that would reflow the agent's screen into a single cell — for nobody, and
+  // destructively: the pty is the agent's real terminal. Measuring only while
+  // the pane is on screen leaves the last good size in place until it is back.
+  const resize = () => {
+    if (!host.clientWidth || !host.clientHeight) return;
+
+    fit.fit();
     const { rows, cols } = term;
     const key = `${rows}x${cols}`;
     if (key === sent) return;
+
     sent = key;
     up.request(host.dataset.resizeUrl, { method: "post", params: { rows, cols } });
   };
 
+  resize();
+
   let debounce;
   const observer = new ResizeObserver(() => {
     clearTimeout(debounce);
-    debounce = setTimeout(() => {
-      fit.fit();
-      postSize();
-    }, 80);
+    debounce = setTimeout(resize, 80);
   });
   observer.observe(host);
 
@@ -140,62 +216,65 @@ up.compiler("[data-terminal]", (host) => {
 });
 
 // ---- review comments --------------------------------------------------------
-// Clicking a diff line moves the (single) comment form under it and points it at
-// that line. The server owns everything else.
+// Clicking a diff line moves the (single) compose box under it and points it at
+// that line. Clicking away saves it as a draft; the server owns everything else.
 
-up.compiler(".diff", (diff) => {
-  const form = diff.querySelector(".comment-form");
+up.compiler(".review", (review) => {
+  const form = review.querySelector(".compose");
   if (!form) return;
+
+  const textarea = form.querySelector("textarea");
 
   const close = () => {
     form.hidden = true;
-    form.querySelector("textarea").value = "";
-    diff.querySelectorAll("tr.commenting").forEach((tr) => tr.classList.remove("commenting"));
+    textarea.value = "";
+    review.querySelectorAll(".line.commenting").forEach((line) => line.classList.remove("commenting"));
   };
 
-  const open = (row) => {
-    const [side, line] = row.dataset.anchor.split(":");
-    form.elements.file_path.value = row.dataset.file;
+  const open = (line) => {
+    const [side, number] = line.dataset.anchor.split(":");
+    form.elements.file_path.value = line.dataset.file;
     form.elements.side.value = side;
-    form.elements.line.value = line;
+    form.elements.line.value = number;
 
-    const holder = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.colSpan = 3;
-    cell.appendChild(form);
-    holder.appendChild(cell);
-    row.after(holder);
-
+    line.after(form);
     form.hidden = false;
-    row.classList.add("commenting");
-    form.querySelector("textarea").focus();
+    line.classList.add("commenting");
+    textarea.focus();
   };
 
-  diff.addEventListener("click", (event) => {
-    if (event.target.closest(".comment-form, .comment, a, button, select")) return;
+  review.addEventListener("click", (event) => {
+    if (event.target.closest(".compose, .thread, a, button, select")) return;
 
-    const row = event.target.closest("tr.l");
-    if (!row) return;
+    const line = event.target.closest(".line");
+    if (!line) return;
 
-    const reopening = row.classList.contains("commenting");
+    const reopening = line.classList.contains("commenting");
     close();
-    if (!reopening) open(row);
+    if (!reopening) open(line);
   });
 
-  form.querySelector("[data-cancel-comment]").addEventListener("click", close);
+  // Clicking away is what saves: an empty box was a change of mind.
+  textarea.addEventListener("blur", () => {
+    if (form.hidden) return;
+    if (textarea.value.trim()) up.submit(form);
+    else close();
+  });
+
+  form.addEventListener("cancel-comment", close);
 });
 
-// ---- diff scope and context -------------------------------------------------
-// The pane carries its own endpoint and current view, so a selector only has to
-// say which parameter it changes.
+// ---- diff range -------------------------------------------------------------
+// The pane carries its own view, so the selector only has to say what changed.
 
-up.compiler("[data-diff-param]", (select) => {
+up.compiler("[data-scope-select]", (select) => {
   select.addEventListener("change", () => {
-    const diff = select.closest("[data-diff-url]");
-    const view = { scope: diff.dataset.scope, context: diff.dataset.context };
-    view[select.dataset.diffParam] = select.value;
+    const card = select.closest(".review").dataset.card;
 
-    const query = new URLSearchParams(view);
-    up.render({ target: "#diff", url: `${diff.dataset.diffUrl}?${query}`, cache: false });
+    up.render({
+      target: "#review",
+      url: `/cards/${card}/diff?scope=${encodeURIComponent(select.value)}`,
+      cache: false,
+    });
   });
 });

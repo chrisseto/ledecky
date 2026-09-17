@@ -4,8 +4,8 @@
   "type": "module",
   "scripts": {
     "icons": "node web/scripts/icons.mjs",
-    "build": "pnpm icons && esbuild web/src/app.js --bundle --minify --format=iife --outfile=static/app.js && esbuild web/src/app.css --bundle --minify --outfile=static/app.css",
-    "watch": "pnpm icons && esbuild web/src/app.js web/src/app.css --bundle --sourcemap --format=iife --outdir=static --watch",
+    "build": "pnpm icons && esbuild web/src/app.js --bundle --minify --format=iife --outfile=static/app.js && esbuild web/src/app.css --bundle --minify --loader:.woff2=file --outfile=static/app.css",
+    "watch": "pnpm icons && esbuild web/src/app.js web/src/app.css --bundle --sourcemap --format=iife --loader:.woff2=file --outdir=static --watch",
     "e2e": "playwright test",
     "e2e:ui": "playwright test --ui"
   },
@@ -17,6 +17,8 @@
     "unpoly": "^3.10.2"
   },
   "devDependencies": {
+    "@fontsource-variable/manrope": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
     "@playwright/test": "1.63.0"
   }
 }

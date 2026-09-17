@@ -1,0 +1,55 @@
+<div class="modal modal-card" role="dialog" aria-label="New card">
+  <form method="post" action="/projects/{{ project.id }}/cards" up-submit up-target="body"
+        data-submit-shortcuts>
+    {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
+
+    <label>
+      <span>Task</span>
+      <textarea name="task" rows="5" autofocus
+                placeholder="What should the agent do?">{{ task }}</textarea>
+    </label>
+
+    <div class="row">
+      <label class="combo">
+        <span>Base branch</span>
+        <input name="base_branch" class="mono" autocomplete="off" spellcheck="false"
+               value="{{ branches[0] | default('') }}" placeholder="Search branches…"
+               data-branch-filter />
+        <div class="combo-menu" hidden>
+          {% for branch in branches %}
+            <button class="mono" type="button" data-branch>{{ branch }}</button>
+          {% endfor %}
+          <p class="empty-match" hidden>No branch matches</p>
+        </div>
+      </label>
+
+      <label>
+        <span>Model</span>
+        <select name="model">
+          {% for value, label in models %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <label>
+      <span>Permissions</span>
+      <select name="permission_mode">
+        {% for mode, label in permission_modes %}
+          <option value="{{ mode }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <footer>
+      <span class="dim">in {{ project.name }}</span>
+      <span class="spacer"></span>
+
+      <button class="btn" type="submit" name="more" value="1">
+        Create more <kbd class="mono" aria-hidden="true">⌘⇧↵</kbd>
+      </button>
+      <button class="btn accent" type="submit">
+        Create <kbd class="mono" aria-hidden="true">⌘↵</kbd>
+      </button>
+    </footer>
+  </form>
+</div>

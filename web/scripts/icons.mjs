@@ -9,10 +9,9 @@ const SRC = join(ROOT, "node_modules", "lucide-static", "icons");
 const OUT = join(ROOT, "static", "icons");
 
 const ICONS = [
-  "alert-triangle", "arrow-left", "check", "chevron-down", "chevron-right",
-  "circle", "circle-dot", "file-diff", "folder", "folder-git-2", "git-branch",
-  "git-commit-horizontal", "git-merge", "loader", "message-square", "play",
-  "plus", "search", "settings", "square", "terminal", "trash-2", "x",
+  "alert-triangle", "check", "chevron-down", "chevron-right", "chevron-up",
+  "folder", "folder-git-2", "git-branch", "git-merge", "play", "plus", "send",
+  "square", "x",
 ];
 
 await rm(OUT, { recursive: true, force: true });

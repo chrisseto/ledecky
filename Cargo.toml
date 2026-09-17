@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 bytes = "1"
-minijinja = { version = "2", features = ["loader"] }
+minijinja = { version = "2", features = ["loader", "urlencode"] }
 portable-pty = "0.9"
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 rocket = { version = "0.5", features = ["json"] }

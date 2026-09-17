@@ -10,14 +10,16 @@ pub use project::Project;
 /// Every route this domain serves.
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
-        project::index,
         project::new,
         project::create,
         project::complete,
+        board::index,
         board::board,
+        board::switcher,
         board::new_card,
         board::create_card,
         board::move_card,
+        board::move_card_to_lane,
         board::delete_card,
     ]
 }

@@ -89,8 +89,7 @@ async function startCard(request) {
   await request.post(`${BASE}/projects`, { form: { path: join(ROOT, "repo") } });
   await request.post(`${BASE}/projects/1/cards`, {
     form: {
-      title: "orphan probe",
-      description: "Sit still.",
+      task: "orphan probe\n\nSit still.",
       base_branch: "main",
       permission_mode: "acceptEdits",
       model: "",

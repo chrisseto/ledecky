@@ -1,0 +1,27 @@
+<aside class="drawer drawer-projects" aria-label="Projects">
+  <div class="drawer-head">
+    <h2>Projects</h2>
+    <span class="spacer"></span>
+
+    <a class="btn accent" href="/projects/new{% if project %}?board={{ project.id }}{% endif %}"
+       up-follow up-target="#overlay">{{ icon("plus") }} Add project</a>
+
+    <a class="btn icon-only" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
+       up-follow up-target="#overlay" aria-label="Close" data-close-overlay>{{ icon("x") }}</a>
+  </div>
+
+  <div class="project-list">
+    {% for entry in projects %}
+      <a class="project-card {% if project and entry.id == project.id %}current{% endif %}"
+         href="/projects/{{ entry.id }}">
+        <span class="name">
+          <span class="dot hue-{{ entry.id % 4 }}"></span>{{ entry.name }}
+          <span class="count">
+            {{ entry.cards }} card{{ "" if entry.cards == 1 else "s" }}
+          </span>
+        </span>
+        <span class="path mono">{{ entry.path }}</span>
+      </a>
+    {% endfor %}
+  </div>
+</aside>

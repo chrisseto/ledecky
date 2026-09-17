@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use rocket::serde::Serialize;
 
 use crate::git;
 use crate::review::diff::{self, ParsedFile};
@@ -9,8 +10,8 @@ use crate::review::diff::{self, ParsedFile};
 /// How many parses to keep before dropping the oldest.
 const CAPACITY: usize = 64;
 
-/// Memoises parsed diffs so the context selector and every comment action do not
-/// re-run git and delta over a whole file.
+/// Memoises parsed diffs so selecting a file, opening a hunk and every comment
+/// action do not re-run git and delta over a whole file.
 ///
 /// Keyed on resolved commit shas rather than ref names: turn refs point at
 /// immutable commits, so an entry can never go stale and there is no
@@ -19,6 +20,15 @@ const CAPACITY: usize = 64;
 #[derive(Default)]
 pub struct DiffCache {
     entries: Mutex<Vec<(Key, Arc<Vec<ParsedFile>>)>>,
+    stats: Mutex<Vec<(Key, Stat)>>,
+}
+
+/// How much a range changed, for the cards on the board.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(crate = "rocket::serde")]
+pub struct Stat {
+    pub additions: u32,
+    pub deletions: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +58,42 @@ impl DiffCache {
         Ok(parsed)
     }
 
+    /// Line counts for a range, computing them on a miss.
+    ///
+    /// The board asks for one of these per card on every poll, so it must not
+    /// touch delta. Unlike [`DiffCache::get`] the key is taken as given: callers
+    /// pass a card's base ref, which is written once and never moves, and a
+    /// turn's sha, so the pair already names an immutable range.
+    pub fn stat(&self, repo: &Path, from: &str, to: &str) -> Stat {
+        let key = Key {
+            repo: repo.to_path_buf(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+
+        if let Some(hit) = self
+            .stats
+            .lock()
+            .ok()
+            .and_then(|stats| stats.iter().find(|(k, _)| *k == key).map(|(_, s)| *s))
+        {
+            return hit;
+        }
+
+        let (additions, deletions) = git::diff_stat(repo, from, to).unwrap_or_default();
+        let stat = Stat {
+            additions,
+            deletions,
+        };
+
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.push((key, stat));
+            let overflow = stats.len().saturating_sub(CAPACITY);
+            stats.drain(..overflow);
+        }
+        stat
+    }
+
     fn lookup(&self, key: &Key) -> Option<Arc<Vec<ParsedFile>>> {
         let entries = self.entries.lock().ok()?;
         entries
@@ -73,6 +119,9 @@ impl DiffCache {
     pub fn forget(&self, repo: &Path) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.retain(|(k, _)| k.repo != repo);
+        }
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.retain(|(k, _)| k.repo != repo);
         }
     }
 }

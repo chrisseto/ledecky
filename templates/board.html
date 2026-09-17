@@ -1,31 +1,65 @@
-{% extends "base.html" %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>
+      {% if card %}{{ card.title }} — {{ project.name }}
+      {% elif project %}{{ project.name }} — kanban2
+      {% else %}kanban2{% endif %}
+    </title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="top">
+      <span class="brand">kanban2</span>
 
-{% block title %}{{ project.name }} — kanban2{% endblock %}
+      {% if project %}
+        <a class="switcher" href="/projects?board={{ project.id }}"
+           up-follow up-target="#overlay" title="Switch project">
+          <span class="dot hue-{{ project.id % 4 }}"></span>
+          {{ project.name }}
+          {{ icon("chevron-down") }}
+        </a>
+      {% endif %}
+    </header>
 
-{% block breadcrumb %}
-  <a class="dim" href="/">{{ icon("arrow-left") }} Projects</a>
-  <span class="dim">/</span>
-  <strong>{{ project.name }}</strong>
-{% endblock %}
+    {% if project %}
+      <main class="board" id="board"
+            up-poll up-interval="4000" up-source="/projects/{{ project.id }}">
+        {% for lane in lanes %}
+          <section class="lane lane-{{ lane.key }}">
+            <header>
+              <span class="dot"></span>
+              <span class="label">{{ lane.label }}</span>
+              <span class="count mono">{{ lane.cards | length }}</span>
+            </header>
 
-{% block actions %}
-  <a class="btn primary" href="/projects/{{ project.id }}/cards/new">
-    {{ icon("plus") }} New card
-  </a>
-{% endblock %}
+            {% if lane.key == "todo" %}
+              <a class="new-card" href="/projects/{{ project.id }}/cards/new"
+                 up-follow up-target="#overlay">{{ icon("plus") }} New card</a>
+            {% endif %}
 
-{% block main %}
-  <div class="board" id="board" up-poll up-interval="4000" up-source="/projects/{{ project.id }}">
-    {% for lane in lanes %}
-      <section class="lane">
-        <header>
-          <span>{{ lane.label }}</span>
-          <span class="count">{{ lane.cards | length }}</span>
-        </header>
-        <div class="lane-cards" data-sortable data-lane="{{ lane.key }}">
-          {% for card in lane.cards %}{% include "_card.html" %}{% endfor %}
-        </div>
-      </section>
-    {% endfor %}
-  </div>
-{% endblock %}
+            <div class="lane-cards" data-sortable data-lane="{{ lane.key }}">
+              {% for card in lane.cards %}{% include "_card.html" %}{% endfor %}
+            </div>
+
+            {% if not lane.cards and lane.key != "todo" %}
+              <p class="drop-here">Drop a card here</p>
+            {% endif %}
+          </section>
+        {% endfor %}
+      </main>
+    {% else %}
+      <main class="board-empty">
+        <p>No projects yet.</p>
+        <a class="btn accent" href="/projects/new" up-follow up-target="#overlay">
+          {{ icon("plus") }} Add project
+        </a>
+      </main>
+    {% endif %}
+
+    <div id="overlay">{% include "_overlay.html" %}</div>
+  </body>
+</html>

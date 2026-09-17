@@ -7,7 +7,10 @@ use rocket::serde::Serialize;
 use rocket::{get, post, State};
 use rusqlite::{Connection, Row};
 
+use crate::config::Settings;
 use crate::db::Db;
+use crate::project::board::{self, Shell};
+use crate::review::DiffCache;
 use crate::tmpl::Tmpl;
 
 /// A git repository the board tracks work against.
@@ -77,20 +80,34 @@ impl Project {
         )?;
         Ok(conn.last_insert_rowid())
     }
+
+    /// Overrides the name taken from the directory.
+    pub fn rename(conn: &Connection, id: i64, name: &str) {
+        let _ = conn.execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            rusqlite::params![id, name],
+        );
+    }
 }
 
 // ---- routes -----------------------------------------------------------------
 
-#[get("/")]
-pub fn index(db: &State<Db>) -> Tmpl {
-    let projects = Project::all(&db.lock());
-    Tmpl("projects.html", context! { projects })
-}
-
-#[get("/projects/new")]
-pub fn new() -> Tmpl {
-    Tmpl(
-        "project_new.html",
+#[get("/projects/new?<board>")]
+pub fn new(
+    db: &State<Db>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    board: Option<i64>,
+) -> Tmpl {
+    let project = board::current(db, board);
+    Shell {
+        db,
+        settings,
+        cache,
+    }
+    .render(
+        project,
+        board::ADD_PROJECT,
         context! { path => default_root(), error => Option::<String>::None },
     )
 }
@@ -98,15 +115,30 @@ pub fn new() -> Tmpl {
 #[derive(rocket::FromForm)]
 pub struct ProjectForm {
     path: String,
+    /// Optional; the directory's own name is the default.
+    name: Option<String>,
+    /// The board the modal was opened over, so a rejection lands back on it.
+    board: Option<i64>,
 }
 
 #[post("/projects", data = "<form>")]
-pub fn create(db: &State<Db>, form: Form<ProjectForm>) -> Result<Redirect, Tmpl> {
+pub fn create(
+    db: &State<Db>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    form: Form<ProjectForm>,
+) -> Result<Redirect, Tmpl> {
     let path = expand(form.path.trim());
 
     let reject = |message: String| {
-        Tmpl(
-            "project_new.html",
+        Shell {
+            db,
+            settings,
+            cache,
+        }
+        .render(
+            board::current(db, form.board),
+            board::ADD_PROJECT,
             context! { path => form.path.clone(), error => Some(message) },
         )
     };
@@ -115,13 +147,32 @@ pub fn create(db: &State<Db>, form: Form<ProjectForm>) -> Result<Redirect, Tmpl>
         return Err(reject(format!("{} is not a directory", path.display())));
     }
     if !is_git_repo(&path) {
-        return Err(reject(format!("{} is not a git repository", path.display())));
+        return Err(reject(format!(
+            "{} is not a git repository",
+            path.display()
+        )));
     }
 
     let path = path.canonicalize().unwrap_or(path);
-    let id = Project::upsert(&db.lock(), &path)
-        .map_err(|err| reject(format!("could not save project: {err}")))?;
 
+    // The lock goes back before `reject` runs: rendering the modal again takes
+    // it for itself.
+    let saved = {
+        let conn = db.lock();
+        let saved = Project::upsert(&conn, &path);
+        let name = form
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+
+        if let (Ok(id), Some(name)) = (&saved, name) {
+            Project::rename(&conn, *id, name);
+        }
+        saved
+    };
+
+    let id = saved.map_err(|err| reject(format!("could not save project: {err}")))?;
     Ok(Redirect::to(format!("/projects/{id}")))
 }
 
@@ -130,7 +181,10 @@ pub fn create(db: &State<Db>, form: Form<ProjectForm>) -> Result<Redirect, Tmpl>
 #[get("/projects/complete?<q>")]
 pub fn complete(q: Option<String>) -> Tmpl {
     let q = q.unwrap_or_default();
-    Tmpl("_completions.html", context! { entries => complete_path(&q) })
+    Tmpl(
+        "_completions.html",
+        context! { entries => complete_path(&q) },
+    )
 }
 
 // ---- directory completion ---------------------------------------------------
@@ -195,10 +249,7 @@ fn split_query(raw: &str) -> (PathBuf, String) {
     }
 
     match (expanded.parent(), expanded.file_name()) {
-        (Some(parent), Some(name)) => (
-            parent.to_path_buf(),
-            name.to_string_lossy().into_owned(),
-        ),
+        (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_string_lossy().into_owned()),
         _ => (expanded, String::new()),
     }
 }

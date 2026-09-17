@@ -32,15 +32,20 @@ export async function addProject(page) {
   return page.url();
 }
 
-/** Fills in the new-card form and returns to the board. */
+/**
+ * Fills in the new-card modal and returns to the board.
+ *
+ * The form takes one task; its first line becomes the card's title, so the
+ * helper keeps the old title/description shape and joins them the way a person
+ * typing into the box would.
+ */
 export async function addCard(page, projectUrl, { title, description, base = "main", permissions, model }) {
   await page.goto(`${projectUrl}/cards/new`);
-  await page.getByLabel("Title").fill(title);
-  if (description) await page.getByLabel(/Description/).fill(description);
-  await page.getByLabel("Base branch").selectOption(base);
+  await page.getByLabel("Task").fill(description ? `${title}\n\n${description}` : title);
+  await page.getByLabel("Base branch").fill(base);
   if (permissions) await page.getByLabel("Permissions").selectOption(permissions);
   if (model) await page.getByLabel("Model").selectOption(model);
-  await page.getByRole("button", { name: "Create card" }).click();
+  await page.getByRole("button", { name: "Create", exact: true }).click();
   await expect(page).toHaveURL(projectUrl);
 }
 
@@ -48,6 +53,20 @@ export const lane = (page, key) => page.locator(`[data-lane="${key}"]`);
 
 export const cardIn = (page, key, title) =>
   lane(page, key).locator(".card", { hasText: title });
+
+/** Opens a card's drawer over the board. */
+export async function openCard(page, cardId) {
+  await page.goto(`/cards/${cardId}`);
+  await expect(page.locator(".drawer-card")).toBeVisible();
+}
+
+/** Types a review comment on a diff line and clicks away, which saves it. */
+export async function comment(page, line, body) {
+  await line.click();
+  await page.locator(".compose textarea").fill(body);
+  // Blur is the save; the header is the nearest thing that is not a diff line.
+  await page.locator(".diff-head .path").click();
+}
 
 /**
  * Drives a lane change the way the board's drag handler does.

@@ -58,12 +58,19 @@ impl Agent {
     /// Sends `text` as one message and returns whether it was actually submitted.
     ///
     /// Claude Code's TUI treats a bare newline as submit, so the text goes in as
-    /// a bracketed paste. The submit key is only sent once the paste is visible
-    /// on screen: a modal — the trust prompt, the bypass-permissions consent
-    /// dialog — swallows the paste, and a blind Enter would answer *it* instead.
+    /// a bracketed paste. Nothing is sent until the input box is on screen, and
+    /// the submit key is not sent until the paste is visibly in it: a client
+    /// that is still starting up *queues* what it is sent, out of the box and
+    /// out of reach, and a dialog — the workspace-trust prompt, the
+    /// bypass-permissions consent — swallows it, where a blind Enter would
+    /// answer the dialog instead.
     #[must_use]
     pub fn inject(&self, text: &str) -> bool {
         let text = text.trim_end();
+        if text.is_empty() {
+            return true;
+        }
+
         let needle = paste_needle(text);
 
         let mut payload = Vec::with_capacity(text.len() + 16);
@@ -71,38 +78,84 @@ impl Agent {
         payload.extend_from_slice(text.as_bytes());
         payload.extend_from_slice(b"\x1b[201~");
 
-        // A paste written while the TUI is mid-redraw is simply dropped, so
-        // re-send rather than waiting longer on one that never arrived. The
-        // in-composer check before each retry keeps it from landing twice.
         for _ in 0..PASTE_ATTEMPTS {
-            if !self.in_composer(&needle) {
+            if !self.is_composing() {
+                std::thread::sleep(PASTE_POLL);
+                continue;
+            }
+
+            // A paste written while the TUI is mid-redraw is simply dropped, so
+            // re-send rather than waiting longer on one that never arrived. The
+            // in-box check before each retry keeps it from landing twice.
+            if !self.holds(&needle) {
                 self.write_input(&payload);
             }
+
             for _ in 0..PASTE_CHECKS {
                 std::thread::sleep(PASTE_POLL);
-                if self.in_composer(&needle) {
-                    self.write_input(b"\r");
+                if !self.holds(&needle) {
+                    continue;
+                }
+
+                self.write_input(b"\r");
+                if self.cleared(&needle) {
                     return true;
                 }
+                break; // the key went nowhere; the text is still sitting there
             }
         }
         false
     }
 
-    /// True once `needle`, or the TUI's collapsed-paste placeholder, shows up in
-    /// the input box.
+    /// The lines of the input box and of any dialog over it.
     ///
-    /// NB: only the last few rows are searched. The transcript above the composer
-    /// echoes earlier messages, so a whole-screen match would find our own
-    /// previous paste and fire the submit key at nothing.
-    fn in_composer(&self, needle: &str) -> bool {
+    /// NB: only the last few rows are searched, and only lines carrying the
+    /// TUI's prompt marker. The transcript above echoes earlier messages, and
+    /// the box's own border can carry a *queued* message — either would match a
+    /// whole-screen search and fire the submit key at nothing.
+    fn prompt_lines(&self) -> Vec<String> {
         let screen = self.screen.lock().unwrap();
         let contents = screen.screen().contents();
 
         let lines: Vec<&str> = contents.lines().collect();
-        let composer = lines[lines.len().saturating_sub(COMPOSER_ROWS)..].join("\n");
+        lines[lines.len().saturating_sub(COMPOSER_ROWS)..]
+            .iter()
+            .filter(|line| is_prompt_line(line))
+            .map(|line| (*line).to_owned())
+            .collect()
+    }
 
-        composer.contains(needle) || composer.contains("Pasted text")
+    /// Whether there is an input box to paste into at all.
+    ///
+    /// A client that has not drawn one yet is still starting up, and a dialog
+    /// over it leaves only its own highlighted options behind.
+    pub fn is_composing(&self) -> bool {
+        self.prompt_lines().iter().any(|line| !is_menu_option(line))
+    }
+
+    /// Whether a dialog is holding the keyboard, which is the user's to answer.
+    pub fn is_blocked(&self) -> bool {
+        self.prompt_lines().iter().any(|line| is_menu_option(line))
+    }
+
+    /// True once `needle`, or the placeholder the TUI collapses a long paste to,
+    /// is in the input box.
+    fn holds(&self, needle: &str) -> bool {
+        self.prompt_lines()
+            .iter()
+            .any(|line| line.contains(needle) || line.contains("Pasted text"))
+    }
+
+    /// Waits for the input box to let go of the text, which is the only proof
+    /// the submit key did anything.
+    fn cleared(&self, needle: &str) -> bool {
+        for _ in 0..PASTE_CHECKS {
+            std::thread::sleep(PASTE_POLL);
+            if !self.holds(needle) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Sends the opening task, keeping it queued if it could not be delivered.
@@ -128,7 +181,11 @@ impl Agent {
             pixel_height: 0,
         };
         let _ = self.master.lock().unwrap().resize(size);
-        self.screen.lock().unwrap().screen_mut().set_size(rows, cols);
+        self.screen
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
     }
 
     /// Kills the agent and reaps it. Without the `wait` the process lingers as a
@@ -279,6 +336,23 @@ fn pump(
     }
 }
 
+/// Whether a line is one the TUI takes input on: its input box, or a dialog's
+/// highlighted option. `❯` is what the current client draws; `>` is what older
+/// ones — and the test stand-in — use.
+fn is_prompt_line(line: &str) -> bool {
+    matches!(line.trim_start().chars().next(), Some('❯' | '>'))
+}
+
+/// Whether that line is a numbered choice rather than the input box.
+fn is_menu_option(line: &str) -> bool {
+    let rest = line
+        .trim_start()
+        .trim_start_matches(['❯', '>'])
+        .trim_start();
+    let number = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+
+    number > 0 && rest[number..].starts_with('.')
+}
 
 /// Picks a substring of a pasted message to look for on screen.
 ///
@@ -294,7 +368,33 @@ fn paste_needle(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::paste_needle;
+    use super::{is_menu_option, is_prompt_line, paste_needle};
+
+    #[test]
+    fn the_input_box_is_a_prompt_line() {
+        assert!(is_prompt_line("❯ "));
+        assert!(is_prompt_line("❯ half a typed message"));
+        assert!(is_prompt_line("> older clients and the stand-in"));
+    }
+
+    #[test]
+    fn the_rest_of_the_screen_is_not() {
+        // The border a queued message is drawn on — the line that used to be
+        // mistaken for the input box, submitting nothing.
+        assert!(!is_prompt_line(
+            "──────────────── Reply with the word ok ──"
+        ));
+        assert!(!is_prompt_line("  -- INSERT -- accept edits on"));
+        assert!(!is_prompt_line(""));
+    }
+
+    #[test]
+    fn a_numbered_choice_belongs_to_a_dialog() {
+        assert!(is_menu_option("❯ 1. Yes, I trust this folder"));
+        assert!(is_menu_option("  2. No, exit"));
+        assert!(!is_menu_option("❯ "));
+        assert!(!is_menu_option("❯ 1 is not a choice without its dot"));
+    }
 
     #[test]
     fn needle_prefers_a_long_word() {
@@ -307,4 +407,3 @@ mod tests {
         assert_eq!(paste_needle(""), "");
     }
 }
-

@@ -123,6 +123,14 @@ impl Comment {
         );
     }
 
+    /// Withdraws the whole batch at once.
+    pub fn delete_drafts(conn: &Connection, card_id: i64) {
+        let _ = conn.execute(
+            "DELETE FROM comments WHERE card_id = ?1 AND state = 'draft'",
+            [card_id],
+        );
+    }
+
     pub fn mark_submitted(conn: &Connection, card_id: i64) {
         let _ = conn.execute(
             "UPDATE comments SET state = 'submitted' WHERE card_id = ?1 AND state = 'draft'",
@@ -196,7 +204,10 @@ mod tests {
 
     #[test]
     fn the_anchor_matches_what_the_template_looks_up() {
-        assert_eq!(sample("src/a.rs", 12, "new", "x").anchor(), "src/a.rs#new:12");
+        assert_eq!(
+            sample("src/a.rs", 12, "new", "x").anchor(),
+            "src/a.rs#new:12"
+        );
         assert_eq!(sample("src/a.rs", 3, "old", "x").anchor(), "src/a.rs#old:3");
     }
 

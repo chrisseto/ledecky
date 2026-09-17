@@ -6,6 +6,9 @@
 //
 //   * a full-height screen with the input box pinned near the bottom, because
 //     the server looks for its pasted text in the last rows of the terminal;
+//   * a startup window with no input box at all, where anything sent is queued
+//     on the box's border rather than typed — text on screen that no Enter will
+//     submit, which the server must not mistake for a delivered prompt;
 //   * bracketed-paste handling, collapsing long pastes to "Pasted text" exactly
 //     as the real client does;
 //   * a modal that swallows pastes and treats a bare Enter as "exit", which is
@@ -52,20 +55,38 @@ let modal = permissionMode === "bypassPermissions" ? "consent" : null;
 let buffer = "";
 /** What the composer displays, which collapses for a long paste. */
 let shown = "";
+/** Text sent before there was anywhere to put it. */
+let queued = "";
 let turn = 0;
+
+// The real client spends several seconds drawing itself before it has an input
+// box, and anything sent in that window is queued on the box's border instead of
+// typed into it — where a bare Enter will not submit it either.
+let booting = true;
+setTimeout(() => {
+  booting = false;
+  render();
+}, Number(process.env.FAKE_AGENT_BOOT_MS ?? 4000));
 
 function render() {
   out(`${ESC}[2J${ESC}[H`);
   out(transcript.slice(-20).join("\r\n"));
 
   // Pin the input box near the bottom; the server only searches the last rows.
-  out(`${ESC}[${ROWS - 2};1H`);
+  // A modal replaces it with its own choices, marking the highlighted one the
+  // way the real client does — that marker is how the server tells a dialog
+  // holding the keyboard from a client that has not drawn a box yet.
+  out(`${ESC}[${ROWS - 3};1H`);
+  if (booting) {
+    out(`${"─".repeat(20)} ${queued} ──\r\nstarting…`);
+    return;
+  }
   if (modal === "consent") {
-    out("WARNING: Bypass Permissions mode\r\n  1. No, exit   2. Yes, I accept\r\nEnter to confirm");
+    out("WARNING: Bypass Permissions mode\r\n❯ 1. No, exit\r\n  2. Yes, I accept\r\nEnter to confirm");
   } else if (modal === "permission") {
-    out("Bash command needs approval\r\n  1. Yes   2. No\r\nEnter to confirm");
+    out("Bash command needs approval\r\n❯ 1. Yes\r\n  2. No\r\nEnter to confirm");
   } else {
-    out(`> ${shown}`);
+    out(`${"─".repeat(20)} ${queued} ──\r\n> ${shown}`);
   }
 }
 
@@ -218,8 +239,12 @@ process.stdin.on("data", (chunk) => {
       pasting += text.slice(0, end);
       text = text.slice(end + PASTE_END.length);
 
-      // A modal owns the keyboard, so the paste is dropped, as with the real client.
-      if (!modal) {
+      // A client still drawing itself queues the paste out of the input box; a
+      // modal owns the keyboard and drops it. Both are the real client's
+      // behaviour, and neither puts the text anywhere Enter can submit it.
+      if (booting) {
+        queued = pasting.replace(/\n/g, " ").slice(0, 60);
+      } else if (!modal) {
         buffer = pasting;
         shown =
           pasting.length > 200
@@ -241,6 +266,8 @@ process.stdin.on("data", (chunk) => {
     const key = text[0];
     text = text.slice(1);
 
+    // Nothing is listening for keys until the client has drawn itself.
+    if (booting) continue;
     if (answerModal(key)) continue;
 
     if (key === "\r" || key === "\n") {

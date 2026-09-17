@@ -2,6 +2,7 @@ use minijinja::context;
 use rocket::form::Form;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::http::Status;
+use rocket::response::Redirect;
 use rocket::{get, post, State};
 use rocket_ws as ws;
 use tokio::sync::broadcast::error::RecvError;
@@ -10,6 +11,7 @@ use crate::agent::{session, Agents};
 use crate::config::Settings;
 use crate::db::Db;
 use crate::hooks::HookAuth;
+use crate::project::board::{self, Shell};
 use crate::project::{Card, Project};
 use crate::review::{self, DiffCache};
 use crate::tmpl::Tmpl;
@@ -29,9 +31,14 @@ pub fn focus(
     drop(conn);
 
     let live = agents.get(id).is_some_and(|a| a.is_running());
-    let diff = review::routes::initial(db, settings, cache, id, scope)?;
+    let review = review::routes::initial(db, settings, cache, id, scope)?;
 
-    Ok(Tmpl("card.html", context! { project, live, ..diff }))
+    Ok(Shell {
+        db,
+        settings,
+        cache,
+    }
+    .render(Some(project), board::CARD, context! { live, ..review }))
 }
 
 /// Just the agent-state chip, so the focus view can poll it without re-running a
@@ -49,9 +56,10 @@ pub fn start(
     auth: &State<HookAuth>,
     settings: &State<Settings>,
     id: i64,
-) -> Result<Status, Status> {
+) -> Result<Redirect, Status> {
     match session::start(db, agents, auth, settings, id) {
-        Ok(_) => Ok(Status::NoContent),
+        // The drawer is what asked, and it has a terminal to put up now.
+        Ok(_) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
             error!("card {id}: {err:#}");
             Err(Status::InternalServerError)
@@ -60,15 +68,15 @@ pub fn start(
 }
 
 #[post("/cards/<id>/stop")]
-pub fn stop(db: &State<Db>, agents: &State<Agents>, id: i64) -> Status {
+pub fn stop(db: &State<Db>, agents: &State<Agents>, id: i64) -> Redirect {
     session::stop(db, agents, id);
-    Status::NoContent
+    Redirect::to(format!("/cards/{id}"))
 }
 
 #[post("/cards/<id>/merge")]
-pub fn merge(db: &State<Db>, agents: &State<Agents>, id: i64) -> Result<Status, Status> {
+pub fn merge(db: &State<Db>, agents: &State<Agents>, id: i64) -> Result<Redirect, Status> {
     match session::request_merge(db, agents, id) {
-        Ok(()) => Ok(Status::NoContent),
+        Ok(()) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
             warn!("card {id}: merge request failed: {err:#}");
             Err(Status::Conflict)

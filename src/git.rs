@@ -7,7 +7,11 @@ use crate::config::Settings;
 
 /// Runs a git command in `repo` and returns trimmed stdout.
 pub fn run(repo: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
 
     if !out.status.success() {
         bail!(
@@ -58,13 +62,29 @@ pub fn create_worktree(
         bail!("{} already exists", path.display());
     }
 
-    let base_sha = run(repo, &["rev-parse", "--verify", &format!("{base_branch}^{{commit}}")])?;
+    let base_sha = run(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{base_branch}^{{commit}}"),
+        ],
+    )?;
 
     run(
         repo,
-        &["worktree", "add", "--detach", &path.to_string_lossy(), &base_sha],
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &path.to_string_lossy(),
+            &base_sha,
+        ],
     )?;
-    run(repo, &["update-ref", &settings.base_ref(card_id), &base_sha])?;
+    run(
+        repo,
+        &["update-ref", &settings.base_ref(card_id), &base_sha],
+    )?;
 
     Ok(base_sha)
 }
@@ -137,10 +157,33 @@ pub fn snapshot_turn(
     ];
     let sha = run_env(
         worktree,
-        &["commit-tree", &tree, "-p", parent, "-m", &format!("turn {n}")],
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            parent,
+            "-m",
+            &format!("turn {n}"),
+        ],
         identity,
     )?;
 
     run(repo, &["update-ref", &settings.turn_ref(card_id, n), &sha])?;
     Ok(Some(sha))
+}
+
+/// Lines added and removed between two revisions.
+///
+/// `--numstat` is one cheap git call with no highlighting behind it, which is
+/// what makes it usable for every card on the board rather than only the one
+/// being reviewed.
+pub fn diff_stat(repo: &Path, from: &str, to: &str) -> Option<(u32, u32)> {
+    let out = run(repo, &["diff", "--numstat", "--no-ext-diff", from, to]).ok()?;
+
+    Some(out.lines().fold((0, 0), |(added, removed), line| {
+        let mut fields = line.split_whitespace();
+        // Binary files report `-`, which reads as nothing changed.
+        let count = |field: Option<&str>| field.and_then(|f| f.parse::<u32>().ok()).unwrap_or(0);
+        (added + count(fields.next()), removed + count(fields.next()))
+    }))
 }

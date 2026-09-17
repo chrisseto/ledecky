@@ -1,0 +1,93 @@
+<aside class="drawer drawer-card" aria-label="{{ card.title }}">
+  <div class="drawer-head">
+    <details class="lane-menu">
+      <summary class="chip lane-{{ card.lane }}" title="Move this card">
+        <span class="dot"></span>{{ card.lane_label }}{{ icon("chevron-down") }}
+      </summary>
+      <div class="menu">
+        <p class="menu-head">Move to</p>
+        {% for lane in lanes %}
+          {% if lane.key != card.lane %}
+            <form method="post" action="/cards/{{ card.id }}/lane" up-submit up-target="body">
+              <input type="hidden" name="lane" value="{{ lane.key }}" />
+              <button class="menu-item lane-{{ lane.key }}" type="submit">
+                <span class="dot"></span>{{ lane.label }}
+              </button>
+            </form>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </details>
+
+    <h2>{{ card.title }}</h2>
+    <span class="branch mono">{{ icon("git-branch") }} {{ card.base_branch }}</span>
+
+    <span class="spacer"></span>
+
+    {#
+      Both panes are rendered and the radios pick one, so switching tabs never
+      goes back to the server — which would tear down the terminal and its
+      socket. The agent leads while it is working; once it hands back, there is
+      a diff to read and the review leads.
+    #}
+    {% set reviewing = file and card.agent_state in ["idle", "stopped"] %}
+    <div class="tabs">
+      <input type="radio" name="tab" id="tab-agent" {% if not reviewing %}checked{% endif %} />
+      <label for="tab-agent">
+        Agent {% include "_state.html" %}
+      </label>
+
+      <input type="radio" name="tab" id="tab-review" {% if reviewing %}checked{% endif %} />
+      <label for="tab-review">
+        Review
+        {% if file %}
+          <span class="stat mono">
+            <span class="adds">+{{ file.additions }}</span>
+            <span class="dels">−{{ file.deletions }}</span>
+          </span>
+        {% endif %}
+      </label>
+    </div>
+
+    {% if card.lane == "in_review" %}
+      <form method="post" action="/cards/{{ card.id }}/merge" up-submit up-target="body">
+        <button class="btn" type="submit"
+                title="Ask the agent to apply its commits onto {{ card.base_branch }}">
+          {{ icon("git-merge") }} Merge
+        </button>
+      </form>
+    {% endif %}
+
+    {% if live %}
+      <form method="post" action="/cards/{{ card.id }}/stop" up-submit up-target="body">
+        <button class="btn accent" type="submit">{{ icon("square") }} Stop agent</button>
+      </form>
+    {% else %}
+      <form method="post" action="/cards/{{ card.id }}/start" up-submit up-target="body">
+        <button class="btn accent" type="submit">{{ icon("play") }} Start agent</button>
+      </form>
+    {% endif %}
+
+    <a class="btn icon-only" href="/projects/{{ project.id }}" up-follow up-target="#overlay"
+       aria-label="Close" data-close-overlay>{{ icon("x") }}</a>
+  </div>
+
+  <section class="pane pane-agent">
+    {% if live %}
+      <div class="terminal-head mono">
+        <span class="pulse state-{{ card.agent_state }}"></span>
+        <span>{{ card.base_branch }}</span>
+        <span class="spacer"></span>
+        <span>pty</span>
+      </div>
+      <div class="terminal" data-terminal="/cards/{{ card.id }}/terminal"
+           data-resize-url="/cards/{{ card.id }}/resize"></div>
+    {% else %}
+      <p class="empty">
+        No agent running. Move this card to <strong>In Progress</strong>, or start one here.
+      </p>
+    {% endif %}
+  </section>
+
+  <section class="pane pane-review">{% include "_review.html" %}</section>
+</aside>
