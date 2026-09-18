@@ -40,12 +40,12 @@
       <input type="radio" name="tab" id="tab-review" {% if reviewing %}checked{% endif %} />
       <label for="tab-review">
         Review
-        {% if has_diff %}
-          <span class="stat mono">
-            <span class="adds">+{{ additions }}</span>
-            <span class="dels">−{{ deletions }}</span>
-          </span>
-        {% endif %}
+        {# Outside `#review`, so the pane's poll cannot swap it — app.js copies
+           the totals across instead. #}
+        <span class="stat mono" id="tab-stat" {% if not has_diff %}hidden{% endif %}>
+          <span class="adds">+{{ additions }}</span>
+          <span class="dels">−{{ deletions }}</span>
+        </span>
       </label>
     </div>
 

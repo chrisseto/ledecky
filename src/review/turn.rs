@@ -1,10 +1,12 @@
 use std::path::Path;
+use std::time::Duration;
 
 use rocket::serde::Serialize;
 use rusqlite::{Connection, Row};
 
 use crate::config::Settings;
 use crate::git;
+use crate::review::DiffCache;
 
 /// A snapshot of the worktree at the end of one agent turn.
 ///
@@ -19,11 +21,14 @@ pub struct Turn {
     pub parent_sha: String,
     pub last_assistant_message: Option<String>,
     pub created_at: String,
+    /// `created_at` in unix seconds, which is what orders a turn against one of
+    /// the agent's own commits in the picker.
+    pub at: i64,
 }
 
 impl Turn {
-    const COLUMNS: &'static str =
-        "id, n, commit_sha, parent_sha, last_assistant_message, created_at";
+    const COLUMNS: &'static str = "id, n, commit_sha, parent_sha, last_assistant_message, \
+         created_at, CAST(strftime('%s', created_at) AS INTEGER) AS at";
 
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -33,6 +38,7 @@ impl Turn {
             parent_sha: row.get("parent_sha")?,
             last_assistant_message: row.get("last_assistant_message")?,
             created_at: row.get("created_at")?,
+            at: row.get("at")?,
         })
     }
 
@@ -128,6 +134,43 @@ impl Turn {
         Self::record(conn, settings, card_id, n, &sha, &parent_sha, message);
         Ok(Self::latest(conn, card_id))
     }
+}
+
+/// The revision the live scopes end at: the worktree exactly as it stands.
+///
+/// This is what makes work visible before the turn that would have captured it.
+/// Falls back to the last turn once the worktree is gone, so a merged card
+/// still shows its history, and returns `None` only when the card has neither.
+pub fn live_head(
+    cache: &DiffCache,
+    settings: &Settings,
+    repo: &Path,
+    worktree: Option<&Path>,
+    card_id: i64,
+    turns: &[Turn],
+) -> Option<String> {
+    let settled = || turns.last().map(|turn| turn.commit_sha.clone());
+
+    // NB: `.git` rather than the directory, matching how a session decides a
+    // worktree is real. `teardown` removes it from the hook thread, so this can
+    // lose the race and find a half-removed one either way.
+    let Some(live) = worktree.filter(|path| path.join(".git").exists()) else {
+        return settled();
+    };
+
+    cache
+        .head(
+            card_id,
+            Duration::from_millis(settings.poll_interval),
+            || match git::working_tree(settings, repo, live, card_id) {
+                Ok(tree) => Some(tree),
+                Err(err) => {
+                    warn!("card {card_id}: staging the worktree: {err:#}");
+                    settled()
+                }
+            },
+        )
+        .or_else(settled)
 }
 
 #[cfg(test)]

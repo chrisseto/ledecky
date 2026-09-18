@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use minijinja::context;
 use rocket::form::Form;
 use rocket::http::Status;
@@ -10,7 +12,7 @@ use crate::db::Db;
 use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, CardEdit, Lane, NewCard, Project};
-use crate::review::{DiffCache, Turn};
+use crate::review::{self, DiffCache, Turn};
 use crate::tmpl::Tmpl;
 
 pub const PERMISSION_MODES: &[(&str, &str)] = &[
@@ -70,9 +72,9 @@ impl Shell<'_> {
         };
         // The stats below shell out to git, so the turns come out of the
         // database first and the lock goes back before any of that happens.
-        let turns: Vec<Option<Turn>> = cards
+        let turns: Vec<Vec<Turn>> = cards
             .iter()
-            .map(|card| Turn::latest(&conn, card.id))
+            .map(|card| Turn::for_card(&conn, card.id))
             .collect();
         drop(conn);
 
@@ -80,10 +82,29 @@ impl Shell<'_> {
         let rows: Vec<(Lane, minijinja::Value)> = cards
             .iter()
             .zip(turns)
-            .map(|(card, turn)| {
-                let stat = repo.as_ref().zip(turn).map(|(repo, turn)| {
-                    self.cache
-                        .stat(repo, &self.settings.base_ref(card.id), &turn.commit_sha)
+            .map(|(card, turns)| {
+                // The card counts what is in its worktree, not only what a turn
+                // has captured — otherwise a card reads `+0 −0` for as long as
+                // its agent is working. Cards without a worktree fall back to
+                // their last turn and cost nothing.
+                //
+                // NB: affordable on every render only because `live_head`
+                // memoises; `Shell::render` runs on every navigation, not just
+                // the board's poll.
+                let stat = repo.as_ref().and_then(|repo| {
+                    let worktree = card.worktree_path.as_ref().map(PathBuf::from);
+                    let head = review::turn::live_head(
+                        self.cache,
+                        self.settings,
+                        repo,
+                        worktree.as_deref(),
+                        card.id,
+                        &turns,
+                    )?;
+                    Some(
+                        self.cache
+                            .stat(repo, &self.settings.base_ref(card.id), &head),
+                    )
                 });
                 (
                     card.lane,

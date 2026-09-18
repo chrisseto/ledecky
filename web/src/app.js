@@ -229,6 +229,82 @@ up.compiler("[data-terminal]", (host) => {
   };
 });
 
+// ---- review pane ------------------------------------------------------------
+
+/**
+ * Holds the pane still while the reader is part-way through something.
+ *
+ * Stopping the timer is not enough on its own: a poll issued moments earlier is
+ * still on its way, and its response would swap away the comment box being
+ * typed into or the menu being read.
+ *
+ * NB: the *request* is aborted, not the fragment. `up.fragment.abort` would
+ * also cancel whatever the reader goes on to click, since that request is bound
+ * to this fragment too — which reads as a dropdown that does nothing.
+ */
+const holdPane = (review) => {
+  up.radio.stopPolling(review);
+  up.network.abort((request) => request.background);
+};
+
+/**
+ * Polls only while the pane is the tab on screen and nobody is mid-sentence.
+ *
+ * Both panes are always in the DOM so that switching tabs never tears down the
+ * terminal, and unpoly polls whatever carries `up-poll` whether or not it is
+ * visible — so without this the agent's tab would stage the worktree every few
+ * seconds for a diff nobody is looking at.
+ */
+up.compiler(".review", (review) => {
+  const tabs = document.querySelector(".drawer-card .tabs");
+  if (!tabs) return;
+
+  const follow = () => {
+    const showing = tabs.querySelector("#tab-review")?.checked;
+    const busy = review.querySelector(".compose:not([hidden]), [data-range-menu][open]");
+
+    if (showing && !busy) up.radio.startPolling(review);
+    else up.radio.stopPolling(review);
+  };
+
+  follow();
+  tabs.addEventListener("change", follow);
+  // NB: the tabs outlive this fragment, so the listener has to come off with
+  // it — otherwise every poll leaves another one behind.
+  return () => tabs.removeEventListener("change", follow);
+});
+
+/** The reader is part-way through something the pane must not move under. */
+const paneBusy = () =>
+  !!document.querySelector("#review .compose:not([hidden]), #review [data-range-menu][open]");
+
+/** Which range a request asked for. Only the pane's own polls name one. */
+const rangeOf = (url) => new URL(url, location.href).searchParams.get("scope");
+
+// The last word on whether a poll gets to redraw the pane, and the only one that
+// closes the window completely: stopping the timer and aborting in flight both
+// happen before a response exists, so neither can stop one already downloaded
+// and on its way to being rendered — which reads as the picker closing itself
+// mid-choice, or a range change that does nothing.
+const skipResponse = up.fragment.config.skipResponse;
+up.fragment.config.skipResponse = (props) => {
+  if (skipResponse(props)) return true;
+  if (!props.request.background) return false;
+
+  // NB: scoped to the pane's own polls. Everything else that polls the page —
+  // the board, the agent-state chip — has no range to name, and skipping those
+  // would freeze them on whatever they first rendered.
+  const asked = rangeOf(props.request.url);
+  if (!asked) return false;
+
+  if (paneBusy()) return true;
+
+  // A poll that set out before the reader picked a different range describes
+  // the one they just left, and rendering it would undo the click.
+  const showing = document.querySelector("#review")?.dataset.scope;
+  return !!showing && asked !== showing;
+};
+
 // ---- review comments --------------------------------------------------------
 // Clicking a diff line moves the (single) compose box under it and points it at
 // that line. Clicking away saves it as a draft; the server owns everything else.
@@ -243,6 +319,7 @@ up.compiler(".review", (review) => {
     form.hidden = true;
     textarea.value = "";
     review.querySelectorAll(".line.commenting").forEach((line) => line.classList.remove("commenting"));
+    up.radio.startPolling(review);
   };
 
   const open = (line) => {
@@ -255,10 +332,14 @@ up.compiler(".review", (review) => {
     form.hidden = false;
     line.classList.add("commenting");
     textarea.focus();
+
+    // A poll swaps the pane out from under this box, half-typed comment and
+    // all. Nothing is lost by holding still until it is put away.
+    holdPane(review);
   };
 
   review.addEventListener("click", (event) => {
-    if (event.target.closest(".compose, .thread, a, button, select")) return;
+    if (event.target.closest(".compose, .thread, a, button, summary")) return;
 
     const line = event.target.closest(".line");
     if (!line) return;
@@ -326,16 +407,45 @@ up.compiler(".review", (review) => {
 });
 
 // ---- diff range -------------------------------------------------------------
-// The pane carries its own view, so the selector only has to say what changed.
+// Every anchor and both halves of the toggle are ordinary links the server
+// built, so picking a range needs no script at all. What is left is keeping the
+// pane's own poll out of the way of someone using them.
 
-up.compiler("[data-scope-select]", (select) => {
-  select.addEventListener("change", () => {
-    const card = select.closest(".review").dataset.card;
-
-    up.render({
-      target: "#review",
-      url: `/cards/${card}/diff?scope=${encodeURIComponent(select.value)}`,
-      cache: false,
-    });
+// Following any of them has to hold the poll off until the swap lands: the
+// timer would otherwise fire while the click's own request is still out, and
+// that poll carries the *old* `up-source`, so its response would put the pane
+// back on the range just left. The replacement fragment brings `up-poll` with
+// it, which starts it again.
+up.compiler(".review", (review) => {
+  review.addEventListener("click", (event) => {
+    if (event.target.closest("a[up-follow], [up-submit]")) holdPane(review);
   });
+});
+
+up.compiler("[data-range-menu]", (menu) => {
+  const review = menu.closest(".review");
+
+  // Opening it holds the pane: a swap underneath would close it mid-choice.
+  //
+  // NB: nothing closes it on the way out. Picking a range replaces the pane,
+  // and the menu that arrives with it is closed — whereas closing this one by
+  // hand fires `toggle`, which would start the poll again while the click's own
+  // request is still out, and that poll would answer with the range just left.
+  menu.addEventListener("toggle", () => {
+    if (menu.open) holdPane(review);
+    else up.radio.startPolling(review);
+  });
+});
+
+// ---- the review tab's stat --------------------------------------------------
+// The tab label sits outside `#review`, so a poll cannot reach it. The pane
+// carries its own totals; this copies them across after each render.
+
+up.compiler(".review", (review) => {
+  const stat = document.querySelector("#tab-stat");
+  if (!stat) return;
+
+  stat.hidden = review.dataset.hasDiff !== "1";
+  stat.querySelector(".adds").textContent = `+${review.dataset.additions}`;
+  stat.querySelector(".dels").textContent = `−${review.dataset.deletions}`;
 });

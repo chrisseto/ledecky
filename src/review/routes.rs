@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use minijinja::context;
 use rocket::form::Form;
@@ -9,10 +10,13 @@ use rocket::{get, post, State};
 use crate::agent::Agents;
 use crate::config::Settings;
 use crate::db::Db;
+use crate::git;
 use crate::project::{Card, Project};
 use crate::review::comment::{format_review, Side};
 use crate::review::diff::{Line, ParsedFile};
 use crate::review::expand::Dir;
+use crate::review::scope::Mode;
+use crate::review::turn;
 use crate::review::{Comment, DiffCache, Expansion, Scope, Turn, Viewed};
 use crate::tmpl::Tmpl;
 
@@ -26,12 +30,27 @@ const STEP: usize = 10;
 /// otherwise put megabytes on the wire every time.
 const MAX_LINES: usize = 2000;
 
+/// One anchor in the picker: a point in the card's history and the link that
+/// selects it, keeping whichever mode is already on screen.
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
 struct Choice {
-    key: String,
     label: String,
+    /// `live`, `commit`, `turn` or `base` — what colours the row.
+    kind: &'static str,
+    href: String,
     selected: bool,
+}
+
+/// One half of the just/since toggle beside the picker.
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct ModeChoice {
+    label: &'static str,
+    href: String,
+    selected: bool,
+    /// Nothing follows the worktree, and the base commit is not the card's work.
+    available: bool,
 }
 
 /// One file in the tree beside the diff.
@@ -114,10 +133,18 @@ pub fn diff_pane(
     expand: Option<&str>,
 ) -> Result<Tmpl, Status> {
     let view = View { scope, expand };
-    Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
+    // Only here is the pane a response of its own, so only here can it carry an
+    // ETag over its own bytes — see `initial`.
+    let context = context! { etag => Tmpl::ETAG_SLOT, ..pane(db, settings, cache, id, view)? };
+    Ok(Tmpl("_review.html", context))
 }
 
 /// Everything `_review.html` needs, for the drawer's first render.
+///
+/// NB: no ETag. The placeholder is filled with the digest of whatever response
+/// carries it, and here that is the whole board page — a value the pane's own
+/// poll could never match. The first tick after opening a card is a plain `200`
+/// and every one after it is conditional.
 pub fn initial(
     db: &Db,
     settings: &Settings,
@@ -155,12 +182,77 @@ fn pane(
     let viewed = Viewed::for_card(&conn, id);
     drop(conn);
 
-    let scopes: Vec<_> = Scope::menu(&turns)
+    // Everything below shells out to git, so the lock is already back.
+    let repo = project.repo();
+    let worktree = card.worktree_path.as_ref().map(PathBuf::from);
+    let head = turn::live_head(cache, settings, &repo, worktree.as_deref(), id, &turns);
+    let commits = match worktree.as_deref() {
+        Some(worktree) => git::commits(&repo, &settings.base_ref(id), &head_of(worktree)),
+        None => Vec::new(),
+    };
+
+    // Every link out of the pane is this same view with one thing changed,
+    // built here so no template has to concatenate a query string.
+    let scope_key = scope.key();
+    let expand_key = expansion.key();
+    let link = |scope: &str, expand: &str| {
+        rocket::uri!(diff_pane(
+            id = id,
+            scope = Some(scope),
+            expand = Some(expand)
+        ))
+        .to_string()
+    };
+    let opening = |expansion: &Expansion| link(&scope_key, &expansion.key());
+
+    // What the card last had recorded of it, as a tree, so the worktree can be
+    // compared against it.
+    let settled = git::tree_of(
+        &repo,
+        turns
+            .last()
+            .map(|turn| turn.commit_sha.as_str())
+            .unwrap_or(&settings.base_ref(id)),
+    );
+
+    let scopes: Vec<_> = Scope::menu(&turns, &commits, head.as_deref(), settled.as_deref())
         .into_iter()
-        .map(|candidate| Choice {
-            key: candidate.key(),
-            label: candidate.label(),
-            selected: candidate == scope,
+        .map(|entry| {
+            // Keep the mode across a change of anchor where it still means
+            // something; the ends of the list each only offer one.
+            let mode = match entry.anchor.offers(scope.mode) {
+                true => scope.mode,
+                false => scope.mode.other(),
+            };
+            let candidate = Scope {
+                anchor: entry.anchor,
+                mode,
+            };
+
+            Choice {
+                label: entry.label,
+                kind: entry.kind,
+                // Changing the range renumbers nothing now that expansion is
+                // keyed by path, so what is open survives the move.
+                href: link(&candidate.key(), &expand_key),
+                selected: candidate == scope,
+            }
+        })
+        .collect();
+
+    let modes: Vec<_> = Mode::ALL
+        .iter()
+        .map(|mode| {
+            let candidate = Scope {
+                anchor: scope.anchor.clone(),
+                mode: *mode,
+            };
+            ModeChoice {
+                label: mode.label(),
+                href: link(&candidate.key(), &expand_key),
+                selected: *mode == scope.mode,
+                available: scope.anchor.offers(*mode),
+            }
         })
         .collect();
 
@@ -178,8 +270,9 @@ fn pane(
 
     // The parse is independent of what is on screen and cached, so opening a
     // hunk is a re-slice rather than another run of git and delta.
-    let files = match scope.revisions(settings, id, &turns) {
-        Some((from, to)) => cache.get(&project.repo(), &from, &to).map_err(|err| {
+    let range = scope.revisions(settings, id, &turns, &commits, head.as_deref());
+    let files = match &range {
+        Some((from, to)) => cache.get(&repo, from, to).map_err(|err| {
             error!("card {id}: diffing {from}..{to}: {err:#}");
             Status::InternalServerError
         })?,
@@ -189,23 +282,11 @@ fn pane(
     let counts = |path: &str| comments.iter().filter(|c| c.file_path == path).count();
     let tree = group(&files, &viewed, counts);
 
-    // Every link out of the pane is this same view with one more thing opened,
-    // built here so no template has to concatenate a query string.
-    let scope_key = scope.key();
-    let link = |expansion: &Expansion| {
-        rocket::uri!(diff_pane(
-            id = id,
-            scope = Some(scope_key.as_str()),
-            expand = Some(expansion.key())
-        ))
-        .to_string()
-    };
-
     let rendered: Vec<FileView> = files
         .iter()
         .enumerate()
         .map(|(index, file)| {
-            let opened = expansion.file(index);
+            let opened = expansion.file(&file.path);
             let diff = file.hunks(&opened);
             let length: usize = diff.hunks.iter().map(|hunk| hunk.lines.len()).sum();
 
@@ -221,17 +302,17 @@ fn pane(
                     .map(|hunk| HunkView {
                         header: hunk.header,
                         above: gap(
-                            &link,
+                            &opening,
                             &expansion,
-                            index,
+                            &file.path,
                             hunk.gaps.first,
                             Dir::Up,
                             hunk.gaps.above,
                         ),
                         below: gap(
-                            &link,
+                            &opening,
                             &expansion,
-                            index,
+                            &file.path,
                             hunk.gaps.last,
                             Dir::Down,
                             hunk.gaps.below,
@@ -254,8 +335,8 @@ fn pane(
                 binary: file.binary,
                 viewed: ticked,
                 held_back,
-                show_href: link(&expansion.showing(index)),
-                expand_all_href: folded.then(|| link(&expansion.whole_file(index))),
+                show_href: opening(&expansion.showing(&file.path)),
+                expand_all_href: folded.then(|| opening(&expansion.whole_file(&file.path))),
                 hunks,
             }
         })
@@ -282,22 +363,37 @@ fn pane(
     });
 
     Ok(context! {
-        card, tree, threads, scopes, drafts, submitted, last_message, turn_note,
+        card, tree, threads, scopes, modes, drafts, submitted, last_message, turn_note,
         files => rendered,
         has_diff => !files.is_empty(),
-        has_turns => !turns.is_empty(),
+        // Whether the card has any history at all to point the picker at — not
+        // whether a turn has landed, since a dirty worktree has files to show
+        // long before one does.
+        has_history => range.is_some(),
+        scope_label => scope.label(),
+        scope_kind => scope.anchor.kind(),
         additions => totals.0,
         deletions => totals.1,
-        scope => scope.key(),
-        expand => expansion.key(),
+        scope => scope_key,
+        expand => expand_key,
+        poll_interval => settings.poll_interval,
+        source => link(&scope_key, &expand_key),
     })
+}
+
+/// What the agent's worktree has checked out, for listing the commits it made.
+///
+/// A detached worktree's `HEAD` is the only place its own commits are reachable
+/// from — the turn refs are a parallel chain and never contain them.
+fn head_of(worktree: &Path) -> String {
+    git::run(worktree, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "HEAD".into())
 }
 
 /// The expansion a button hands back, or nothing when that side is already open.
 fn gap(
     link: &impl Fn(&Expansion) -> String,
     expansion: &Expansion,
-    file: usize,
+    file: &str,
     hunk: usize,
     dir: Dir,
     lines: usize,

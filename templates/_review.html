@@ -1,14 +1,48 @@
+{#
+  The pane polls itself, so anything the reader is part-way through has to
+  survive a swap: `up-scroll="keep"` holds the diff where it was, and app.js
+  stops the poll outright while a comment or this menu is open.
+#}
 <div class="review" id="review" data-card="{{ card.id }}"
-     data-scope="{{ scope }}" data-expand="{{ expand }}">
+     data-scope="{{ scope }}" data-expand="{{ expand }}"
+     data-additions="{{ additions }}" data-deletions="{{ deletions }}"
+     data-has-diff="{{ 1 if has_diff else 0 }}"
+     up-poll up-interval="{{ poll_interval }}" up-source="{{ source }}"
+     {# Single-quoted: the digest substituted in carries its own double quotes,
+        as an ETag must. Only set when the pane is the whole response — inside
+        the board page the placeholder would take that page's digest, which this
+        poll could never match. #}
+     up-scroll="keep" {% if etag %}up-etag='{{ etag }}'{% endif %}>
   <nav class="tree">
     <div class="tree-head">
-      <select data-scope-select aria-label="Range" {% if not has_turns %}disabled{% endif %}>
-        {% for option in scopes %}
-          <option value="{{ option.key }}" {% if option.selected %}selected{% endif %}>
-            {{ option.label }}
-          </option>
+      {# One list of points in history, newest first; the toggle beside it picks
+         which side of the chosen one is on screen. #}
+      <details class="range-menu" id="range-menu" data-range-menu
+               {% if not has_history %}hidden{% endif %}>
+        <summary class="chip anchor-{{ scope_kind }}" title="Pick a range">
+          <span class="dot"></span>{{ scope_label }}{{ icon("chevron-down") }}
+        </summary>
+        <div class="menu">
+          <p class="menu-head">Measure from</p>
+          {% for option in scopes %}
+            <a class="menu-item anchor-{{ option.kind }} {% if option.selected %}on{% endif %}"
+               href="{{ option.href }}" up-follow up-target="#review" up-scroll="keep">
+              <span class="dot"></span>{{ option.label }}
+            </a>
+          {% endfor %}
+        </div>
+      </details>
+
+      <div class="modes" role="group" aria-label="What to show">
+        {% for option in modes %}
+          {% if option.available %}
+            <a class="mode {% if option.selected %}on{% endif %}" href="{{ option.href }}"
+               up-follow up-target="#review" up-scroll="keep">{{ option.label }}</a>
+          {% else %}
+            <span class="mode" aria-disabled="true">{{ option.label }}</span>
+          {% endif %}
         {% endfor %}
-      </select>
+      </div>
     </div>
 
     {# Every file is already on the page, so these only have to jump to one. #}
@@ -172,7 +206,7 @@
         </section>
       {% else %}
         <p class="empty">
-          {% if has_turns %}
+          {% if has_history %}
             No changes in this range.
           {% else %}
             Nothing yet on <span class="mono">{{ card.base_branch }}</span>.

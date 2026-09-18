@@ -20,12 +20,14 @@ pub struct FileExpansion {
 /// from the query alone, and a stale key is harmless — it names files and hunks
 /// that no longer exist.
 ///
-/// Files are keyed by their position in the diff, which is also what the DOM ids
-/// and the tree's jump links use. Positions shift when the scope changes, but a
-/// key that outlives its scope was already only a rendering hint.
+/// Files are keyed by path, not by their position in the diff. The default
+/// range ends at the live worktree and the pane polls it, so a file appearing
+/// upstream would otherwise slide every open hunk onto a different file while
+/// someone is reading it. The DOM ids and the tree's jump links stay positional
+/// — they are rebuilt on every render and never outlive it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Expansion {
-    by_file: BTreeMap<usize, FileExpansion>,
+    by_file: BTreeMap<String, FileExpansion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +127,11 @@ impl FileExpansion {
 }
 
 impl Expansion {
-    /// `0:file;3:0u10,2d40`. Anything unparseable reads as no expansion.
+    /// `src/a.rs:file;src/b.rs:0u10,2d40`. Anything unparseable reads as no
+    /// expansion.
+    ///
+    /// NB: the terms are taken from after the *last* colon, because a path may
+    /// contain one and the terms never do.
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
             return Self::default();
@@ -133,16 +139,17 @@ impl Expansion {
 
         let mut by_file = BTreeMap::new();
         for term in raw.split(';') {
-            let Some((index, terms)) = term.split_once(':') else {
+            let Some((path, terms)) = term.rsplit_once(':') else {
                 continue;
             };
-            let Ok(index) = index.trim().parse() else {
+            let path = path.trim();
+            if path.is_empty() {
                 continue;
-            };
+            }
 
             let expansion = FileExpansion::parse(terms);
             if !expansion.is_empty() {
-                by_file.insert(index, expansion);
+                by_file.insert(path.to_owned(), expansion);
             }
         }
 
@@ -151,44 +158,44 @@ impl Expansion {
 
     pub fn key(&self) -> String {
         let mut key = String::new();
-        for (index, expansion) in &self.by_file {
+        for (path, expansion) in &self.by_file {
             if !key.is_empty() {
                 key.push(';');
             }
-            let _ = write!(key, "{index}:{}", expansion.terms());
+            let _ = write!(key, "{path}:{}", expansion.terms());
         }
         key
     }
 
-    /// What has been opened in the file at `index`.
-    pub fn file(&self, index: usize) -> FileExpansion {
-        self.by_file.get(&index).cloned().unwrap_or_default()
+    /// What has been opened in one file.
+    pub fn file(&self, path: &str) -> FileExpansion {
+        self.by_file.get(path).cloned().unwrap_or_default()
     }
 
     /// The same expansion with `lines` more opened on one side of one hunk of
     /// one file.
-    pub fn plus(&self, file: usize, hunk: usize, dir: Dir, lines: usize) -> Self {
-        let expanded = self.file(file).plus(hunk, dir, lines);
+    pub fn plus(&self, path: &str, hunk: usize, dir: Dir, lines: usize) -> Self {
+        let expanded = self.file(path).plus(hunk, dir, lines);
         let mut next = self.clone();
         if !expanded.is_empty() {
-            next.by_file.insert(file, expanded);
+            next.by_file.insert(path.to_owned(), expanded);
         }
         next
     }
 
     /// The same expansion with every hunk of one file opened.
-    pub fn whole_file(&self, file: usize) -> Self {
+    pub fn whole_file(&self, path: &str) -> Self {
         let mut next = self.clone();
-        let entry = next.by_file.entry(file).or_default();
+        let entry = next.by_file.entry(path.to_owned()).or_default();
         entry.whole_file = true;
         entry.by_hunk.clear();
         next
     }
 
     /// The same expansion with one over-long file asked for anyway.
-    pub fn showing(&self, file: usize) -> Self {
+    pub fn showing(&self, path: &str) -> Self {
         let mut next = self.clone();
-        next.by_file.entry(file).or_default().shown = true;
+        next.by_file.entry(path.to_owned()).or_default().shown = true;
         next
     }
 }
@@ -200,86 +207,109 @@ mod tests {
     #[test]
     fn nothing_expanded_by_default() {
         let expansion = Expansion::parse(None);
-        assert_eq!(expansion.file(0).of(0), (0, 0));
+        assert_eq!(expansion.file("src/a.rs").of(0), (0, 0));
         assert_eq!(expansion.key(), "");
     }
 
     #[test]
     fn expansions_round_trip_through_their_key() {
-        let expansion = Expansion::parse(Some("2:0u10,2d40"));
-        assert_eq!(expansion.file(2).of(0), (10, 0));
-        assert_eq!(expansion.file(2).of(2), (0, 40));
-        assert_eq!(expansion.key(), "2:0u10,2d40");
+        let expansion = Expansion::parse(Some("src/a.rs:0u10,2d40"));
+        assert_eq!(expansion.file("src/a.rs").of(0), (10, 0));
+        assert_eq!(expansion.file("src/a.rs").of(2), (0, 40));
+        assert_eq!(expansion.key(), "src/a.rs:0u10,2d40");
     }
 
     #[test]
     fn files_do_not_share_what_has_been_opened() {
-        let expansion = Expansion::parse(Some("0:1u10;3:file"));
+        let expansion = Expansion::parse(Some("src/a.rs:1u10;src/b.rs:file"));
 
-        assert_eq!(expansion.file(0).of(1), (10, 0));
-        assert_eq!(expansion.file(3).of(1), (usize::MAX, usize::MAX));
+        assert_eq!(expansion.file("src/a.rs").of(1), (10, 0));
+        assert_eq!(expansion.file("src/b.rs").of(1), (usize::MAX, usize::MAX));
         // The file nobody has touched is untouched.
-        assert_eq!(expansion.file(1).of(1), (0, 0));
+        assert_eq!(expansion.file("src/c.rs").of(1), (0, 0));
+    }
+
+    /// A path is what survives the diff changing under a poll; a position is
+    /// not, which is why these are keyed the way they are.
+    #[test]
+    fn a_new_file_upstream_does_not_move_what_is_open() {
+        let expansion = Expansion::parse(Some("src/b.rs:0u10"));
+
+        // `src/a.rs` appearing ahead of it in the diff changes nothing.
+        assert_eq!(expansion.file("src/b.rs").of(0), (10, 0));
+        assert_eq!(expansion.file("src/a.rs").of(0), (0, 0));
     }
 
     #[test]
     fn the_whole_file_opens_every_hunk() {
-        let expansion = Expansion::parse(Some("4:file"));
-        assert_eq!(expansion.file(4).of(7), (usize::MAX, usize::MAX));
-        assert_eq!(expansion.key(), "4:file");
+        let expansion = Expansion::parse(Some("src/a.rs:file"));
+        assert_eq!(expansion.file("src/a.rs").of(7), (usize::MAX, usize::MAX));
+        assert_eq!(expansion.key(), "src/a.rs:file");
     }
 
     #[test]
     fn junk_terms_are_dropped_rather_than_failing() {
-        let expansion = Expansion::parse(Some("nonsense;1:xuy,1u5;:9;2"));
-        assert_eq!(expansion.file(1).of(1), (5, 0));
-        assert_eq!(expansion.key(), "1:1u5");
+        let expansion = Expansion::parse(Some("nonsense;src/a.rs:xuy,1u5;:9;2"));
+        assert_eq!(expansion.file("src/a.rs").of(1), (5, 0));
+        assert_eq!(expansion.key(), "src/a.rs:1u5");
+    }
+
+    /// The terms come off the end, so a colon in the path is not a split point.
+    #[test]
+    fn a_path_containing_a_colon_survives_the_round_trip() {
+        let expansion = Expansion::parse(Some("weird:name.rs:0u10"));
+        assert_eq!(expansion.file("weird:name.rs").of(0), (10, 0));
+        assert_eq!(expansion.key(), "weird:name.rs:0u10");
     }
 
     #[test]
     fn expanding_accumulates_on_one_side() {
-        let expansion = Expansion::parse(Some("0:0u10"))
-            .plus(0, 0, Dir::Up, 10)
-            .plus(0, 0, Dir::Down, 3);
+        let expansion = Expansion::parse(Some("src/a.rs:0u10"))
+            .plus("src/a.rs", 0, Dir::Up, 10)
+            .plus("src/a.rs", 0, Dir::Down, 3);
 
-        assert_eq!(expansion.file(0).of(0), (20, 3));
-        assert_eq!(expansion.key(), "0:0u20,0d3");
+        assert_eq!(expansion.file("src/a.rs").of(0), (20, 3));
+        assert_eq!(expansion.key(), "src/a.rs:0u20,0d3");
     }
 
     #[test]
     fn expanding_one_file_leaves_the_others_alone() {
-        let expansion = Expansion::parse(Some("0:0u10")).plus(5, 1, Dir::Down, 20);
+        let expansion = Expansion::parse(Some("src/a.rs:0u10")).plus("src/z.rs", 1, Dir::Down, 20);
 
-        assert_eq!(expansion.file(0).of(0), (10, 0));
-        assert_eq!(expansion.key(), "0:0u10;5:1d20");
+        assert_eq!(expansion.file("src/a.rs").of(0), (10, 0));
+        assert_eq!(expansion.key(), "src/a.rs:0u10;src/z.rs:1d20");
     }
 
     #[test]
     fn a_whole_file_expansion_has_nothing_left_to_open() {
-        let expansion = Expansion::parse(Some("3:file")).plus(3, 0, Dir::Up, 10);
-        assert_eq!(expansion.key(), "3:file");
+        let expansion = Expansion::parse(Some("src/a.rs:file")).plus("src/a.rs", 0, Dir::Up, 10);
+        assert_eq!(expansion.key(), "src/a.rs:file");
     }
 
     #[test]
     fn opening_a_whole_file_supersedes_its_hunks() {
-        let expansion = Expansion::parse(Some("3:0u10,1d5")).whole_file(3);
-        assert_eq!(expansion.key(), "3:file");
+        let expansion = Expansion::parse(Some("src/a.rs:0u10,1d5")).whole_file("src/a.rs");
+        assert_eq!(expansion.key(), "src/a.rs:file");
     }
 
     #[test]
     fn a_file_held_back_for_its_size_can_be_asked_for() {
-        let expansion = Expansion::default().showing(2);
+        let expansion = Expansion::default().showing("pnpm-lock.yaml");
 
-        assert_eq!(expansion.key(), "2:show");
-        assert!(expansion.file(2).shown());
-        assert!(!expansion.file(0).shown());
+        assert_eq!(expansion.key(), "pnpm-lock.yaml:show");
+        assert!(expansion.file("pnpm-lock.yaml").shown());
+        assert!(!expansion.file("src/a.rs").shown());
         // Asking for it opens nothing beyond the default context.
-        assert_eq!(expansion.file(2).of(0), (0, 0));
+        assert_eq!(expansion.file("pnpm-lock.yaml").of(0), (0, 0));
     }
 
     #[test]
     fn expanding_a_hunk_is_itself_a_reason_to_show_the_file() {
-        assert!(Expansion::parse(Some("2:0u10")).file(2).shown());
-        assert!(Expansion::parse(Some("2:file")).file(2).shown());
+        assert!(Expansion::parse(Some("src/a.rs:0u10"))
+            .file("src/a.rs")
+            .shown());
+        assert!(Expansion::parse(Some("src/a.rs:file"))
+            .file("src/a.rs")
+            .shown());
     }
 }

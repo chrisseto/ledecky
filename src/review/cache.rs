@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rocket::serde::Serialize;
@@ -21,6 +23,7 @@ const CAPACITY: usize = 64;
 pub struct DiffCache {
     entries: Mutex<Vec<(Key, Arc<Vec<ParsedFile>>)>>,
     stats: Mutex<Vec<(Key, Stat)>>,
+    heads: Mutex<HashMap<i64, (Instant, String)>>,
 }
 
 /// How much a range changed, for the cards on the board.
@@ -94,6 +97,34 @@ impl DiffCache {
         stat
     }
 
+    /// A card's live head, recomputing at most once per `ttl`.
+    ///
+    /// NB: `compute` runs under the lock on purpose. Staging the worktree is
+    /// what produces the head, and the pane's poll, the board's poll and every
+    /// navigation can all ask for the same card at once — concurrently they
+    /// would collide on the scratch index's `.lock` file, and one `git add -A`
+    /// per card per *request* is not a cost the board can carry.
+    pub fn head(
+        &self,
+        card_id: i64,
+        ttl: Duration,
+        compute: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let Ok(mut heads) = self.heads.lock() else {
+            return compute();
+        };
+
+        if let Some((at, head)) = heads.get(&card_id) {
+            if at.elapsed() < ttl {
+                return Some(head.clone());
+            }
+        }
+
+        let head = compute()?;
+        heads.insert(card_id, (Instant::now(), head.clone()));
+        Some(head)
+    }
+
     fn lookup(&self, key: &Key) -> Option<Arc<Vec<ParsedFile>>> {
         let entries = self.entries.lock().ok()?;
         entries
@@ -122,6 +153,14 @@ impl DiffCache {
         }
         if let Ok(mut stats) = self.stats.lock() {
             stats.retain(|(k, _)| k.repo != repo);
+        }
+    }
+
+    /// Drops a card's memoised head, so the next read sees the worktree it
+    /// actually has — or notices that it no longer has one.
+    pub fn forget_head(&self, card_id: i64) {
+        if let Ok(mut heads) = self.heads.lock() {
+            heads.remove(&card_id);
         }
     }
 }

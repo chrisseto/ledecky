@@ -80,6 +80,10 @@ fn normalize_svg(svg: &str, name: &str) -> String {
 ///
 /// The digest is taken over the body with the placeholder still in it and
 /// substituted afterwards, so the ETag is never an input to itself.
+///
+/// NB: it is filled with the digest of whatever response carries it, so a
+/// fragment that is sometimes rendered inside a larger page must only emit it
+/// when it is the response — see `review::routes::initial`.
 const ETAG_SLOT: &str = "__up_etag__";
 
 /// Not a security boundary — a collision costs one redundant fragment swap.
@@ -99,6 +103,11 @@ fn if_none_match(req: &Request<'_>, etag: &str) -> bool {
 
 /// Renders a minijinja template, pulling `Templates` out of Rocket's state.
 pub struct Tmpl(pub &'static str, pub Value);
+
+impl Tmpl {
+    /// What a template puts in `up-etag` to have it filled in on the way out.
+    pub const ETAG_SLOT: &'static str = ETAG_SLOT;
+}
 
 impl<'r> Responder<'r, 'static> for Tmpl {
     fn respond_to(self, req: &'r Request<'_>) -> response::Result<'static> {

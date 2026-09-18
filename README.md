@@ -46,8 +46,25 @@ each `Stop`. The server then commits the *working tree* as
 be captured. Staging happens in a scratch `GIT_INDEX_FILE`, so the worktree's
 own index is never disturbed.
 
-This is what makes the diff scopes work: `base..turn-N` for everything,
-`turn-(N-1)..turn-N` for one round, `turn-N..latest` for everything since.
+**Ranges.** The diff is always measured from some *anchor* — the live worktree,
+one of the agent's own commits, a turn, or where the card started — and a toggle
+beside the picker says whether to read *just* that point or everything *since*
+it. So `base..worktree` is everything the card has done, `turn-(N-1)..turn-N` is
+one round, `sha^..sha` is one commit. The picker lists the anchors newest first,
+turns and commits interleaved by time, each tagged with its own colour.
+
+Anything live ends at the worktree rather than at the last turn, and that is the
+point: work shows up while the agent is still doing it, committed or not, rather
+than only once a `Stop` has captured it. The worktree is staged into a scratch
+index and written out with `git write-tree`, so it has an object id the diff can
+use like any other revision — a *tree*, deliberately not a commit, because a
+commit would carry a timestamp and so change on every read, defeating both the
+diff cache and the pane's ETag. `refs/ledecky/<card>/working` holds it so `gc`
+cannot prune it mid-read, and it goes away with the worktree.
+
+The pane polls, so a range that ends at the worktree keeps up on its own. It
+holds still while a comment is open or the picker is down, and an unchanged diff
+is answered `304` and never swapped.
 
 **Review.** The diff is rendered by piping `git diff` through [delta][] at full
 context. Full context is what makes highlighting correct: a block comment or
@@ -63,11 +80,13 @@ The parse is cached per resolved commit pair and holds every line of the file, s
 selecting a file, opening a hunk, or widening to the whole file is a re-slice
 rather than another run.
 
-One file is shown at a time, picked from the tree beside it. The diff opens with
-three lines of context; *Expand N lines above/below* takes a bite out of a gap
-and *Expand whole file* opens all of them. What is open lives in the pane's
-query string, so nothing about it is server state. Ticking *Viewed* folds a file
-away, and that much is remembered per card.
+Every file in the range is stacked on the page, with the tree beside it jumping
+to one. The diff opens with three lines of context; *Expand N lines above/below*
+takes a bite out of a gap and *Expand whole file* opens all of them. What is
+open lives in the pane's query string, so nothing about it is server state — and
+it is keyed by path rather than by position in the diff, so a file appearing
+upstream mid-poll cannot slide it onto a different one. Ticking *Viewed* folds a
+file away, and that much is remembered per card.
 
 Click any diff line to comment; clicking away saves it as a draft. *Send N to
 agent* formats the batch into one message and pastes it into the agent's
@@ -96,7 +115,8 @@ cards that actually differ are replaced.
 **Merge.** Available in In Review. The server asks the agent to land its commits
 on the base branch and never rewrites branches itself. On the next turn it
 checks that the branch moved *and* that its tree matches the latest snapshot
-before marking the card Done and pruning the worktree. Turn refs are kept.
+before marking the card Done and pruning the worktree. Turn refs are kept; the
+`working` ref goes with the worktree it described.
 
 ## Configuration
 

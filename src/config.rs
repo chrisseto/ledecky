@@ -76,6 +76,14 @@ impl Settings {
     pub fn turn_ref(&self, card_id: i64, n: i64) -> String {
         format!("refs/{}/{card_id}/turn-{n}", self.app_slug)
     }
+
+    /// `refs/<app_slug>/<card>/working` — the live worktree's tree.
+    ///
+    /// Unlike the turn refs this one is not history: it moves on every read and
+    /// goes away with the worktree.
+    pub fn working_ref(&self, card_id: i64) -> String {
+        format!("refs/{}/{card_id}/working", self.app_slug)
+    }
 }
 
 fn default_data_dir(app_slug: &str) -> PathBuf {
@@ -120,6 +128,7 @@ mod tests {
         assert_eq!(s.card_dir(7), PathBuf::from("/srv/board/cards/7"));
         assert_eq!(s.base_ref(7), "refs/planner/7/base");
         assert_eq!(s.turn_ref(7, 3), "refs/planner/7/turn-3");
+        assert_eq!(s.working_ref(7), "refs/planner/7/working");
     }
 
     #[test]

@@ -6,10 +6,13 @@ import {
   addedLines,
   cardIn,
   comment,
+  editWorktree,
   fileSection,
   git,
   openCard,
+  pollsOfPath,
   turnRefs,
+  worktreeGit,
 } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
@@ -135,11 +138,13 @@ test("the review pane stacks every changed file, with scopes for each turn", asy
   // Two lines change per turn now: the appended record, and a rewritten word.
   await expect(fileSection(page, "main.rs").locator(".line.l-added", { hasText: TASK })).toBeVisible();
 
-  await expect(review.locator("[data-scope-select] option")).toHaveText([
-    /All changes/,
+  // One point per row, newest first; the toggle beside it says which side.
+  await expect(review.locator("[data-range-menu] .menu-item")).toHaveText([
     /Turn 1/,
-    /Since turn 1/,
+    /Where this card started/,
   ]);
+  await expect(review.locator("[data-range-menu] summary")).toContainText("All changes");
+  await expect(review.locator(".modes .mode")).toHaveText(["Just this", "Since this"]);
 
   // The agent's closing message is surfaced outside the terminal, in the tree
   // footer rather than in the diff column where it used to crowd out the diff.
@@ -151,16 +156,96 @@ test("an empty range keeps the picker, so there is a way back out of it", async 
   await openCard(page, cardId);
 
   const review = page.locator("#review");
-  const picker = review.locator("[data-scope-select]");
+  const menu = review.locator("[data-range-menu]");
 
-  // With one turn, "since turn 1" is that turn against itself: no files.
-  await picker.selectOption("since-1");
+  // With one turn and a clean worktree, "since turn 1" is that turn against
+  // itself: no files.
+  // The mode carries across a change of anchor, and the default is "since".
+  await menu.locator("summary").click();
+  await menu.getByText("Turn 1").click();
+
   await expect(review.locator("#diff-lines > .empty")).toBeVisible();
   await expect(review.locator(".file")).toHaveCount(0);
+  await expect(menu.locator("summary")).toContainText("Since turn 1");
 
-  await expect(picker).toHaveValue("since-1");
-  await picker.selectOption("all");
+  await menu.locator("summary").click();
+  await menu.getByText("Where this card started").click();
   await expect(review.locator(".file")).toHaveCount(2);
+});
+
+test("uncommitted work is on screen before any turn captures it", async ({ page }) => {
+  // No hook fires for this: it is the agent mid-turn, which is exactly the case
+  // the pane used to render as "Nothing yet on main".
+  editWorktree(cardId, "scratch.txt", "written between turns\n");
+  const before = turnRefs(cardId).length;
+
+  await openCard(page, cardId);
+  const review = page.locator("#review");
+
+  await expect(fileSection(page, "scratch.txt")).toBeVisible();
+  await expect(
+    fileSection(page, "scratch.txt").locator(".line.l-added", { hasText: "between turns" }),
+  ).toBeVisible();
+
+  // The picker offers it as a point of its own, above the turns.
+  await review.locator("[data-range-menu] summary").click();
+  await expect(review.locator("[data-range-menu] .menu-item").first()).toContainText(
+    "Uncommitted work",
+  );
+
+  // And none of that recorded a turn.
+  expect(turnRefs(cardId).length).toBe(before);
+});
+
+test("a commit the agent made is a point of its own in the picker", async ({ page }) => {
+  // NB: only this file. The agent's own edits are uncommitted too — a turn
+  // snapshot captures them without the worktree's HEAD ever moving.
+  worktreeGit(cardId, "add", "scratch.txt");
+  worktreeGit(cardId, "-c", "user.email=a@b.c", "-c", "user.name=a", "commit", "-qm", "banner: land it");
+
+  await openCard(page, cardId);
+  const review = page.locator("#review");
+  const menu = review.locator("[data-range-menu]");
+
+  await menu.locator("summary").click();
+  const entry = menu.locator(".menu-item.anchor-commit", { hasText: "banner: land it" });
+  await expect(entry).toBeVisible();
+
+  // Reading just that commit shows only what it changed.
+  await entry.click();
+  await expect(menu.locator("summary")).toContainText("Since ");
+
+  await review.locator(".modes a.mode", { hasText: "Just this" }).click();
+  await expect(review.locator(".file-head .path")).toHaveText(["scratch.txt"]);
+});
+
+test("the pane keeps up with the worktree on its own", async ({ page }) => {
+  const polls = pollsOfPath(page, `/cards/${cardId}/diff`);
+  await openCard(page, cardId);
+  await expect(page.locator("#review .file").first()).toBeVisible();
+
+  editWorktree(cardId, "later.txt", "arrived while the drawer was open\n");
+
+  // No reload: the pane polls its own URL.
+  await expect(fileSection(page, "later.txt")).toBeVisible({ timeout: 25_000 });
+
+  // And once it settles, an unchanged diff is answered 304 rather than swapped
+  // — which only holds because the worktree's tree id is stable.
+  await expect.poll(() => polls.filter((s) => s === 304).length, { timeout: 25_000 }).toBeGreaterThan(0);
+});
+
+test("a comment being written survives the poll", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = page.locator("#review .line").first();
+  await line.click();
+
+  const textarea = page.locator(".compose textarea");
+  await textarea.fill("half a thought");
+
+  // Long enough for several ticks to have gone by had polling not stopped.
+  await page.waitForTimeout(3_000);
+  await expect(textarea).toHaveValue("half a thought");
 });
 
 test("the tree jumps to a file instead of reloading the pane", async ({ page }) => {
@@ -200,6 +285,12 @@ test("every link out of the pane carries a usable query", async ({ page }) => {
     els.map((el) => el.getAttribute("href")),
   );
   expect(hrefs.filter((href) => href.includes("amp;"))).toEqual([]);
+
+  // The pane polls this one, so a dropped parameter would reset the range on
+  // every tick rather than just on a click.
+  const source = await page.locator("#review").getAttribute("up-source");
+  expect(source).not.toContain("amp;");
+  expect(source).toContain("scope=");
 });
 
 test("only the word that changed is marked, not the whole line", async ({ page }) => {

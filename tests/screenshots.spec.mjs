@@ -1,6 +1,15 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, comment, fileSection, openCard, turnRefs } from "./support/board.mjs";
+import {
+  addCard,
+  addProject,
+  cardIn,
+  comment,
+  fileSection,
+  openCard,
+  turnRefs,
+  worktreeGit,
+} from "./support/board.mjs";
 
 // Not assertions so much as a way to look at the thing. Run with
 // `pnpm e2e tests/screenshots.spec.mjs` and open tests/.shots/.
@@ -56,6 +65,16 @@ test("capture the whole flow", async ({ page }) => {
 
   await page.locator('label[for="tab-review"]').click();
   await shot(page, "09-review");
+
+  // The colour coding only means anything with more than one kind of point in
+  // the list, so give it a commit of the agent's own to sit beside the turn.
+  worktreeGit(cardId, "-c", "user.email=a@b.c", "-c", "user.name=a", "commit", "-qam", "banner: land it");
+  await page.reload();
+  await page.locator('label[for="tab-review"]').click();
+  await page.locator("[data-range-menu] summary").click();
+  await expect(page.locator("[data-range-menu] .menu-item.anchor-commit")).toBeVisible();
+  await shot(page, "09b-range-menu");
+  await page.locator("[data-range-menu] summary").click();
 
   await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
   await expect(page.locator("#review .comment")).toBeVisible();

@@ -1,10 +1,27 @@
 import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { expect } from "@playwright/test";
 
-import { REPO } from "./paths.mjs";
+import { DATA_HOME, REPO } from "./paths.mjs";
 
 export const git = (...args) =>
   execFileSync("git", ["-C", REPO, ...args], { encoding: "utf8" }).trim();
+
+/** Where the server puts a card's worktree, as `Settings` derives it. */
+export const worktreeOf = (cardId) => join(DATA_HOME, "ledecky", "worktrees", String(cardId));
+
+/**
+ * Stands in for the agent touching its own worktree.
+ *
+ * The fake agent only ever appends on a prompt, so work that arrives *between*
+ * turns — which is most of what a real agent does — has to be made here.
+ */
+export const editWorktree = (cardId, path, body) =>
+  writeFileSync(join(worktreeOf(cardId), path), body);
+
+export const worktreeGit = (cardId, ...args) =>
+  execFileSync("git", ["-C", worktreeOf(cardId), ...args], { encoding: "utf8" }).trim();
 
 export const refs = (pattern = "refs/ledecky/**") =>
   git("for-each-ref", "--format=%(refname)", pattern).split("\n").filter(Boolean);
@@ -77,7 +94,11 @@ export async function comment(page, line, body) {
  * the page. Call before `goto`; the returned array fills as ticks land.
  */
 export function pollsOf(page, projectUrl) {
-  const path = new URL(projectUrl).pathname;
+  return pollsOfPath(page, new URL(projectUrl).pathname);
+}
+
+/** The same, for any polled fragment — the review pane polls its own URL. */
+export function pollsOfPath(page, path) {
   const statuses = [];
 
   page.on("response", (response) => {

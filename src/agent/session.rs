@@ -211,8 +211,16 @@ pub fn teardown(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCache
         .map(PathBuf::from)
         .unwrap_or_else(|| settings.worktree_path(card_id));
     git::remove_worktree(&project.repo(), &worktree);
+    // Turn refs are history and are kept; this one only ever described the
+    // worktree that has just gone, and would otherwise pin its tree forever.
+    let _ = git::run(
+        &project.repo(),
+        &["update-ref", "-d", &settings.working_ref(card_id)],
+    );
+
     // The card's refs go with it, so anything parsed from them is dead weight.
     cache.forget(&project.repo());
+    cache.forget_head(card_id);
 
     Card::detach_worktree(&db.lock(), card_id);
 }
