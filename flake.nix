@@ -29,10 +29,10 @@
             pkgs.nodejs_22
             pkgs.pnpm
             pkgs.esbuild
-            # The diff pane shells out to this; there is no fallback path.
-            pkgs.delta
-            # `scripts/migrate-data-dir.sh` rewrites the board database.
-            pkgs.sqlite
+            pkgs.delta # For generating diffs.
+            pkgs.perl # Also used by agents
+            pkgs.python3 # Used by agents
+            pkgs.sqlite # For debugging, if need be.
           ];
 
           # Playwright's own browser download produces binaries that will not run
