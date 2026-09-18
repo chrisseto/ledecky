@@ -123,8 +123,7 @@
 
               {% for line in hunk.lines %}
                 <div class="line l-{{ line.kind }}"
-                     data-file="{{ file.path }}" data-anchor="{{ line.anchor }}"
-                     title="Comment on this line">
+                     data-file="{{ file.path }}" data-anchor="{{ line.anchor }}">
                   <span class="add">+</span>
                   <span class="n">{{ line.old_line if line.old_line else "" }}</span>
                   <span class="n">{{ line.new_line if line.new_line else "" }}</span>
