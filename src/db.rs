@@ -10,6 +10,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/002_merge.sql"),
     include_str!("../migrations/003_agent_pid.sql"),
     include_str!("../migrations/004_review_viewed.sql"),
+    include_str!("../migrations/005_session_titles.sql"),
 ];
 
 /// A single connection behind a mutex.
@@ -122,8 +123,7 @@ pub mod tests {
             &conn,
             crate::project::NewCard {
                 project_id: project,
-                title: "doomed",
-                description: "",
+                task: "work",
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,

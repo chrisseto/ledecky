@@ -16,7 +16,9 @@
 //   * a modal that swallows pastes and treats a bare Enter as "exit", which is
 //     how the bypass-permissions consent dialog behaves — blind-Entering into
 //     one used to kill agents outright;
-//   * the HTTP hooks named in its own --settings argument.
+//   * the HTTP hooks named in its own --settings argument;
+//   * naming itself after its first prompt, as a metadata line in its
+//     transcript — which is where the server reads the card's title from.
 //
 // Each submitted prompt appends a line to main.rs so turn snapshots have
 // something to capture, and the merge prompt is understood well enough to move
@@ -40,7 +42,6 @@ const flag = (name) => {
 const settings = JSON.parse(flag("--settings") ?? "{}");
 const hookUrl = (event) => settings.hooks?.[event]?.[0]?.hooks?.[0]?.url;
 const repo = flag("--add-dir");
-const title = flag("--name") ?? "card";
 const permissionMode = flag("--permission-mode") ?? "default";
 const resuming = flag("--resume");
 const sessionId = resuming ?? `fake-${process.pid}`;
@@ -60,7 +61,7 @@ appendFileSync(transcriptPath, `${JSON.stringify({ session: sessionId })}\n`);
 
 const out = (s) => process.stdout.write(s);
 const transcript = [
-  `fake-agent - ${title}`,
+  `fake-agent - ${sessionId}`,
   `cwd ${process.cwd()}`,
   `mode ${permissionMode}`,
   "",
@@ -161,7 +162,7 @@ function performMerge(prompt) {
       "user.name=fake agent",
       "commit",
       "-qm",
-      `work for ${title}`,
+      `work for ${sessionId}`,
     );
   } catch {
     // Nothing left to commit.
@@ -178,6 +179,21 @@ async function submit(prompt) {
   turn += 1;
   transcript.push(`> ${prompt.split("\n")[0]}`);
   render();
+
+  // The real client titles an unnamed session off its first prompt, shortly
+  // after submitting it, and only ever writes it to the transcript — never to a
+  // hook payload. Derived from the prompt so the suite can still find the card
+  // by the words it typed.
+  if (turn === 1) {
+    appendFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: "ai-title",
+        aiTitle: `${prompt.split("\n")[0]} (named)`,
+        sessionId,
+      })}\n`,
+    );
+  }
 
   await hook("UserPromptSubmit", { prompt });
 

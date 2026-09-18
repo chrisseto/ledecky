@@ -1,4 +1,4 @@
-<aside class="drawer drawer-card" aria-label="{{ card.title }}">
+<aside class="drawer drawer-card" aria-label="{{ card.title or card.task }}">
   <div class="drawer-head">
     <details class="lane-menu">
       <summary class="chip lane-{{ card.lane }}" title="Move this card">
@@ -19,7 +19,7 @@
       </div>
     </details>
 
-    <h2>{{ card.title }}</h2>
+    <h2>{{ card.title or card.task }}</h2>
     <span class="branch mono">{{ icon("git-branch") }} {{ card.base_branch }}</span>
 
     <span class="spacer"></span>

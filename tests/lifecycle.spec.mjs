@@ -54,7 +54,6 @@ test("the terminal streams the agent's screen", async ({ page }) => {
 
   const rows = page.locator("div[data-terminal] .xterm-rows");
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
-  await expect(rows).toContainText(TITLE);
   // The agent is running inside the card's worktree, not the project checkout.
   await expect(rows).toContainText(`worktrees/${cardId}`);
 });
@@ -123,6 +122,16 @@ test("the opening task is delivered and the finished turn moves the card to In R
 
   // The snapshot captured the working tree even though the agent never committed.
   expect(addedLines(`refs/ledecky/${cardId}/base`, `refs/ledecky/${cardId}/turn-1`)).toContain(TASK);
+});
+
+test("the card takes the name the session gave itself", async ({ page }) => {
+  await page.goto(projectUrl);
+
+  // The title the human typed is only a label until the agent names its
+  // session; from then on the card follows that name.
+  await expect(page.locator(`#card-${cardId}`)).toContainText(`${TITLE} (named)`, {
+    timeout: 25_000,
+  });
 });
 
 test("the review pane stacks every changed file, with scopes for each turn", async ({ page }) => {

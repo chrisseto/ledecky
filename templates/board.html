@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>
-      {% if card %}{{ card.title }} — {{ project.name }}
+      {% if card %}{{ card.title or card.task }} — {{ project.name }}
       {% elif project %}{{ project.name }} — ledecky
       {% else %}ledecky{% endif %}
     </title>

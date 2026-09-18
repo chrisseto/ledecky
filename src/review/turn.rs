@@ -185,8 +185,7 @@ mod tests {
             conn,
             NewCard {
                 project_id: project,
-                title: "work",
-                description: "",
+                task: "work",
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
@@ -277,8 +276,7 @@ mod tests {
             &conn,
             NewCard {
                 project_id: Project::upsert(&conn, Path::new("/srv/repo")).unwrap(),
-                title: "other",
-                description: "",
+                task: "other",
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,

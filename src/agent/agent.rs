@@ -271,8 +271,8 @@ impl Agents {
         cmd.arg(hook_settings);
         cmd.arg("--add-dir");
         cmd.arg(repo);
-        cmd.arg("--name");
-        cmd.arg(&card.title);
+        // NB: no `--name`. Naming the session suppresses the name it would
+        // give itself, which is the one the card takes.
         cmd.cwd(worktree);
         // Match what xterm.js renders; the inherited TERM may be anything.
         cmd.env("TERM", "xterm-256color");

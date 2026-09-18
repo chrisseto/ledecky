@@ -371,7 +371,13 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 .card-ghost { opacity: 0.35; }
 .lane-done .card { opacity: 0.55; }
 
-.card-open { font-weight: 600; color: var(--fg-strong); text-wrap: pretty; }
+.card-open {
+  font-weight: 600;
+  color: var(--fg-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* The whole card opens it; the meta line below stays legible underneath. */
 .card-open::after { content: ""; position: absolute; inset: 0; }
 
@@ -444,7 +450,13 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   border-bottom: 1px solid var(--border);
 }
 .drawer-head form { display: contents; }
-.drawer-head h2 { font-size: 15px; min-width: 0; }
+.drawer-head h2 {
+  font-size: 15px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .drawer-head .branch {
   display: inline-flex;
   align-items: center;

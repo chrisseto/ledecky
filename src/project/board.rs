@@ -32,10 +32,6 @@ pub const MODELS: &[(&str, &str)] = &[
     ("haiku", "Haiku"),
 ];
 
-/// A card's title is the first line of its task, cut to something that fits on
-/// a card.
-const TITLE_MAX: usize = 60;
-
 const EMPTY_TASK: &str = "A card needs a task for the agent.";
 
 /// What is open over the board.
@@ -256,7 +252,7 @@ struct Fields {
 impl Fields {
     fn of(card: &Card) -> Self {
         Self {
-            task: card.task(),
+            task: card.task.clone(),
             base_branch: card.base_branch.clone(),
             permission_mode: card.permission_mode.clone(),
             model: card.model.clone().unwrap_or_default(),
@@ -310,8 +306,8 @@ pub fn create_card(
         None => return Ok(Redirect::to("/")),
     };
 
-    let (title, description) = split_task(&form.task);
-    if title.is_empty() {
+    let task = form.task.trim();
+    if task.is_empty() {
         let context = form_context(&project, None, Fields::submitted(&form), Some(EMPTY_TASK));
         return Err(Shell {
             db,
@@ -325,8 +321,7 @@ pub fn create_card(
         &db.lock(),
         NewCard {
             project_id: id,
-            title: &title,
-            description: &description,
+            task,
             base_branch: form.base_branch.trim(),
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
@@ -358,8 +353,8 @@ pub fn update_card(
     let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
     drop(conn);
 
-    let (title, description) = split_task(&form.task);
-    if title.is_empty() {
+    let task = form.task.trim();
+    if task.is_empty() {
         let context = form_context(
             &project,
             Some(&card),
@@ -378,8 +373,7 @@ pub fn update_card(
         &db.lock(),
         id,
         CardEdit {
-            title: &title,
-            description: &description,
+            task,
             base_branch: form.base_branch.trim(),
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
@@ -393,28 +387,6 @@ pub fn update_card(
         Ok(false) => Err(Status::Conflict),
         Err(_) => Err(Status::InternalServerError),
     }
-}
-
-/// The card's title and the agent's opening prompt, out of the one field the
-/// form offers.
-fn split_task(task: &str) -> (String, String) {
-    let task = task.trim();
-    let (first, rest) = task.split_once('\n').unwrap_or((task, ""));
-    let first = first.trim();
-
-    let title: String = match first.chars().count() > TITLE_MAX {
-        true => first.chars().take(TITLE_MAX).collect::<String>() + "…",
-        false => first.to_owned(),
-    };
-
-    // A shortened title is not the task any more, so the prompt carries the
-    // whole thing rather than the remainder.
-    let description = match title == first {
-        true => rest.trim().to_owned(),
-        false => task.to_owned(),
-    };
-
-    (title, description)
 }
 
 /// Only modes the form offers are accepted; anything else is someone poking at
@@ -526,36 +498,5 @@ mod tests {
         // Anything unrecognised lands on the conservative default.
         assert_eq!(permission_mode("rm -rf"), "acceptEdits");
         assert_eq!(permission_mode(""), "acceptEdits");
-    }
-
-    #[test]
-    fn a_one_line_task_is_the_whole_title() {
-        assert_eq!(
-            split_task("  Teach it to whistle  "),
-            ("Teach it to whistle".to_owned(), String::new())
-        );
-    }
-
-    #[test]
-    fn the_rest_of_the_task_becomes_the_prompt() {
-        let (title, description) = split_task("Teach it to whistle\n\nOn startup, in C.");
-        assert_eq!(title, "Teach it to whistle");
-        assert_eq!(description, "On startup, in C.");
-    }
-
-    #[test]
-    fn a_long_first_line_is_shortened_but_not_lost() {
-        let task = "x".repeat(TITLE_MAX + 20);
-        let (title, description) = split_task(&task);
-
-        assert_eq!(title.chars().count(), TITLE_MAX + 1);
-        assert!(title.ends_with('…'));
-        // The agent is still told the whole thing.
-        assert_eq!(description, task);
-    }
-
-    #[test]
-    fn an_empty_task_has_no_title_to_file_it_under() {
-        assert_eq!(split_task("   \n  ").0, "");
     }
 }

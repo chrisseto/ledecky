@@ -38,9 +38,10 @@ test("a new card offers the repository's branches and lands in To Do", async ({ 
   await expect(cardIn(page, "todo", "Teach it to whistle")).toContainText("main");
 });
 
-test("the task's first line titles the card and the rest is kept for the agent", async ({ page }) => {
+test("a card with no name of its own stands in its task, clipped to one line", async ({ page }) => {
   await page.goto(`${projectUrl}/cards/new`);
-  await page.getByLabel("Task").fill("Title line\n\nThe body the agent is given.");
+  const body = "The body the agent is given, at length. ".repeat(4).trim();
+  await page.getByLabel("Task").fill(`Title line\n\n${body}`);
   await page.getByRole("button", { name: "Create more" }).click();
 
   // "Create more" leaves the form open on an empty task for the next one.
@@ -48,9 +49,21 @@ test("the task's first line titles the card and the rest is kept for the agent",
   await expect(page.getByLabel("Task")).toHaveValue("");
 
   await page.goto(projectUrl);
-  const card = cardIn(page, "todo", "Title line");
-  await expect(card).toBeVisible();
-  await expect(card).not.toContainText("The body the agent is given.");
+  const label = cardIn(page, "todo", "Title line").locator(".card-open");
+
+  // Nothing is cut on the way in — the whole task is there, and the card is
+  // still one line tall because CSS is what does the clipping.
+  await expect(label).toContainText(body);
+  expect(
+    await label.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return {
+        wrap: style.whiteSpace,
+        overflow: style.textOverflow,
+        clipped: el.scrollWidth > el.clientWidth,
+      };
+    }),
+  ).toEqual({ wrap: "nowrap", overflow: "ellipsis", clipped: true });
 });
 
 test("the keyboard creates a card without reaching for the buttons", async ({ page }) => {
@@ -250,7 +263,7 @@ test("a card waiting in To Do can have its task rewritten", async ({ page }) => 
   await openCard(page, id);
   await page.locator(".drawer-card").getByRole("link", { name: "Edit" }).click();
 
-  // The form opens on the task as one field again, not the split the card stores.
+  // The form opens on the task exactly as it was typed.
   const form = page.locator(".modal-card");
   await expect(form.getByLabel("Task")).toHaveValue("Draft errand\n\nFirst attempt.");
   await expect(form.getByLabel("Base branch")).toHaveValue("main");
@@ -261,8 +274,9 @@ test("a card waiting in To Do can have its task rewritten", async ({ page }) => 
   await form.getByLabel("Permissions").selectOption("plan");
   await form.getByRole("button", { name: "Save" }).click();
 
-  // Saving lands back on the card it edited.
-  await expect(page.locator(".drawer-card h2")).toHaveText("Rewritten errand");
+  // Saving lands back on the card it edited, which is still unnamed and so
+  // still standing in its task.
+  await expect(page.locator(".drawer-card h2")).toHaveText("Rewritten errand\n\nSecond attempt.");
   await expect(page.locator(".drawer-card .branch")).toContainText("release");
 
   await page.goto(projectUrl);

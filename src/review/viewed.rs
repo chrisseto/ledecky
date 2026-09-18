@@ -48,8 +48,7 @@ mod tests {
             conn,
             NewCard {
                 project_id: project,
-                title: "review me",
-                description: "",
+                task: "review me",
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,

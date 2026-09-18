@@ -170,8 +170,7 @@ mod tests {
             conn,
             NewCard {
                 project_id: project,
-                title: "work",
-                description: "",
+                task: "work",
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,

@@ -119,8 +119,10 @@ to_sql!(AgentState);
 pub struct Card {
     pub id: i64,
     pub project_id: i64,
-    pub title: String,
-    pub description: String,
+    /// What the session called itself, once it has. The board falls back to
+    /// the task.
+    pub title: Option<String>,
+    pub task: String,
     pub base_branch: String,
     pub lane: Lane,
     pub lane_label: &'static str,
@@ -140,8 +142,7 @@ pub struct Card {
 /// What a card is created with. Everything else is derived or set later.
 pub struct NewCard<'a> {
     pub project_id: i64,
-    pub title: &'a str,
-    pub description: &'a str,
+    pub task: &'a str,
     pub base_branch: &'a str,
     pub permission_mode: &'a str,
     pub model: Option<&'a str>,
@@ -149,16 +150,14 @@ pub struct NewCard<'a> {
 
 /// What a card's form can still change, before an agent has seen any of it.
 pub struct CardEdit<'a> {
-    pub title: &'a str,
-    pub description: &'a str,
+    pub task: &'a str,
     pub base_branch: &'a str,
     pub permission_mode: &'a str,
     pub model: Option<&'a str>,
 }
 
 impl Card {
-    const COLUMNS: &'static str =
-        "id, project_id, title, description, base_branch, lane, position, \
+    const COLUMNS: &'static str = "id, project_id, title, task, base_branch, lane, position, \
          permission_mode, model, worktree_path, session_id, agent_pid, agent_state, \
          merge_requested, created_at, updated_at";
 
@@ -173,7 +172,7 @@ impl Card {
             id: row.get("id")?,
             project_id: row.get("project_id")?,
             title: row.get("title")?,
-            description: row.get("description")?,
+            task: row.get("task")?,
             base_branch: row.get("base_branch")?,
             lane,
             lane_label: lane.label(),
@@ -199,34 +198,15 @@ impl Card {
 
     /// The opening message for a fresh session, or nothing when resuming — the
     /// agent already has the task in its transcript.
+    ///
+    /// NB: the task alone. The title is the board's label for this card, not
+    /// something the agent needs to be told.
     pub fn opening_prompt(&self) -> Option<String> {
         if self.session_id.is_some() {
             return None;
         }
 
-        let description = self.description.trim();
-        let prompt = if description.is_empty() {
-            self.title.trim().to_owned()
-        } else {
-            format!("{}\n\n{description}", self.title.trim())
-        };
-
-        Some(prompt).filter(|p| !p.is_empty())
-    }
-
-    /// The one field the card form edits, back out of the title and description.
-    pub fn task(&self) -> String {
-        let description = self.description.trim();
-        if description.is_empty() {
-            return self.title.clone();
-        }
-
-        // NB: a title that had to be shortened is a prefix of the task, which the
-        // description already holds whole — joining the two would repeat it.
-        match self.title.strip_suffix('…') {
-            Some(head) if description.starts_with(head) => description.to_owned(),
-            _ => format!("{}\n\n{description}", self.title),
-        }
+        Some(self.task.trim().to_owned()).filter(|p| !p.is_empty())
     }
 
     // ---- queries ------------------------------------------------------------
@@ -277,12 +257,11 @@ impl Card {
 
         conn.execute(
             "INSERT INTO cards
-                 (project_id, title, description, base_branch, position, permission_mode, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (project_id, task, base_branch, position, permission_mode, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 new.project_id,
-                new.title,
-                new.description,
+                new.task,
                 new.base_branch,
                 position,
                 new.permission_mode,
@@ -297,14 +276,13 @@ impl Card {
     pub fn update(conn: &Connection, id: i64, edit: CardEdit<'_>) -> rusqlite::Result<bool> {
         let rows = conn.execute(
             &format!(
-                "UPDATE cards SET title = ?1, description = ?2, base_branch = ?3,
-                     permission_mode = ?4, model = ?5, updated_at = datetime('now')
-                 WHERE id = ?6 AND {}",
+                "UPDATE cards SET task = ?1, base_branch = ?2,
+                     permission_mode = ?3, model = ?4, updated_at = datetime('now')
+                 WHERE id = ?5 AND {}",
                 Self::EDITABLE
             ),
             rusqlite::params![
-                edit.title,
-                edit.description,
+                edit.task,
                 edit.base_branch,
                 edit.permission_mode,
                 edit.model,
@@ -317,6 +295,19 @@ impl Card {
     pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
         conn.execute("DELETE FROM cards WHERE id = ?1", [id])?;
         Ok(())
+    }
+
+    /// Renames a card from the outside: the session naming itself.
+    ///
+    /// NB: deliberately not gated by [`Self::EDITABLE`], which the form's
+    /// `update` is. This lands once the agent is well under way, which is the
+    /// whole point of it.
+    pub fn set_title(conn: &Connection, id: i64, title: &str) {
+        let _ = conn.execute(
+            "UPDATE cards SET title = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND title IS NOT ?1",
+            rusqlite::params![title, id],
+        );
     }
 
     pub fn set_lane(conn: &Connection, id: i64, lane: Lane) {
@@ -432,13 +423,12 @@ mod tests {
         (db, id)
     }
 
-    fn add(conn: &Connection, project_id: i64, title: &str) -> i64 {
+    fn add(conn: &Connection, project_id: i64, task: &str) -> i64 {
         Card::create(
             conn,
             NewCard {
                 project_id,
-                title,
-                description: "",
+                task,
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
@@ -519,24 +509,16 @@ mod tests {
     }
 
     #[test]
-    fn the_opening_prompt_joins_title_and_description() {
+    fn the_opening_prompt_is_the_task_and_nothing_else() {
         let (db, project_id) = seeded();
         let conn = db.lock();
 
-        let id = Card::create(
-            &conn,
-            NewCard {
-                project_id,
-                title: "Add a flag",
-                description: "Make it verbose.",
-                base_branch: "main",
-                permission_mode: "acceptEdits",
-                model: None,
-            },
-        )
-        .unwrap();
+        let id = add(&conn, project_id, "Add a flag\n\nMake it verbose.");
+        Card::set_title(&conn, id, "Filed under something else");
 
+        // A card carries the session's name, which is no part of the task.
         let card = Card::find(&conn, id).unwrap();
+        assert_eq!(card.title.as_deref(), Some("Filed under something else"));
         assert_eq!(
             card.opening_prompt().unwrap(),
             "Add a flag\n\nMake it verbose."
@@ -572,55 +554,19 @@ mod tests {
     }
 
     #[test]
-    fn the_form_gets_its_task_back_whole() {
+    fn a_card_starts_unnamed_however_long_its_task_is() {
         let (db, project_id) = seeded();
         let conn = db.lock();
 
-        let bare = add(&conn, project_id, "Teach it to whistle");
-        assert_eq!(
-            Card::find(&conn, bare).unwrap().task(),
-            "Teach it to whistle"
-        );
+        // Nothing is cut to fit any more: the board clips what it shows, and
+        // the card holds the task whole until a session names it.
+        let task = "x".repeat(300);
+        let id = add(&conn, project_id, &task);
 
-        let task = "Teach it to whistle\n\nOn startup, in C.";
-        let (title, description) = ("Teach it to whistle", "On startup, in C.");
-        let id = Card::create(
-            &conn,
-            NewCard {
-                project_id,
-                title,
-                description,
-                base_branch: "main",
-                permission_mode: "acceptEdits",
-                model: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(Card::find(&conn, id).unwrap().task(), task);
-    }
-
-    #[test]
-    fn a_shortened_title_is_not_repeated_in_the_task() {
-        let (db, project_id) = seeded();
-        let conn = db.lock();
-
-        // What the form's split hands back for an over-long first line: the
-        // description is the whole task, and the title a cut of its front.
-        let task = "x".repeat(70);
-        let id = Card::create(
-            &conn,
-            NewCard {
-                project_id,
-                title: &(task.chars().take(60).collect::<String>() + "…"),
-                description: &task,
-                base_branch: "main",
-                permission_mode: "acceptEdits",
-                model: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(Card::find(&conn, id).unwrap().task(), task);
+        let card = Card::find(&conn, id).unwrap();
+        assert_eq!(card.title, None);
+        assert_eq!(card.task, task);
+        assert_eq!(card.opening_prompt().unwrap(), task);
     }
 
     fn rewrite(conn: &Connection, id: i64) -> bool {
@@ -628,8 +574,7 @@ mod tests {
             conn,
             id,
             CardEdit {
-                title: "Teach it to hum",
-                description: "Quietly.",
+                task: "Teach it to hum\n\nQuietly.",
                 base_branch: "release",
                 permission_mode: "plan",
                 model: Some("opus"),
@@ -648,7 +593,7 @@ mod tests {
         assert!(rewrite(&conn, id));
 
         let card = Card::find(&conn, id).unwrap();
-        assert_eq!(card.task(), "Teach it to hum\n\nQuietly.");
+        assert_eq!(card.task, "Teach it to hum\n\nQuietly.");
         assert_eq!(card.base_branch, "release");
         assert_eq!(card.permission_mode, "plan");
         assert_eq!(card.model.as_deref(), Some("opus"));
@@ -674,7 +619,44 @@ mod tests {
         for id in [moved, started] {
             assert!(!Card::find(&conn, id).unwrap().editable());
             assert!(!rewrite(&conn, id));
-            assert_ne!(Card::find(&conn, id).unwrap().title, "Teach it to hum");
+            assert_ne!(
+                Card::find(&conn, id).unwrap().task,
+                "Teach it to hum\n\nQuietly."
+            );
         }
+    }
+
+    #[test]
+    fn a_session_can_rename_a_card_its_agent_already_holds() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        let id = add(&conn, project_id, "Teach it to whistle");
+        Card::set_lane(&conn, id, Lane::InProgress);
+        Card::set_session_id(&conn, id, "session-1");
+
+        // The form is shut, but the session naming itself still lands.
+        assert!(!rewrite(&conn, id));
+        Card::set_title(&conn, id, "Whistling on startup");
+
+        let card = Card::find(&conn, id).unwrap();
+        assert_eq!(card.title.as_deref(), Some("Whistling on startup"));
+        // Only the label moved; the agent's task is untouched.
+        assert_eq!(card.task, "Teach it to whistle");
+    }
+
+    #[test]
+    fn renaming_a_card_to_what_it_is_called_leaves_it_alone() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        let id = add(&conn, project_id, "Teach it to whistle");
+        Card::set_title(&conn, id, "Whistling on startup");
+        let before = Card::find(&conn, id).unwrap().updated_at;
+
+        // Every hook re-reads the title, so an unchanged one must not keep
+        // bumping `updated_at` and churning the board's ETag.
+        Card::set_title(&conn, id, "Whistling on startup");
+        assert_eq!(Card::find(&conn, id).unwrap().updated_at, before);
     }
 }
