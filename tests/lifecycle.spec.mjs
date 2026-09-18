@@ -11,6 +11,7 @@ import {
   editWorktree,
   fileSection,
   git,
+  openAgent,
   openCard,
   pollsOfPath,
   turnRefs,
@@ -52,7 +53,7 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
 });
 
 test("the terminal streams the agent's screen", async ({ page }) => {
-  await openCard(page, cardId);
+  await openAgent(page, cardId);
 
   const rows = page.locator("div[data-terminal] .xterm-rows");
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
@@ -61,7 +62,7 @@ test("the terminal streams the agent's screen", async ({ page }) => {
 });
 
 test("a wheel over the terminal never reaches the page behind it", async ({ page }) => {
-  await openCard(page, cardId);
+  await openAgent(page, cardId);
 
   const terminal = page.locator("div[data-terminal]");
   await expect(terminal.locator(".xterm-rows")).toContainText("fake-agent", { timeout: 15_000 });
@@ -99,7 +100,7 @@ test("a wheel over the terminal never reaches the page behind it", async ({ page
 });
 
 test("the scrollback the agent printed before the drawer opened is scrollable", async ({ page }) => {
-  await openCard(page, cardId);
+  await openAgent(page, cardId);
 
   const rows = page.locator("div[data-terminal] .xterm-rows");
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
@@ -134,6 +135,35 @@ test("the card takes the name the session gave itself", async ({ page }) => {
   await expect(page.locator(`#card-${cardId}`)).toContainText(`${TITLE} (named)`, {
     timeout: 25_000,
   });
+});
+
+test("a terminal opened behind the review tab still fits its own pane", async ({ page }) => {
+  // Now that there is a diff to read, the drawer lands on Review — so the agent
+  // pane is hidden, and measures nothing, at the moment the drawer compiles.
+  await openCard(page, cardId);
+  await expect(page.locator("#tab-review")).toBeChecked();
+
+  await page.locator('label[for="tab-agent"]').click();
+
+  const rows = page.locator("div[data-terminal] .xterm-rows");
+  await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
+
+  const box = await page.locator("div[data-terminal]").boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let i = 0; i < 20; i++) await page.mouse.wheel(0, -600);
+
+  // One line of the replayed scrollback is 100 columns wide. A terminal that
+  // took the replay at xterm's 80-column default holds it in two rows, and the
+  // fit that comes with the tab switch only reflows the damage.
+  const ruler = "=".repeat(100);
+  await expect
+    .poll(() =>
+      rows.locator("> div").evaluateAll(
+        (divs, want) => divs.filter((div) => div.textContent.trimEnd() === want).length,
+        ruler,
+      ),
+    )
+    .toBe(1);
 });
 
 test("the review pane stacks every changed file, with scopes for each turn", async ({ page }) => {

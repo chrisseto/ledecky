@@ -1,6 +1,15 @@
 import { expect, test } from "@playwright/test";
 
-import { addCard, addProject, cardIn, comment, fileSection, openCard, turnRefs } from "./support/board.mjs";
+import {
+  addCard,
+  addProject,
+  cardIn,
+  comment,
+  fileSection,
+  openAgent,
+  openCard,
+  turnRefs,
+} from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -32,7 +41,7 @@ test("a consent dialog holds the opening prompt instead of being answered by it"
   await page.goto(projectUrl);
   await cardIn(page, "todo", TITLE).dragTo(page.locator('[data-lane="in_progress"]'));
 
-  await openCard(page, cardId);
+  await openAgent(page, cardId);
   const rows = page.locator(".terminal .xterm-rows");
   await expect(rows).toContainText("Bypass Permissions mode", { timeout: 15_000 });
 
@@ -50,7 +59,7 @@ test("a consent dialog holds the opening prompt instead of being answered by it"
 });
 
 test("answering the dialog in the terminal releases the queued prompt", async ({ page }) => {
-  await openCard(page, cardId);
+  await openAgent(page, cardId);
   const rows = page.locator(".terminal .xterm-rows");
   await expect(rows).toContainText("Bypass Permissions mode", { timeout: 15_000 });
 

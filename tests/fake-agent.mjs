@@ -32,6 +32,8 @@ const ESC = "\u001b";
 const PASTE_START = `${ESC}[200~`;
 const PASTE_END = `${ESC}[201~`;
 const ROWS = 40;
+/** Width of the ruler line in the startup banner. See its use below. */
+const RULER_COLS = 100;
 
 const argv = process.argv.slice(2);
 const flag = (name) => {
@@ -361,7 +363,14 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
 // starts repainting in place. `render` only ever clears and redraws, so without
 // this the pty would have no scrollback at all and nothing would exercise the
 // history the server replays to a connecting client.
-for (let i = 0; i < ROWS + 20; i++) out(`banner-${i}\r\n`);
+//
+// One of those lines is a ruler, wider than xterm's 80-column default and
+// narrower than the pane the drawer gives it: a client that connected before it
+// knew its own size replays it wrapped in two.
+for (let i = 0; i < ROWS + 20; i++) {
+  if (i === 5) out(`${"=".repeat(RULER_COLS)}\r\n`);
+  out(`banner-${i}\r\n`);
+}
 
 // Keep the process alive on a pty even while stdin is quiet.
 setInterval(() => {}, 1 << 30);

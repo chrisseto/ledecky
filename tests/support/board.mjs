@@ -88,6 +88,19 @@ export async function openCard(page, cardId) {
   await expect(page.locator(".drawer-card")).toBeVisible();
 }
 
+/**
+ * Opens the card on its Agent tab.
+ *
+ * Which tab the drawer lands on follows the agent's state, and the terminal
+ * does not exist until its pane does — so anything reading the screen has to
+ * ask for it rather than assume the agent is still what leads.
+ */
+export async function openAgent(page, cardId) {
+  await openCard(page, cardId);
+  await page.locator('label[for="tab-agent"]').click();
+  await expect(page.locator(".terminal .xterm-rows")).toBeVisible();
+}
+
 /** The stacked diff renders every changed file; this is one of them. */
 export const fileSection = (page, path) => page.locator(`#review .file[data-path="${path}"]`);
 

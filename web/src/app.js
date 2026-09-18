@@ -166,10 +166,12 @@ up.compiler("[data-sortable]", (lane) => {
 });
 
 // ---- terminal ---------------------------------------------------------------
-// The socket carries raw pty bytes in both directions. Resize goes over HTTP so
-// the socket never needs a message envelope.
+// The socket carries raw pty bytes in both directions. The screen's size rides
+// on its URL, so the pty is already the client's shape when the replay is
+// rendered; later resizes go over HTTP and the socket needs no envelope.
 
-up.compiler("[data-terminal]", (host) => {
+/** Opens a terminal on `host` and attaches it to the agent behind it. */
+const attach = (host) => {
   const term = new Terminal({
     convertEol: false,
     cursorBlink: true,
@@ -183,44 +185,20 @@ up.compiler("[data-terminal]", (host) => {
   const fit = new FitAddon();
   term.loadAddon(fit);
   term.open(host);
-
-  // xterm cancels a wheel only when it actually scrolled the viewport with it; at
-  // either end of the scrollback it lets the event through and the page behind the
-  // drawer scrolls instead. Nothing in this pane should ever move the board.
-  host.addEventListener("wheel", (event) => event.preventDefault(), { passive: false });
-
-  let sent = "";
-
-  // NB: the review tab hides this pane, which then measures 0x0. Fitting to
-  // that would reflow the agent's screen into a single cell — for nobody, and
-  // destructively: the pty is the agent's real terminal. Measuring only while
-  // the pane is on screen leaves the last good size in place until it is back.
-  const resize = () => {
-    if (!host.clientWidth || !host.clientHeight) return;
-
-    fit.fit();
-    const { rows, cols } = term;
-    const key = `${rows}x${cols}`;
-    if (key === sent) return;
-
-    sent = key;
-    up.request(host.dataset.resizeUrl, { method: "post", params: { rows, cols } });
-  };
-
-  // Fitting before the socket opens is what lets `rows` below be this screen's.
-  resize();
+  fit.fit();
 
   const url = new URL(host.dataset.terminal, location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  // The scrollback the server replays has to be scrolled down by a full screen
-  // before it repaints over it, and that screen is ours, not the pty's — a
-  // taller client would otherwise never see the newest history.
   url.searchParams.set("rows", term.rows);
+  url.searchParams.set("cols", term.cols);
+
+  // The server sizes the pty to this before it renders a byte, so the screen
+  // that comes back is already ours and nothing has to be reflowed into place.
+  let sent = `${term.rows}x${term.cols}`;
 
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
 
-  socket.addEventListener("open", () => resize());
   socket.addEventListener("message", (event) => {
     term.write(new Uint8Array(event.data));
   });
@@ -233,17 +211,62 @@ up.compiler("[data-terminal]", (host) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
   });
 
+  const resize = () => {
+    fit.fit();
+    const { rows, cols } = term;
+    const key = `${rows}x${cols}`;
+    if (key === sent) return;
+
+    sent = key;
+    up.request(host.dataset.resizeUrl, { method: "post", params: { rows, cols } });
+  };
+
+  // The first fit measures whatever font is up at the time, and the box it
+  // measured in never changes afterwards — so nothing else would ever notice
+  // the real one arriving.
+  document.fonts.ready.then(resize);
+
+  return {
+    resize,
+    stop: () => {
+      socket.close();
+      term.dispose();
+    },
+  };
+};
+
+up.compiler("[data-terminal]", (host) => {
+  // xterm cancels a wheel only when it actually scrolled the viewport with it; at
+  // either end of the scrollback it lets the event through and the page behind the
+  // drawer scrolls instead. Nothing in this pane should ever move the board.
+  host.addEventListener("wheel", (event) => event.preventDefault(), { passive: false });
+
+  let session;
   let debounce;
+
+  // NB: the review tab hides this pane, and the drawer opens on it whenever
+  // there is a diff to read — so this compiles at 0x0 as often as not. xterm
+  // opened into that measures no cell at all and never re-measures, and the
+  // replay would land in its 80x24 default, wrapped at a width that is not the
+  // agent's. Nothing starts until the pane is on screen.
+  const tick = () => {
+    if (!host.clientWidth || !host.clientHeight) return;
+
+    if (session) session.resize();
+    else session = attach(host);
+  };
+
   const observer = new ResizeObserver(() => {
     clearTimeout(debounce);
-    debounce = setTimeout(resize, 80);
+    debounce = setTimeout(tick, 80);
   });
   observer.observe(host);
+  tick();
 
   return () => {
     observer.disconnect();
-    socket.close();
-    term.dispose();
+    clearTimeout(debounce);
+    session?.stop();
   };
 });
 
