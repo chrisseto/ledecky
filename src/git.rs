@@ -47,7 +47,8 @@ pub fn head_branch(repo: &Path) -> Option<String> {
 }
 
 /// Creates a detached worktree at `path` based on `base_branch`, and records the
-/// starting commit as `refs/{APP_SLUG}/<card>/base` so diffs have a fixed origin.
+/// starting commit as `refs/{APP_SLUG}/<card>/base`, which is where the card's
+/// diffs are measured from until [`reconcile_base`] moves it.
 pub fn create_worktree(
     settings: &Settings,
     repo: &Path,
@@ -119,6 +120,73 @@ fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> 
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
+}
+
+/// Whether `ancestor` is reachable from `descendant`.
+///
+/// NB: `merge-base --is-ancestor` answers with its exit status and prints
+/// nothing, so [`run`] — which bails on any non-zero status — would read a plain
+/// "no" as a failure and mint an error message saying git broke. This asks the
+/// status directly. A rev that does not resolve exits 128 and reads as "no" too,
+/// which is the right answer for the only caller: a guard that refuses to move
+/// anything it cannot prove.
+fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        // `output` rather than `status` so git's complaint about a bad rev is
+        // captured instead of landing in the server's stderr among pty traffic.
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Moves `base_ref` up to wherever `worktree` branches from `base_branch` now.
+///
+/// A detached worktree does not contain new upstream commits, so a branch that
+/// merely moves ahead is harmless and this does nothing. What it is for is a
+/// rebase: afterwards the worktree is rooted at a commit `base_ref` has never
+/// heard of, and `base_ref..worktree` would fold every upstream commit into the
+/// range. Plain `merge-base` rather than `--fork-point` so that a worktree which
+/// merged instead of rebasing is read the same way.
+///
+/// The ref only ever moves *forward*. A rewound branch, or a worktree checked
+/// out at an older commit, would otherwise drag it back.
+///
+/// Returns the new value when it moved, and `None` otherwise — which is both the
+/// ordinary case and what every failure reads as. Best-effort on purpose:
+/// callers poll this, and an unresolvable `base_branch` still has to render.
+pub fn reconcile_base(
+    repo: &Path,
+    worktree: &Path,
+    base_ref: &str,
+    base_branch: &str,
+) -> Option<String> {
+    let current = run(
+        repo,
+        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+    )
+    .ok()?;
+
+    // NB: in the worktree, not the repo. `HEAD` is per-worktree, and its own
+    // commits are reachable from nowhere else; the repo's is whatever happens to
+    // be checked out there.
+    let head = run(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).ok()?;
+
+    // Back in the repo, where the base branch lives. The object database and
+    // `refs/heads` are shared, so this resolves either way.
+    let candidate = run(repo, &["merge-base", base_branch, &head])
+        .ok()
+        .filter(|sha| !sha.is_empty())?;
+
+    if candidate == current || !is_ancestor(repo, &current, &candidate) {
+        return None;
+    }
+
+    // The third argument is the expected old value, so two polls racing cannot
+    // interleave into a lost update.
+    run(repo, &["update-ref", base_ref, &candidate, &current]).ok()?;
+    Some(candidate)
 }
 
 /// Writes the worktree's current state to a tree object, via `index`.
@@ -392,5 +460,143 @@ mod tests {
         // rather than an error.
         assert!(commits(&repo, "HEAD", "HEAD").is_empty());
         assert!(commits(&repo, &base, "no-such-ref").is_empty());
+    }
+
+    /// Commits `body` to `file` in whichever tree `at` is, and returns the sha.
+    fn commit(at: &Path, file: &str, body: &str, subject: &str) -> String {
+        std::fs::write(at.join(file), body).unwrap();
+        run(at, &["add", "-A"]).unwrap();
+        run(at, &["commit", "-qm", subject]).unwrap();
+        run(at, &["rev-parse", "HEAD"]).unwrap()
+    }
+
+    /// The whole point of [`is_ancestor`] existing rather than `run(...).is_ok()`.
+    #[test]
+    fn asking_whether_one_commit_is_behind_another_is_an_answer_not_an_error() {
+        let (_settings, repo) = scratch("ancestor");
+        let first = run(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let second = commit(&repo, "a.txt", "two\n", "second");
+
+        assert!(is_ancestor(&repo, &first, &second));
+        assert!(!is_ancestor(&repo, &second, &first));
+        // A rev that does not resolve is "no", not a panic and not a hang.
+        assert!(!is_ancestor(&repo, "no-such-ref", &first));
+    }
+
+    #[test]
+    fn a_rebase_moves_the_base_up_to_where_the_worktree_now_branches() {
+        let (settings, repo) = scratch("rebase");
+        let worktree = settings.worktree_path(1);
+
+        let started = create_worktree(&settings, &repo, &worktree, "main", 1).unwrap();
+        commit(&worktree, "agent.txt", "work\n", "agent work");
+        let upstream = commit(&repo, "upstream.txt", "theirs\n", "upstream work");
+
+        // Drift on its own is not a rebase: the worktree is detached and does
+        // not contain the upstream commit, so there is nothing to correct.
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            None
+        );
+        assert_eq!(
+            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            started
+        );
+
+        run(&worktree, &["rebase", "main"]).unwrap();
+
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            Some(upstream.clone())
+        );
+        assert_eq!(
+            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            upstream
+        );
+
+        // Idempotent: nothing has moved since, so there is nothing to write.
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            None
+        );
+
+        // What the whole change is for — the upstream commit is out of the range.
+        let head = run(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        let listed = commits(&repo, &settings.base_ref(1), &head);
+        let subjects: Vec<_> = listed.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["agent work"]);
+    }
+
+    /// `--fork-point` would not cover this; plain `merge-base` does.
+    #[test]
+    fn an_agent_that_merges_instead_of_rebasing_also_moves_the_base() {
+        let (settings, repo) = scratch("merged");
+        let worktree = settings.worktree_path(1);
+
+        create_worktree(&settings, &repo, &worktree, "main", 1).unwrap();
+        commit(&worktree, "agent.txt", "work\n", "agent work");
+        let upstream = commit(&repo, "upstream.txt", "theirs\n", "upstream work");
+
+        run(&worktree, &["merge", "main", "-m", "merge main"]).unwrap();
+
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            Some(upstream)
+        );
+    }
+
+    #[test]
+    fn a_base_branch_that_was_rewound_does_not_drag_the_base_back() {
+        let (settings, repo) = scratch("rewound");
+        let first = run(&repo, &["rev-parse", "HEAD"]).unwrap();
+        commit(&repo, "a.txt", "two\n", "second");
+
+        let started =
+            create_worktree(&settings, &repo, &worktree_of(&settings), "main", 1).unwrap();
+        commit(&worktree_of(&settings), "agent.txt", "work\n", "agent work");
+        run(&repo, &["reset", "--hard", "-q", &first]).unwrap();
+
+        assert_eq!(
+            reconcile_base(
+                &repo,
+                &worktree_of(&settings),
+                &settings.base_ref(1),
+                "main"
+            ),
+            None
+        );
+        assert_eq!(
+            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            started
+        );
+    }
+
+    #[test]
+    fn a_card_whose_base_branch_has_gone_keeps_the_base_it_started_from() {
+        let (settings, repo) = scratch("branch-gone");
+        run(&repo, &["branch", "feature"]).unwrap();
+
+        let started =
+            create_worktree(&settings, &repo, &worktree_of(&settings), "feature", 1).unwrap();
+        // Safe to delete: `main` is what the repo has checked out.
+        run(&repo, &["branch", "-D", "feature"]).unwrap();
+
+        assert_eq!(
+            reconcile_base(
+                &repo,
+                &worktree_of(&settings),
+                &settings.base_ref(1),
+                "feature"
+            ),
+            None
+        );
+        assert_eq!(
+            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            started
+        );
+    }
+
+    fn worktree_of(settings: &Settings) -> PathBuf {
+        settings.worktree_path(1)
     }
 }

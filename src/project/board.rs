@@ -94,7 +94,7 @@ impl Shell<'_> {
                         self.settings,
                         repo,
                         worktree.as_deref(),
-                        card.id,
+                        card,
                         &turns,
                     )?;
                     Some(

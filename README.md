@@ -56,6 +56,11 @@ it. So `base..worktree` is everything the card has done, `turn-(N-1)..turn-N` is
 one round, `sha^..sha` is one commit. The picker lists the anchors newest first,
 turns and commits interleaved by time, each tagged with its own colour.
 
+The base anchor reads "what this card is based on" rather than where it started,
+and the distinction is the one above: an agent that rebases re-roots its
+worktree, the base follows it, and `base..worktree` stays the card's own work
+instead of the card's work plus everything upstream did meanwhile.
+
 Anything live ends at the worktree rather than at the last turn, and that is the
 point: work shows up while the agent is still doing it, committed or not, rather
 than only once a `Stop` has captured it. The worktree is staged into a scratch

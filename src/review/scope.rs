@@ -275,7 +275,7 @@ impl Scope {
 
         out.push(Entry {
             anchor: Anchor::Base,
-            label: "Where this card started".into(),
+            label: "What this card is based on".into(),
             kind: "base",
         });
         out

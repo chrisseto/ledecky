@@ -64,9 +64,10 @@ impl DiffCache {
     /// Line counts for a range, computing them on a miss.
     ///
     /// The board asks for one of these per card on every poll, so it must not
-    /// touch delta. Unlike [`DiffCache::get`] the key is taken as given: callers
-    /// pass a card's base ref, which is written once and never moves, and a
-    /// turn's sha, so the pair already names an immutable range.
+    /// touch delta. Unlike [`DiffCache::get`] the key is taken as given, ref
+    /// name and all — resolving here would cost a `rev-parse` per card per
+    /// render, including on a hit. The one ref that moves under it is a card's
+    /// base, and [`DiffCache::forget_stats`] is how that says so.
     pub fn stat(&self, repo: &Path, from: &str, to: &str) -> Stat {
         let key = Key {
             repo: repo.to_path_buf(),
@@ -156,6 +157,20 @@ impl DiffCache {
         }
     }
 
+    /// Drops the stats measured from `from`, for when the ref naming it moved.
+    ///
+    /// NB: [`DiffCache::stat`] keys on the ref name it is handed rather than the
+    /// sha behind it, so a ref that moves has to say so. A rebase usually
+    /// changes the worktree's tree and so misses on the other half of the key
+    /// anyway; this is for the rebase that does not — upstream landing exactly
+    /// what the card already carried, where the chip would otherwise keep
+    /// reporting its pre-rebase numbers until teardown.
+    pub fn forget_stats(&self, repo: &Path, from: &str) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.retain(|(k, _)| !(k.repo == repo && k.from == from));
+        }
+    }
+
     /// Drops a card's memoised head, so the next read sees the worktree it
     /// actually has — or notices that it no longer has one.
     pub fn forget_head(&self, card_id: i64) {
@@ -189,6 +204,28 @@ mod tests {
         assert!(cache.lookup(&key("/srv/repo", "aaa", "bbb")).is_some());
         assert!(cache.lookup(&key("/srv/repo", "aaa", "ccc")).is_none());
         assert!(cache.lookup(&key("/other", "aaa", "bbb")).is_none());
+    }
+
+    #[test]
+    fn moving_a_ref_drops_only_the_stats_measured_from_it() {
+        let cache = DiffCache::default();
+        let push = |repo: &str, from: &str, to: &str| {
+            cache
+                .stats
+                .lock()
+                .unwrap()
+                .push((key(repo, from, to), Stat::default()));
+        };
+        push("/srv/repo", "refs/ledecky/1/base", "aaa");
+        push("/srv/repo", "refs/ledecky/2/base", "bbb");
+        push("/other", "refs/ledecky/1/base", "ccc");
+
+        cache.forget_stats(Path::new("/srv/repo"), "refs/ledecky/1/base");
+
+        let stats = cache.stats.lock().unwrap();
+        let left: Vec<_> = stats.iter().map(|(k, _)| k.to.as_str()).collect();
+        // Another card in the same repo, and the same card in another, both stay.
+        assert_eq!(left, ["bbb", "ccc"]);
     }
 
     #[test]

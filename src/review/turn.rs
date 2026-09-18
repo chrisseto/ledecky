@@ -6,6 +6,7 @@ use rusqlite::{Connection, Row};
 
 use crate::config::Settings;
 use crate::git;
+use crate::project::Card;
 use crate::review::DiffCache;
 
 /// A snapshot of the worktree at the end of one agent turn.
@@ -146,7 +147,7 @@ pub fn live_head(
     settings: &Settings,
     repo: &Path,
     worktree: Option<&Path>,
-    card_id: i64,
+    card: &Card,
     turns: &[Turn],
 ) -> Option<String> {
     let settled = || turns.last().map(|turn| turn.commit_sha.clone());
@@ -160,17 +161,48 @@ pub fn live_head(
 
     cache
         .head(
-            card_id,
+            card.id,
             Duration::from_millis(settings.poll_interval),
-            || match git::working_tree(settings, repo, live, card_id) {
-                Ok(tree) => Some(tree),
-                Err(err) => {
-                    warn!("card {card_id}: staging the worktree: {err:#}");
-                    settled()
+            || {
+                // Before anything measures from it: the pane reads `base..HEAD`
+                // for its commit list and the board takes a stat from the same
+                // ref, both after this returns.
+                reconcile(cache, settings, repo, live, card);
+
+                match git::working_tree(settings, repo, live, card.id) {
+                    Ok(tree) => Some(tree),
+                    Err(err) => {
+                        warn!("card {}: staging the worktree: {err:#}", card.id);
+                        settled()
+                    }
                 }
             },
         )
         .or_else(settled)
+}
+
+/// Keeps the card's base ref pointing at whatever its worktree branches from.
+///
+/// Rides inside [`DiffCache::head`]'s memo, so it costs at most one `merge-base`
+/// per card per poll interval rather than one per request.
+fn reconcile(cache: &DiffCache, settings: &Settings, repo: &Path, worktree: &Path, card: &Card) {
+    // NB: not while a merge is outstanding. The agent has been asked to land its
+    // commits on the base branch, and once that ff-merge goes in the merge base
+    // *is* the card's own head — a poll arriving before `check_merge` tears the
+    // card down would advance the base to the tip and blank the diff for good.
+    // A merge exists to put this work on the base branch; measuring from the
+    // base branch afterwards would swallow the very thing under review.
+    if card.merge_requested {
+        return;
+    }
+
+    let base_ref = settings.base_ref(card.id);
+    let Some(moved) = git::reconcile_base(repo, worktree, &base_ref, &card.base_branch) else {
+        return;
+    };
+
+    info!("card {}: base moved to {moved}", card.id);
+    cache.forget_stats(repo, &base_ref);
 }
 
 #[cfg(test)]

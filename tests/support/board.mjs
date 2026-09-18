@@ -28,6 +28,17 @@ export const refs = (pattern = "refs/ledecky/**") =>
 
 export const turnRefs = (cardId) => refs(`refs/ledecky/${cardId}/turn-*`);
 
+/** The commit a card's diffs are measured from, which follows a rebase. */
+export const baseRef = (cardId) => git("rev-parse", `refs/ledecky/${cardId}/base`);
+
+/** Lands a commit on the scratch repo itself, standing in for upstream work. */
+export const commitInRepo = (path, body, subject) => {
+  writeFileSync(join(REPO, path), body);
+  git("add", "-A");
+  git("commit", "-qm", subject);
+  return git("rev-parse", "HEAD");
+};
+
 /**
  * The lines a range *adds*, without the surrounding context.
  *

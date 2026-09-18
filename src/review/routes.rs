@@ -185,7 +185,7 @@ fn pane(
     // Everything below shells out to git, so the lock is already back.
     let repo = project.repo();
     let worktree = card.worktree_path.as_ref().map(PathBuf::from);
-    let head = turn::live_head(cache, settings, &repo, worktree.as_deref(), id, &turns);
+    let head = turn::live_head(cache, settings, &repo, worktree.as_deref(), &card, &turns);
     let commits = match worktree.as_deref() {
         Some(worktree) => git::commits(&repo, &settings.base_ref(id), &head_of(worktree)),
         None => Vec::new(),

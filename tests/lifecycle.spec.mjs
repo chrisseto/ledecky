@@ -4,7 +4,9 @@ import {
   addCard,
   addProject,
   addedLines,
+  baseRef,
   cardIn,
+  commitInRepo,
   comment,
   editWorktree,
   fileSection,
@@ -43,7 +45,7 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
     .poll(() => git("worktree", "list"), { timeout: 15_000 })
     .toMatch(new RegExp(`worktrees/${cardId}\\s+\\w+ \\(detached HEAD\\)`));
 
-  // The starting commit is pinned so diffs have a fixed origin.
+  // The starting commit is recorded, which is what diffs are measured from.
   expect(git("for-each-ref", "--format=%(refname)", `refs/ledecky/${cardId}/base`)).toBe(
     `refs/ledecky/${cardId}/base`,
   );
@@ -150,7 +152,7 @@ test("the review pane stacks every changed file, with scopes for each turn", asy
   // One point per row, newest first; the toggle beside it says which side.
   await expect(review.locator("[data-range-menu] .menu-item")).toHaveText([
     /Turn 1/,
-    /Where this card started/,
+    /What this card is based on/,
   ]);
   await expect(review.locator("[data-range-menu] summary")).toContainText("All changes");
   await expect(review.locator(".modes .mode")).toHaveText(["Just this", "Since this"]);
@@ -178,7 +180,7 @@ test("an empty range keeps the picker, so there is a way back out of it", async 
   await expect(menu.locator("summary")).toContainText("Since turn 1");
 
   await menu.locator("summary").click();
-  await menu.getByText("Where this card started").click();
+  await menu.getByText("What this card is based on").click();
   await expect(review.locator(".file")).toHaveCount(2);
 });
 
@@ -407,6 +409,34 @@ test("drafts can be thrown away in one go", async ({ page }) => {
   await expect(page.locator("#review .comment-submitted")).toBeVisible();
 });
 
+test("a rebase keeps upstream commits out of the card's diff", async ({ page }) => {
+  const started = baseRef(cardId);
+
+  // Step one of the merge prompt: a rebase needs a clean worktree, and the fake
+  // agent only ever commits when asked to merge.
+  worktreeGit(cardId, "add", "-A");
+  worktreeGit(cardId, "commit", "-qm", "card work");
+
+  const upstream = commitInRepo("upstream.txt", "landed while the card was open\n", "upstream work");
+
+  await openCard(page, cardId);
+
+  // Drift on its own is invisible: the worktree is detached and does not
+  // contain the upstream commit, so there is nothing yet to correct.
+  await expect(fileSection(page, "upstream.txt")).toHaveCount(0);
+  expect(baseRef(cardId)).toBe(started);
+
+  worktreeGit(cardId, "rebase", "main");
+
+  // The pane's own poll is what notices; nothing external nudges the server.
+  await expect.poll(() => baseRef(cardId), { timeout: 25_000 }).toBe(upstream);
+
+  // The regression this exists for — without the base following the rebase,
+  // every upstream file would show up as the card's own work.
+  await expect(fileSection(page, "upstream.txt")).toHaveCount(0);
+  await expect(fileSection(page, "main.rs")).toBeVisible();
+});
+
 test("merging lands the work on the base branch and retires the card", async ({ page }) => {
   const before = git("rev-parse", "main");
 
@@ -422,7 +452,10 @@ test("merging lands the work on the base branch and retires the card", async ({ 
   await page.goto(projectUrl);
   await expect(cardIn(page, "done", TITLE)).toBeVisible({ timeout: 20_000 });
 
-  // The worktree is pruned, but the turn history is kept.
+  // The worktree is pruned, but the turn history is kept. Three turns, not two:
+  // the rebase above pulled `upstream.txt` into the worktree, so the snapshot
+  // that followed had a tree of its own rather than matching turn 2 and
+  // returning `None`.
   expect(git("worktree", "list")).not.toContain(`worktrees/${cardId}`);
-  expect(turnRefs(cardId)).toHaveLength(2);
+  expect(turnRefs(cardId)).toHaveLength(3);
 });
