@@ -68,7 +68,7 @@
 
   --shadow: 0 14px 34px oklch(0.1 0.012 250 / 0.55);
   --radius: 6px;
-  --drawer-width: 980px;
+  --drawer-width: 0.875;
 
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --sans: "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -411,10 +411,21 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 
 .drawer-card {
   right: 0;
-  width: var(--drawer-width);
+  /* The resizer renders in the bottom-right corner, which for a right-anchored
+     drawer is the screen's own edge, with nothing to drag toward; rtl moves it
+     to the bottom-left. Children take their own direction back. `resize` also
+     wants an overflow of its own, and writes an inline width — so the bounds
+     have to be min/max for it to respect them. */
+  direction: rtl;
+  resize: horizontal;
+  overflow: hidden;
+  width: calc(var(--drawer-width) * 100%);
+  min-width: 480px;
+  max-width: 100vw;
   border-left: 1px solid var(--border-card);
   animation: slide-right 0.22s ease-out both;
 }
+.drawer-card > * { direction: ltr; }
 
 .drawer-projects {
   left: 0;

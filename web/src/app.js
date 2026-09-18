@@ -24,6 +24,24 @@ up.on("keydown", (event) => {
   document.querySelector("#overlay [data-close-overlay]")?.click();
 });
 
+// ---- drawer resize -----------------------------------------------------------
+// The drawer resizes itself; this only outlives it. The resizer writes an inline
+// width that the #overlay swap throws away on the next lane move, so the width
+// is mirrored onto :root — which the swap leaves alone — as the fraction of the
+// viewport that board.html reads back before paint.
+
+up.compiler(".drawer-card", (drawer) => {
+  const observer = new MutationObserver(() => {
+    const fraction = drawer.offsetWidth / window.innerWidth;
+    document.documentElement.style.setProperty("--drawer-width", fraction);
+    localStorage.setItem("drawer-width", fraction);
+  });
+
+  observer.observe(drawer, { attributeFilter: ["style"] });
+
+  return () => observer.disconnect();
+});
+
 // ⌘↵ submits a form; adding shift takes the second button, which keeps the form
 // open for the next one.
 up.compiler("[data-submit-shortcuts]", (form) => {

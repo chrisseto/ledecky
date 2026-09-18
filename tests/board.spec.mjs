@@ -93,6 +93,37 @@ test("the drawer moves a card without leaving the board", async ({ page }) => {
   await expect(cardIn(page, "done", "Teach it to whistle")).toBeVisible();
 });
 
+test("the drawer's width is draggable and sticks", async ({ page }) => {
+  await page.goto(projectUrl);
+  const cardId = await cardIn(page, "done", "Teach it to whistle").getAttribute("data-card-id");
+  await openCard(page, cardId);
+
+  const drawer = page.locator(".drawer-card");
+  const width = async () => (await drawer.boundingBox()).width;
+
+  // 7/8 of the 1440px viewport.
+  expect(await width()).toBeCloseTo(1260, 0);
+
+  // The drawer is rtl, which puts its resizer in the bottom-left corner; the
+  // slide has to land before that corner is where it looks like it is.
+  await drawer.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+  const grab = { x: 1440 - (await width()) + 8, y: 900 - 8 };
+
+  // Dragging it right narrows the drawer, since the right edge is pinned.
+  await page.mouse.move(grab.x, grab.y);
+  await page.mouse.down();
+  await page.mouse.move(grab.x + 300, grab.y, { steps: 10 });
+  await page.mouse.up();
+
+  expect(await width()).toBeCloseTo(960, 0);
+
+  // The width outlived the page, and the fresh drawer carries it without an
+  // inline width of its own — so it is coming from :root, not the resizer.
+  await openCard(page, cardId);
+  expect(await width()).toBeCloseTo(960, 0);
+  expect(await drawer.getAttribute("style")).toBeNull();
+});
+
 test("cards keep their order within a lane", async ({ page }) => {
   await addCard(page, projectUrl, { title: "Second card" });
   await addCard(page, projectUrl, { title: "Third card" });

@@ -8,6 +8,14 @@
       {% elif project %}{{ project.name }} — ledecky
       {% else %}ledecky{% endif %}
     </title>
+    {# The drawer's width is a preference, not board state, so it lives in
+       localStorage rather than the URL or the database. Read here rather than
+       from the deferred bundle: a direct load of /cards/<id> would otherwise
+       paint the default width first and snap. #}
+    <script>
+      document.documentElement.style.setProperty("--drawer-width", localStorage.getItem("drawer-width"));
+    </script>
+
     <link rel="stylesheet" href="/static/app.css" />
     <script src="/static/app.js" defer></script>
   </head>
