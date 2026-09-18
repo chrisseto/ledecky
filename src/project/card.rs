@@ -52,7 +52,7 @@ pub enum AgentState {
     Starting,
     Running,
     Idle,
-    AwaitingPermission,
+    AwaitingUser,
     Misconfigured,
     Error,
 }
@@ -63,7 +63,7 @@ impl AgentState {
         Self::Starting,
         Self::Running,
         Self::Idle,
-        Self::AwaitingPermission,
+        Self::AwaitingUser,
         Self::Misconfigured,
         Self::Error,
     ];
@@ -74,7 +74,7 @@ impl AgentState {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Idle => "idle",
-            Self::AwaitingPermission => "awaiting_permission",
+            Self::AwaitingUser => "awaiting_user",
             Self::Misconfigured => "misconfigured",
             Self::Error => "error",
         }
@@ -86,7 +86,7 @@ impl AgentState {
             Self::Starting => "starting",
             Self::Running => "working",
             Self::Idle => "idle",
-            Self::AwaitingPermission => "needs permission",
+            Self::AwaitingUser => "needs you",
             Self::Misconfigured => "hooks not reaching server",
             Self::Error => "error",
         }

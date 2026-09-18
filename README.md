@@ -11,9 +11,12 @@ back where you were and the back button closes what is open.
 
 ```
 To Do  ──drag──▶  In Progress  ──agent idles──▶  In Review  ──merge──▶  Done
-                  worktree +                      diff +                 agent lands
-                  live agent                      comments               commits on base
+                  worktree +     ◀──agent works──  diff +                 agent lands
+                  live agent                       comments               commits on base
 ```
+
+In Progress means an agent is working. Anything else — a finished turn, a
+question, a permission prompt — is In Review, which is where you are.
 
 ## Running it
 
@@ -102,6 +105,18 @@ and Enter cannot reach, and a dialog — the workspace-trust prompt, the
 dialog instead. Delivery is confirmed by watching the box let go of the text,
 so "sent" means sent.
 
+The same screen answers a question the hooks cannot. `Notification` says a dialog
+is coming — a tool permission, a question, a plan to approve, an MCP server
+asking for input — which is why the card says `needs you` rather than naming one
+of them. It is matched down to those types: `idle_prompt` is the same event and
+would light up every idle card a minute after it went quiet. `PermissionRequest`
+would cover less and answer from inside the permission flow, where a slow reply
+stalls the turn.
+
+Nothing at all reports the answer, though. So the pty reader watches for the
+dialog leaving the screen, and that is what puts the card back to work; a hook
+that never paints one is given up on after five seconds.
+
 [delta]: https://github.com/dandavison/delta
 
 **Polling.** The board and the agent-state chip poll themselves through unpoly.
@@ -136,8 +151,8 @@ The port is fixed in `Rocket.toml` because hook URLs have to be stable.
 Per-card permission mode and model are set on the new-card form, whose one Task
 field doubles as the card's title: the first line names the card, the whole
 thing is what the agent is told. `bypassPermissions` shows a one-time consent
-dialog in the terminal — answer it there; the card reports `needs permission`
-until you do.
+dialog in the terminal — answer it there; the card reports `needs you` and waits
+in In Review until you do.
 
 ## Layout
 

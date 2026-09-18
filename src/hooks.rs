@@ -6,17 +6,29 @@ use rand::TryRng;
 use rocket::serde::Serialize;
 use serde_json::{json, Map, Value};
 
-/// Hook events we register, paired with the URL segment each posts to.
+/// Hook events we register: the event, the URL segment it posts to, and the
+/// matcher scoping it.
 ///
 /// NB: `SessionStart` is absent on purpose — it only accepts `command` and
 /// `mcp_tool` handlers, so an HTTP hook there silently never fires. The opening
 /// prompt goes out on a timer instead, and `session_id` is read from whichever
 /// of these lands first.
-const EVENTS: &[(&str, &str)] = &[
-    ("UserPromptSubmit", "prompt"),
-    ("PermissionRequest", "permission"),
-    ("Stop", "stop"),
-    ("SessionEnd", "end"),
+const EVENTS: &[(&str, &str, Option<&str>)] = &[
+    ("UserPromptSubmit", "prompt", None),
+    // NB: `Notification` rather than `PermissionRequest`, which sees tool
+    // permissions only and answers from inside the permission flow, where a slow
+    // reply stalls the turn. This one is fire-and-forget, and it also catches the
+    // dialogs an MCP server puts up.
+    //
+    // The matcher earns its keep by leaving `idle_prompt` out: that fires a
+    // minute into every idle card, which is not a card waiting on anybody.
+    (
+        "Notification",
+        "needs-user",
+        Some("permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input"),
+    ),
+    ("Stop", "stop", None),
+    ("SessionEnd", "end", None),
 ];
 
 const HOOK_TIMEOUT_SECS: u32 = 10;
@@ -75,13 +87,22 @@ impl HookAuth {
     pub fn settings(&self, card_id: i64) -> Value {
         let hooks: Map<String, Value> = EVENTS
             .iter()
-            .map(|(event, path)| {
+            .map(|(event, path, matcher)| {
                 let handler = HttpHook {
                     kind: "http",
                     url: self.url(card_id, path),
                     timeout: HOOK_TIMEOUT_SECS,
                 };
-                ((*event).to_owned(), json!([{ "hooks": [handler] }]))
+
+                // NB: an absent `matcher` is what matches everything, so the key
+                // is omitted rather than sent empty.
+                let mut entry = Map::new();
+                if let Some(matcher) = matcher {
+                    entry.insert("matcher".to_owned(), json!(matcher));
+                }
+                entry.insert("hooks".to_owned(), json!([handler]));
+
+                ((*event).to_owned(), json!([entry]))
             })
             .collect();
 
@@ -144,15 +165,47 @@ mod tests {
         // hook that never fires.
         assert!(!hooks.contains_key("SessionStart"));
 
-        for (event, path) in EVENTS {
-            let handler = &hooks[*event][0]["hooks"][0];
+        for (event, path, matcher) in EVENTS {
+            let entry = &hooks[*event][0];
+            let handler = &entry["hooks"][0];
             assert_eq!(handler["type"], "http");
             assert_eq!(handler["timeout"], HOOK_TIMEOUT_SECS);
             assert_eq!(
                 handler["url"].as_str().unwrap(),
                 format!("http://127.0.0.1:9999/hooks/{}/42/{path}", auth.token)
             );
+
+            match matcher {
+                Some(matcher) => assert_eq!(entry["matcher"], *matcher),
+                // An empty matcher is not the same as none of the key at all.
+                None => assert!(entry.get("matcher").is_none(), "{event} grew a matcher"),
+            }
         }
+    }
+
+    /// `Notification` covers more than a permission prompt, and one of the types
+    /// it covers is useless here: `idle_prompt` fires a minute into every idle
+    /// card. Admitting it would light up the whole board.
+    #[test]
+    fn the_notification_matcher_takes_dialogs_but_not_idleness() {
+        let matcher = EVENTS
+            .iter()
+            .find(|(event, ..)| *event == "Notification")
+            .and_then(|(.., matcher)| *matcher)
+            .expect("Notification is what arms the dialog watcher");
+
+        for kind in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+            "agent_needs_input",
+        ] {
+            assert!(
+                matcher.contains(kind),
+                "{kind} is a dialog holding the keyboard"
+            );
+        }
+        assert!(!matcher.contains("idle_prompt"));
     }
 
     #[test]

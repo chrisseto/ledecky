@@ -223,12 +223,12 @@ label > span { font-size: 12.5px; font-weight: 600; color: var(--fg-dim); }
 .pulse.state-starting,
 .pulse.state-running,
 .pulse.state-idle { background: var(--accent); box-shadow: 0 0 0 3px oklch(0.62 0.08 150 / 0.25); }
-.pulse.state-awaiting_permission { background: var(--warn); box-shadow: 0 0 0 3px oklch(0.7 0.08 80 / 0.25); }
+.pulse.state-awaiting_user { background: var(--warn); box-shadow: 0 0 0 3px oklch(0.7 0.08 80 / 0.25); }
 .pulse.state-error,
 .pulse.state-misconfigured { background: var(--del); box-shadow: 0 0 0 3px oklch(0.6 0.1 30 / 0.25); }
 
 .state { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 500; color: var(--fg-dim); }
-.state-awaiting_permission { color: var(--warn-text); }
+.state-awaiting_user { color: var(--warn-text); }
 .state-error, .state-misconfigured { color: var(--del); }
 
 .stat { white-space: nowrap; font-size: 11.5px; }

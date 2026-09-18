@@ -69,6 +69,11 @@ const transcript = [
 
 // bypassPermissions shows a one-time consent dialog before anything else runs.
 let modal = permissionMode === "bypassPermissions" ? "consent" : null;
+
+// Set between answering a permission prompt and `f`. The turn is deliberately
+// still open in that window: a card has to have stopped saying "needs you" while
+// the agent is working, which the `idle` of a finished turn would otherwise hide.
+let working = null;
 /** The full text the composer holds. */
 let buffer = "";
 /** What the composer displays, which collapses for a long paste. */
@@ -201,7 +206,7 @@ async function submit(prompt) {
   if (prompt.includes("[needs-permission]")) {
     modal = "permission";
     render();
-    await hook("PermissionRequest", { tool_name: "Bash" });
+    await hook("Notification", { notification_type: "permission_prompt" });
     return; // the turn resumes once the modal is answered
   }
 
@@ -263,11 +268,21 @@ function answerModal(key) {
     const allowed = key === "1";
     transcript.push(allowed ? "* approved" : "* denied");
     if (allowed) appendFileSync("main.rs", `// turn ${turn}: approved\n`);
+    // The composer is back, so the server can see the dialog has gone — but the
+    // turn stays open until `f`. Ending it here instead would let the `idle` that
+    // follows rescue a card still stuck on "needs you", and a timer would only
+    // make the gap between the two a race.
+    working = allowed ? "approved and applied" : "denied";
     render();
-    hook("Stop", {
-      last_assistant_message: allowed ? "approved and applied" : "denied",
-      background_tasks: [],
-    });
+    return true;
+  }
+
+  if (working && key === "f") {
+    const summary = working;
+    working = null;
+    transcript.push("* finished");
+    render();
+    hook("Stop", { last_assistant_message: summary, background_tasks: [] });
     return true;
   }
 

@@ -56,8 +56,18 @@ pub fn receive(
     }
 
     match event {
-        "prompt" => session::set_state(db, card_id, AgentState::Running),
-        "permission" => session::set_state(db, card_id, AgentState::AwaitingPermission),
+        "prompt" => session::resume(db, card_id),
+        // NB: a tool permission, a question, a plan to approve and an MCP
+        // elicitation all arrive here — which is why the card says "needs you"
+        // rather than naming one of them. Nothing reports the answer, so the
+        // terminal watcher is armed here and clears the card once the dialog
+        // leaves the screen.
+        "needs-user" => {
+            session::await_user(db, card_id);
+            if let Some(agent) = agents.get(card_id) {
+                agent.expect_dialog();
+            }
+        }
         "stop" => on_stop(db, agents, settings, cache, card_id, &payload),
         "end" => session::set_state(db, card_id, AgentState::Stopped),
         _ => {}

@@ -69,6 +69,7 @@ pub fn start(
 
     let mut agent = agents
         .spawn(
+            db,
             settings,
             &card,
             &worktree,
@@ -88,6 +89,7 @@ pub fn start(
         let card = Card::find(&db.lock(), card_id).context("card vanished")?;
         agent = agents
             .spawn(
+                db,
                 settings,
                 &card,
                 &worktree,
@@ -147,7 +149,8 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64) {
         // drawn its input box yet is only slow to start, and reporting that as a
         // permission prompt sends them looking for one that is not there.
         if agent.is_blocked() {
-            set_state(&db, card_id, AgentState::AwaitingPermission);
+            agent.saw_dialog();
+            await_user(&db, card_id);
         }
 
         if waited >= PROMPT_TIMEOUT {
@@ -229,6 +232,51 @@ pub fn set_state(db: &Db, card_id: i64, state: AgentState) {
     Card::set_agent_state(&db.lock(), card_id, state);
 }
 
+/// Parks a card that is waiting on a dialog in In Review.
+///
+/// A chip is easy to miss at board scale; a lane is not.
+pub fn await_user(db: &Db, card_id: i64) {
+    let conn = db.lock();
+    Card::set_agent_state(&conn, card_id, AgentState::AwaitingUser);
+
+    if Card::find(&conn, card_id).is_some_and(|card| card.lane == Lane::InProgress) {
+        Card::set_lane(&conn, card_id, Lane::InReview);
+    }
+}
+
+/// The other half: the agent is working, so the card belongs in In Progress.
+///
+/// Driven by `UserPromptSubmit` rather than by anything dialog-shaped, so a
+/// review sent to an idle card moves it too.
+pub fn resume(db: &Db, card_id: i64) {
+    let conn = db.lock();
+    let Some(card) = Card::find(&conn, card_id) else {
+        return;
+    };
+    Card::set_agent_state(&conn, card_id, AgentState::Running);
+
+    // NB: a merge is asked for and finished in review, the only lane offering
+    // the button. The merge prompt fires `UserPromptSubmit` like any other, and
+    // moving the card here would take that button away mid-merge.
+    if card.lane == Lane::InReview && !card.merge_requested {
+        Card::set_lane(&conn, card_id, Lane::InProgress);
+    }
+}
+
+/// Resumes a card whose dialog has left the screen.
+///
+/// NB: only overwrites the state we set ourselves. A turn can end — and its
+/// `Stop` hook record `idle` — before the redraw that proves the dialog is gone,
+/// and writing `running` over that would leave the card claiming to work.
+pub fn resume_after_dialog(db: &Db, card_id: i64) {
+    let awaiting = Card::find(&db.lock(), card_id)
+        .is_some_and(|card| card.agent_state == AgentState::AwaitingUser);
+
+    if awaiting {
+        resume(db, card_id);
+    }
+}
+
 /// Records that the opening prompt went in — unless the hooks have already moved
 /// the card on.
 ///
@@ -237,16 +285,15 @@ pub fn set_state(db: &Db, card_id: i64, state: AgentState) {
 /// `idle` its `Stop` hook just recorded would leave the card claiming to be
 /// working for as long as it sat there.
 fn mark_delivered(db: &Db, card_id: i64) {
-    let conn = db.lock();
-    let Some(card) = Card::find(&conn, card_id) else {
-        return;
-    };
+    let stale = Card::find(&db.lock(), card_id).is_some_and(|card| {
+        matches!(
+            card.agent_state,
+            AgentState::Starting | AgentState::AwaitingUser
+        )
+    });
 
-    if matches!(
-        card.agent_state,
-        AgentState::Starting | AgentState::AwaitingPermission
-    ) {
-        Card::set_agent_state(&conn, card_id, AgentState::Running);
+    if stale {
+        resume(db, card_id);
     }
 }
 
@@ -453,6 +500,88 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let pid = std::process::id() as i64;
         assert!(owns(pid, &cwd));
+    }
+
+    // ---- the lane pair ------------------------------------------------------
+
+    /// A card in `lane`, with its agent in `state`.
+    fn card_in(db: &Db, lane: Lane, state: AgentState) -> i64 {
+        let conn = db.lock();
+        let project = Project::upsert(&conn, Path::new("/srv/repo")).unwrap();
+        let card = Card::create(
+            &conn,
+            NewCard {
+                project_id: project,
+                task: "waiting",
+                base_branch: "main",
+                permission_mode: "acceptEdits",
+                model: None,
+            },
+        )
+        .unwrap();
+        Card::set_lane(&conn, card, lane);
+        Card::set_agent_state(&conn, card, state);
+        card
+    }
+
+    fn look(db: &Db, card_id: i64) -> (Lane, AgentState) {
+        let card = Card::find(&db.lock(), card_id).unwrap();
+        (card.lane, card.agent_state)
+    }
+
+    #[test]
+    fn a_card_waiting_on_a_dialog_steps_into_review_and_back() {
+        let db = memory_db();
+        let card = card_in(&db, Lane::InProgress, AgentState::Running);
+
+        await_user(&db, card);
+        assert_eq!(look(&db, card), (Lane::InReview, AgentState::AwaitingUser));
+
+        resume_after_dialog(&db, card);
+        assert_eq!(look(&db, card), (Lane::InProgress, AgentState::Running));
+    }
+
+    #[test]
+    fn a_card_already_in_review_only_changes_state_on_the_way_in() {
+        let db = memory_db();
+        let card = card_in(&db, Lane::InReview, AgentState::Running);
+
+        await_user(&db, card);
+        assert_eq!(look(&db, card), (Lane::InReview, AgentState::AwaitingUser));
+    }
+
+    #[test]
+    fn a_prompt_pulls_an_idle_card_out_of_review() {
+        // Sending a review to an idle card is the case the dialog watcher never
+        // sees: there is no dialog, only a `UserPromptSubmit`.
+        let db = memory_db();
+        let card = card_in(&db, Lane::InReview, AgentState::Idle);
+
+        resume(&db, card);
+        assert_eq!(look(&db, card), (Lane::InProgress, AgentState::Running));
+    }
+
+    #[test]
+    fn an_outstanding_merge_keeps_the_card_in_review() {
+        // The merge prompt fires `UserPromptSubmit` like any other, and In Review
+        // is the only lane offering the button.
+        let db = memory_db();
+        let card = card_in(&db, Lane::InReview, AgentState::Idle);
+        Card::request_merge(&db.lock(), card, "abc123");
+
+        resume(&db, card);
+        assert_eq!(look(&db, card), (Lane::InReview, AgentState::Running));
+    }
+
+    #[test]
+    fn a_dialog_redraw_does_not_overwrite_a_finished_turn() {
+        // The `Stop` hook can land before the redraw that proves the dialog is
+        // gone; `running` written over that `idle` would strand the card.
+        let db = memory_db();
+        let card = card_in(&db, Lane::InReview, AgentState::Idle);
+
+        resume_after_dialog(&db, card);
+        assert_eq!(look(&db, card), (Lane::InReview, AgentState::Idle));
     }
 
     // ---- the sweep ----------------------------------------------------------

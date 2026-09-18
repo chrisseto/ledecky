@@ -2,13 +2,16 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
 
+use crate::agent::session;
 use crate::config::Settings;
+use crate::db::Db;
 use crate::project::Card;
 
 const DEFAULT_ROWS: u16 = 40;
@@ -16,12 +19,31 @@ const DEFAULT_COLS: u16 = 120;
 const SCROLLBACK: usize = 5000;
 
 /// Paste delivery: up to PASTE_ATTEMPTS sends, each polled PASTE_CHECKS times.
-const PASTE_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+const PASTE_POLL: Duration = Duration::from_millis(150);
 const PASTE_CHECKS: u32 = 8;
 const PASTE_ATTEMPTS: u32 = 4;
 
 /// Rows at the bottom of the screen treated as the input box.
 const COMPOSER_ROWS: usize = 15;
+
+/// How long a requested dialog has to paint before the watcher gives up on it.
+///
+/// Our own hook returns no decision, but the settings merge with the user's
+/// (`hooks.rs`) — one of theirs can answer the request, and then nothing is ever
+/// drawn and there is nothing to wait for.
+const DIALOG_GRACE: Duration = Duration::from_secs(5);
+
+/// What the watcher believes about a dialog holding the keyboard.
+///
+/// `Expected` and `OnScreen` are deliberately different: the `Notification` hook
+/// can reach us before the client paints anything, so treating the two alike
+/// would clear the card before there was a dialog to answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialog {
+    None,
+    Expected,
+    OnScreen,
+}
 
 /// One live `claude` process attached to a pty.
 pub struct Agent {
@@ -36,6 +58,8 @@ pub struct Agent {
     /// The opening task, held until the session is actually up. Flushed by the
     /// `SessionStart` hook, or by a timer if hooks never reach us.
     pending_prompt: Mutex<Option<String>>,
+    /// What the pump believes about a dialog, and when it started believing it.
+    dialog: Mutex<(Dialog, Instant)>,
 }
 
 impl Agent {
@@ -143,6 +167,46 @@ impl Agent {
             .is_some_and(|line| is_menu_option(line))
     }
 
+    /// Arms the watcher: a dialog has been asked for.
+    ///
+    /// NB: it looks at the screen rather than trusting the order of events. The
+    /// client usually paints before the hook reaches us, and `Expected` can only
+    /// promote itself when a chunk arrives *while* the dialog is up — nothing
+    /// guarantees another redraw once it has been drawn.
+    pub fn expect_dialog(&self) {
+        let state = if self.is_blocked() {
+            Dialog::OnScreen
+        } else {
+            Dialog::Expected
+        };
+        *self.dialog.lock().unwrap() = (state, Instant::now());
+    }
+
+    /// The same, for a caller that has already looked.
+    pub fn saw_dialog(&self) {
+        *self.dialog.lock().unwrap() = (Dialog::OnScreen, Instant::now());
+    }
+
+    /// Advances the watcher over one chunk of output, returning whether the card
+    /// has stopped waiting on the user.
+    ///
+    /// NB: the `Dialog::None` check is the whole point of the latch — reading the
+    /// screen renders it to a `String`, and this runs per chunk. The screen lock
+    /// is deliberately not taken while `dialog` is held; `expect_dialog` takes
+    /// them the other way round.
+    fn watch_dialog(&self) -> bool {
+        if self.dialog.lock().unwrap().0 == Dialog::None {
+            return false;
+        }
+
+        let blocked = self.is_blocked();
+
+        let mut dialog = self.dialog.lock().unwrap();
+        let (next, resumed) = settle(dialog.0, blocked, dialog.1.elapsed());
+        dialog.0 = next;
+        resumed
+    }
+
     /// True once `needle`, or the placeholder the TUI collapses a long paste to,
     /// is in the input box.
     fn holds(&self, needle: &str) -> bool {
@@ -232,6 +296,7 @@ impl Agents {
     /// in the worktree.
     pub fn spawn(
         &self,
+        db: &Db,
         settings: &Settings,
         card: &Card,
         worktree: &Path,
@@ -309,15 +374,22 @@ impl Agents {
             master: Mutex::new(pty.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
-            screen: screen.clone(),
-            output: output.clone(),
+            screen,
+            output,
             pending_prompt: Mutex::new(card.opening_prompt()),
+            dialog: Mutex::new((Dialog::None, Instant::now())),
         });
 
-        // portable-pty hands back a blocking reader, so it gets its own thread.
-        std::thread::spawn(move || pump(reader, screen, output));
-
         self.0.write().unwrap().insert(card.id, agent.clone());
+
+        // portable-pty hands back a blocking reader, so it gets its own thread.
+        // Its handle on the agent is not a cycle: the reader hits EOF when the
+        // pty closes, and the loop drops it on the way out.
+        let pumped = agent.clone();
+        let db = db.clone();
+        let card_id = card.id;
+        std::thread::spawn(move || pump(reader, pumped, db, card_id));
+
         Ok(agent)
     }
 }
@@ -371,22 +443,45 @@ fn history_bytes(screen: &mut vt100::Screen, client_rows: Option<u16>) -> Vec<u8
     out
 }
 
-fn pump(
-    mut reader: Box<dyn Read + Send>,
-    screen: Arc<Mutex<vt100::Parser>>,
-    output: broadcast::Sender<Bytes>,
-) {
+/// Feeds pty output into the screen and out to the websocket, and watches for a
+/// dialog leaving that screen.
+///
+/// The watcher lives here because there is no hook for a permission being
+/// answered: the redraw that takes the dialog away is the only signal, and this
+/// is the only place it is seen.
+fn pump(mut reader: Box<dyn Read + Send>, agent: Arc<Agent>, db: Db, card_id: i64) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let chunk = Bytes::copy_from_slice(&buf[..n]);
-                screen.lock().unwrap().process(&chunk);
+                agent.screen.lock().unwrap().process(&chunk);
+
+                if agent.watch_dialog() {
+                    session::resume_after_dialog(&db, card_id);
+                }
+
                 // No subscribers is the normal case when nobody has the card open.
-                let _ = output.send(chunk);
+                let _ = agent.output.send(chunk);
             }
         }
+    }
+}
+
+/// One step of the dialog watcher: the next belief, and whether the card has
+/// stopped waiting on the user.
+///
+/// Split out from `Agent` so the transitions can be tested without a pty.
+fn settle(state: Dialog, blocked: bool, waited: Duration) -> (Dialog, bool) {
+    match (state, blocked) {
+        (Dialog::None, _) => (Dialog::None, false),
+        (_, true) => (Dialog::OnScreen, false),
+        (Dialog::OnScreen, false) => (Dialog::None, true),
+        // Nothing was ever drawn. Either the client is slow, or another hook
+        // answered the request and no dialog is coming at all.
+        (Dialog::Expected, false) if waited >= DIALOG_GRACE => (Dialog::None, true),
+        (Dialog::Expected, false) => (Dialog::Expected, false),
     }
 }
 
@@ -439,8 +534,10 @@ fn paste_needle(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        composer_block, history_bytes, is_menu_option, is_prompt_line, paste_needle, COMPOSER_ROWS,
+        composer_block, history_bytes, is_menu_option, is_prompt_line, paste_needle, settle,
+        Dialog, COMPOSER_ROWS, DIALOG_GRACE,
     };
+    use std::time::Duration;
 
     /// The walk steps through the scrollback a screenful at a time, and the
     /// last step is a partial one whenever the history is not a multiple of the
@@ -641,5 +738,50 @@ mod tests {
     fn needle_falls_back_to_a_prefix() {
         assert_eq!(paste_needle("go go go"), "go go go");
         assert_eq!(paste_needle(""), "");
+    }
+
+    // ---- the dialog watcher -------------------------------------------------
+
+    const SOON: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn an_unarmed_watcher_never_fires() {
+        // Output from an ordinary turn must not be read as a dialog going away.
+        assert_eq!(settle(Dialog::None, false, SOON), (Dialog::None, false));
+        assert_eq!(settle(Dialog::None, true, SOON), (Dialog::None, false));
+    }
+
+    #[test]
+    fn a_requested_dialog_is_held_until_it_paints() {
+        // The hook fires first. Clearing here would take the card off "needs
+        // you" before there was anything on screen to answer.
+        assert_eq!(
+            settle(Dialog::Expected, false, SOON),
+            (Dialog::Expected, false)
+        );
+        assert_eq!(
+            settle(Dialog::Expected, true, SOON),
+            (Dialog::OnScreen, false)
+        );
+    }
+
+    #[test]
+    fn a_dialog_leaving_the_screen_resumes_the_card() {
+        assert_eq!(
+            settle(Dialog::OnScreen, true, SOON),
+            (Dialog::OnScreen, false)
+        );
+        assert_eq!(settle(Dialog::OnScreen, false, SOON), (Dialog::None, true));
+    }
+
+    #[test]
+    fn a_dialog_that_never_paints_is_given_up_on() {
+        // A notification the client never draws a dialog for — the user's own
+        // `PermissionRequest` hook answered it first, say — leaves nothing to
+        // wait on, so the card must not be stranded on "needs you".
+        assert_eq!(
+            settle(Dialog::Expected, false, DIALOG_GRACE),
+            (Dialog::None, true)
+        );
     }
 }

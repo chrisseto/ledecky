@@ -11,6 +11,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/003_agent_pid.sql"),
     include_str!("../migrations/004_review_viewed.sql"),
     include_str!("../migrations/005_session_titles.sql"),
+    include_str!("../migrations/006_awaiting_user.sql"),
 ];
 
 /// A single connection behind a mutex.
