@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./support/fixtures.mjs";
+import { PAST_GRACE, SLOW } from "../playwright.config.mjs";
 
 import {
   addCard,
@@ -8,8 +9,10 @@ import {
   fileSection,
   openAgent,
   openCard,
+  pollsOfPath,
   turnRefs,
 } from "./support/board.mjs";
+import { terminalInput, terminalRows } from "./support/dom.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -42,17 +45,21 @@ test("a consent dialog holds the opening prompt instead of being answered by it"
   await cardIn(page, "todo", TITLE).dragTo(page.locator('[data-lane="in_progress"]'));
 
   await openAgent(page, cardId);
-  const rows = page.locator(".terminal .xterm-rows");
-  await expect(rows).toContainText("Bypass Permissions mode", { timeout: 15_000 });
+  const rows = terminalRows(page);
+  await expect(rows).toContainText("Bypass Permissions mode");
 
   // The card says it is blocked rather than pretending to work, and steps into
   // In Review so the board says so too.
-  await expect(page.locator("#agent-state")).toContainText("needs you", { timeout: 15_000 });
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("#agent-state")).toContainText("needs you");
+  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
 
-  // Give the server well past its retry window, then confirm it neither answered
-  // the dialog nor gave up on the agent.
-  await page.waitForTimeout(6_000);
+  // Give the server real chances to misbehave rather than a wall-clock number
+  // big enough to hope it had some: every tick here is a delivery retry that
+  // could have answered the dialog.
+  const ticks = pollsOfPath(page, `/cards/${cardId}/state`);
+  // Past the dialog grace, so a server that had given up would have shown it.
+  await expect.poll(() => ticks.length, { timeout: PAST_GRACE }).toBeGreaterThan(14);
+
   await expect(rows).toContainText("Bypass Permissions mode");
   await expect(rows).not.toContainText("exiting");
   expect(turnRefs(cardId)).toHaveLength(0);
@@ -60,19 +67,19 @@ test("a consent dialog holds the opening prompt instead of being answered by it"
 
 test("answering the dialog in the terminal releases the queued prompt", async ({ page }) => {
   await openAgent(page, cardId);
-  const rows = page.locator(".terminal .xterm-rows");
-  await expect(rows).toContainText("Bypass Permissions mode", { timeout: 15_000 });
+  const rows = terminalRows(page);
+  await expect(rows).toContainText("Bypass Permissions mode");
 
   // Typing goes straight down the websocket, the same as a real keystroke.
-  await page.locator(".terminal .xterm-helper-textarea").press("2");
-  await expect(rows).toContainText("bypass permissions accepted", { timeout: 10_000 });
+  await terminalInput(page).press("2");
+  await expect(rows).toContainText("bypass permissions accepted", { timeout: SLOW });
 
   // The prompt the server has been holding is now delivered on its own.
-  await expect.poll(() => turnRefs(cardId).length, { timeout: 25_000 }).toBe(1);
-  await expect(page.locator("#agent-state")).toContainText("idle", { timeout: 15_000 });
+  await expect.poll(() => turnRefs(cardId).length).toBe(1);
+  await expect(page.locator("#agent-state")).toContainText("idle");
 
   await page.goto(projectUrl);
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible({ timeout: 15_000 });
+  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
 });
 
 /**
@@ -93,24 +100,24 @@ test("a tool permission prompt shows on the card and resumes when answered", asy
   );
   await page.getByRole("button", { name: /Send \d+ to agent/ }).click();
 
-  await expect(page.locator("#agent-state")).toContainText("needs you", { timeout: 15_000 });
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("#agent-state")).toContainText("needs you");
+  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
 
   await page.locator('label[for="tab-agent"]').click();
-  const rows = page.locator(".terminal .xterm-rows");
+  const rows = terminalRows(page);
   await expect(rows).toContainText("needs approval");
-  const terminal = page.locator(".terminal .xterm-helper-textarea");
+  const terminal = terminalInput(page);
   await terminal.press("1");
 
   // The dialog is gone but the turn has not ended, which is where the state used
   // to stay stuck. The card is working again, and in the lane for it.
-  await expect(page.locator("#agent-state")).toContainText("working", { timeout: 15_000 });
-  await expect(cardIn(page, "in_progress", TITLE)).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("#agent-state")).toContainText("working");
+  await expect(cardIn(page, "in_progress", TITLE)).toBeVisible();
   expect(turnRefs(cardId)).toHaveLength(1);
 
   // Only now does the turn end.
   await terminal.press("f");
-  await expect.poll(() => turnRefs(cardId).length, { timeout: 25_000 }).toBe(2);
-  await expect(page.locator("#agent-state")).toContainText("idle", { timeout: 15_000 });
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible({ timeout: 15_000 });
+  await expect.poll(() => turnRefs(cardId).length).toBe(2);
+  await expect(page.locator("#agent-state")).toContainText("idle");
+  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
 });

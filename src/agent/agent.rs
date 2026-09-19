@@ -10,7 +10,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
 
 use crate::agent::session;
-use crate::config::Settings;
+use crate::config::{Settings, Timings};
 use crate::db::Db;
 use crate::project::Card;
 
@@ -19,19 +19,18 @@ const DEFAULT_COLS: u16 = 120;
 const SCROLLBACK: usize = 5000;
 
 /// Paste delivery: up to PASTE_ATTEMPTS sends, each polled PASTE_CHECKS times.
-const PASTE_POLL: Duration = Duration::from_millis(150);
+// NB: the paste poll interval and the dialog grace live in `Settings`, so the
+// end-to-end suite does not have to wait in real time.
 const PASTE_CHECKS: u32 = 8;
 const PASTE_ATTEMPTS: u32 = 4;
 
 /// Rows at the bottom of the screen treated as the input box.
 const COMPOSER_ROWS: usize = 15;
 
-/// How long a requested dialog has to paint before the watcher gives up on it.
-///
-/// Our own hook returns no decision, but the settings merge with the user's
-/// (`hooks.rs`) — one of theirs can answer the request, and then nothing is ever
-/// drawn and there is nothing to wait for.
-const DIALOG_GRACE: Duration = Duration::from_secs(5);
+// The dialog grace is `Timings::dialog_grace`: our own hook returns no
+// decision, but the settings merge with the user's (`hooks.rs`) — one of theirs
+// can answer the request, and then nothing is ever drawn and there is nothing
+// to wait for.
 
 /// What the watcher believes about a dialog holding the keyboard.
 ///
@@ -60,6 +59,8 @@ pub struct Agent {
     pending_prompt: Mutex<Option<String>>,
     /// What the pump believes about a dialog, and when it started believing it.
     dialog: Mutex<(Dialog, Instant)>,
+    /// The real-time waits this agent makes, from `Settings`.
+    timings: Timings,
 }
 
 impl Agent {
@@ -111,7 +112,7 @@ impl Agent {
 
         for _ in 0..PASTE_ATTEMPTS {
             if !self.is_composing() {
-                std::thread::sleep(PASTE_POLL);
+                std::thread::sleep(self.timings.paste_poll);
                 continue;
             }
 
@@ -123,7 +124,7 @@ impl Agent {
             }
 
             for _ in 0..PASTE_CHECKS {
-                std::thread::sleep(PASTE_POLL);
+                std::thread::sleep(self.timings.paste_poll);
                 if !self.holds(&needle) {
                     continue;
                 }
@@ -202,7 +203,12 @@ impl Agent {
         let blocked = self.is_blocked();
 
         let mut dialog = self.dialog.lock().unwrap();
-        let (next, resumed) = settle(dialog.0, blocked, dialog.1.elapsed());
+        let (next, resumed) = settle(
+            dialog.0,
+            blocked,
+            dialog.1.elapsed(),
+            self.timings.dialog_grace,
+        );
         dialog.0 = next;
         resumed
     }
@@ -219,7 +225,7 @@ impl Agent {
     /// the submit key did anything.
     fn cleared(&self, needle: &str) -> bool {
         for _ in 0..PASTE_CHECKS {
-            std::thread::sleep(PASTE_POLL);
+            std::thread::sleep(self.timings.paste_poll);
             if !self.holds(needle) {
                 return true;
             }
@@ -342,6 +348,10 @@ impl Agents {
         // Match what xterm.js renders; the inherited TERM may be anything.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // Applied last so a deployment can override the above if it must.
+        for (key, value) in &settings.agent_env {
+            cmd.env(key, value);
+        }
         // If this server was itself launched from a Claude Code session, these
         // markers make the child think it is a nested agent and disable session
         // persistence. Auth vars are deliberately left alone.
@@ -378,6 +388,7 @@ impl Agents {
             output,
             pending_prompt: Mutex::new(card.opening_prompt()),
             dialog: Mutex::new((Dialog::None, Instant::now())),
+            timings: settings.timings(),
         });
 
         self.0.write().unwrap().insert(card.id, agent.clone());
@@ -473,14 +484,14 @@ fn pump(mut reader: Box<dyn Read + Send>, agent: Arc<Agent>, db: Db, card_id: i6
 /// stopped waiting on the user.
 ///
 /// Split out from `Agent` so the transitions can be tested without a pty.
-fn settle(state: Dialog, blocked: bool, waited: Duration) -> (Dialog, bool) {
+fn settle(state: Dialog, blocked: bool, waited: Duration, grace: Duration) -> (Dialog, bool) {
     match (state, blocked) {
         (Dialog::None, _) => (Dialog::None, false),
         (_, true) => (Dialog::OnScreen, false),
         (Dialog::OnScreen, false) => (Dialog::None, true),
         // Nothing was ever drawn. Either the client is slow, or another hook
         // answered the request and no dialog is coming at all.
-        (Dialog::Expected, false) if waited >= DIALOG_GRACE => (Dialog::None, true),
+        (Dialog::Expected, false) if waited >= grace => (Dialog::None, true),
         (Dialog::Expected, false) => (Dialog::Expected, false),
     }
 }
@@ -535,7 +546,7 @@ fn paste_needle(text: &str) -> String {
 mod tests {
     use super::{
         composer_block, history_bytes, is_menu_option, is_prompt_line, paste_needle, settle,
-        Dialog, COMPOSER_ROWS, DIALOG_GRACE,
+        Dialog, COMPOSER_ROWS,
     };
     use std::time::Duration;
 
@@ -743,12 +754,21 @@ mod tests {
     // ---- the dialog watcher -------------------------------------------------
 
     const SOON: Duration = Duration::from_millis(200);
+    /// The grace the transitions are asserted against; `Settings` supplies the
+    /// real one.
+    const GRACE: Duration = Duration::from_secs(5);
 
     #[test]
     fn an_unarmed_watcher_never_fires() {
         // Output from an ordinary turn must not be read as a dialog going away.
-        assert_eq!(settle(Dialog::None, false, SOON), (Dialog::None, false));
-        assert_eq!(settle(Dialog::None, true, SOON), (Dialog::None, false));
+        assert_eq!(
+            settle(Dialog::None, false, SOON, GRACE),
+            (Dialog::None, false)
+        );
+        assert_eq!(
+            settle(Dialog::None, true, SOON, GRACE),
+            (Dialog::None, false)
+        );
     }
 
     #[test]
@@ -756,11 +776,11 @@ mod tests {
         // The hook fires first. Clearing here would take the card off "needs
         // you" before there was anything on screen to answer.
         assert_eq!(
-            settle(Dialog::Expected, false, SOON),
+            settle(Dialog::Expected, false, SOON, GRACE),
             (Dialog::Expected, false)
         );
         assert_eq!(
-            settle(Dialog::Expected, true, SOON),
+            settle(Dialog::Expected, true, SOON, GRACE),
             (Dialog::OnScreen, false)
         );
     }
@@ -768,10 +788,13 @@ mod tests {
     #[test]
     fn a_dialog_leaving_the_screen_resumes_the_card() {
         assert_eq!(
-            settle(Dialog::OnScreen, true, SOON),
+            settle(Dialog::OnScreen, true, SOON, GRACE),
             (Dialog::OnScreen, false)
         );
-        assert_eq!(settle(Dialog::OnScreen, false, SOON), (Dialog::None, true));
+        assert_eq!(
+            settle(Dialog::OnScreen, false, SOON, GRACE),
+            (Dialog::None, true)
+        );
     }
 
     #[test]
@@ -780,7 +803,7 @@ mod tests {
         // `PermissionRequest` hook answered it first, say — leaves nothing to
         // wait on, so the card must not be stranded on "needs you".
         assert_eq!(
-            settle(Dialog::Expected, false, DIALOG_GRACE),
+            settle(Dialog::Expected, false, GRACE, GRACE),
             (Dialog::None, true)
         );
     }

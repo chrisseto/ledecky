@@ -7,7 +7,9 @@
     "build": "pnpm icons && esbuild web/src/app.js --bundle --minify --format=iife --outfile=static/app.js && esbuild web/src/app.css --bundle --minify --loader:.woff2=file --outfile=static/app.css",
     "watch": "pnpm icons && esbuild web/src/app.js web/src/app.css --bundle --sourcemap --format=iife --loader:.woff2=file --outdir=static --watch",
     "e2e": "playwright test",
-    "e2e:ui": "playwright test --ui"
+    "e2e:ui": "playwright test --ui",
+    "e2e:trace": "E2E_DEBUG=1 playwright test --retries=1 --trace=on",
+    "e2e:shots": "E2E_SHOTS=1 playwright test --grep @shots"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",

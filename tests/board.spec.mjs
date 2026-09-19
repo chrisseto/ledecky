@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./support/fixtures.mjs";
 
 import { addCard, addProject, cardIn, lane, moveCard, openCard, pollsOf } from "./support/board.mjs";
 

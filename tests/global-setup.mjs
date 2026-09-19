@@ -1,34 +1,26 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DATA_HOME, REPO, ROOT } from "./support/paths.mjs";
-
-const git = (cwd, ...args) =>
-  execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+import { PROJECT } from "./support/server.mjs";
 
 export default function globalSetup() {
-  // The bundle is built by `build.rs`, so it is current by the time there is a
-  // server to run at all.
-  rmSync(ROOT, { recursive: true, force: true });
-  mkdirSync(DATA_HOME, { recursive: true });
-  mkdirSync(REPO, { recursive: true });
+  // A directory of its own per run, so nothing survives from the last one and
+  // two runs — two agents, two worktrees — cannot wipe each other's databases.
+  // Set here rather than derived in each process: the workers inherit this
+  // environment, and under `nix develop` `TMPDIR` is per-invocation, so each of
+  // them working it out alone would disagree about where the data lives.
+  //
+  // Honoured if already set, which is how you keep a run's state to poke at.
+  if (!process.env.LEDECKY_TEST_ROOT) {
+    process.env.LEDECKY_TEST_ROOT = mkdtempSync(join(tmpdir(), "ledecky-e2e-"));
+    // Ours to remove again; a root handed in from outside is not.
+    process.env.LEDECKY_TEST_ROOT_OWNED = "1";
+  }
 
-  git(REPO, "init", "-q", "-b", "main");
-  git(REPO, "config", "user.email", "e2e@ledecky.test");
-  git(REPO, "config", "user.name", "ledecky e2e");
-  // The fake agent edits this file; keeping it small keeps diff assertions legible.
-  // Long enough that a 3-line context window does not already show the whole
-  // file, so widening it is observable.
-  const filler = Array.from({ length: 24 }, (_, i) => `fn spare_${i}() -> u32 { ${i} }`);
-  writeFileSync(
-    join(REPO, "main.rs"),
-    `${filler.join("\n")}\n\nfn main() {\n    println!("hi");\n}\n`,
-  );
-  writeFileSync(join(REPO, "README.md"), "# scratch\n");
-  git(REPO, "add", "-A");
-  git(REPO, "commit", "-qm", "init");
-
-  // A second branch so the base-branch picker has something to choose between.
-  git(REPO, "branch", "release");
+  // Built once, here, rather than by each worker: `build.rs` produces the web
+  // bundle as a side effect, so this is also what keeps `static/` current —
+  // the property `cargo run` used to provide when it started the server.
+  execFileSync("cargo", ["build", "--quiet"], { cwd: PROJECT, stdio: "inherit" });
 }

@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect } from "@playwright/test";
 
+import { terminalRows } from "./dom.mjs";
 import { DATA_HOME, REPO } from "./paths.mjs";
 
 export const git = (...args) =>
@@ -98,7 +99,7 @@ export async function openCard(page, cardId) {
 export async function openAgent(page, cardId) {
   await openCard(page, cardId);
   await page.locator('label[for="tab-agent"]').click();
-  await expect(page.locator(".terminal .xterm-rows")).toBeVisible();
+  await expect(terminalRows(page)).toBeVisible();
 }
 
 /** The stacked diff renders every changed file; this is one of them. */

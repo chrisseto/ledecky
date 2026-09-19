@@ -1,17 +1,17 @@
-import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { SLOW } from "../playwright.config.mjs";
 
 import { expect, test } from "@playwright/test";
 
-// This spec runs its own server so it can kill it outright, which would take the
-// shared one down with it.
-const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const ROOT = "/tmp/ledecky-orphans";
+import { ROOT as WORKER_ROOT } from "./support/paths.mjs";
+import { PROJECT, boot as bootServer, provision } from "./support/server.mjs";
 
-const git = (cwd, ...args) =>
-  execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+// This spec runs a server of its own so it can kill it outright, which would
+// take a shared one down with it. Under this worker's root rather than a fixed
+// path, so parallel workers cannot wipe each other's copy of it.
+const ROOT = join(WORKER_ROOT, "orphans");
 
 const alive = (pid) => {
   try {
@@ -22,66 +22,32 @@ const alive = (pid) => {
   }
 };
 
-/** The pid of the agent working in a given card's worktree. */
-function agentPid(worktreesDir) {
-  const pids = execFileSync("pgrep", ["-u", String(process.getuid()), "-f", "fake-agent"], {
-    encoding: "utf8",
-  })
-    .split("\n")
-    .filter(Boolean);
-
-  return pids.find((pid) => {
-    try {
-      return readlinkSync(`/proc/${pid}/cwd`).startsWith(worktreesDir);
-    } catch {
-      return false;
-    }
-  });
-}
-
 /**
- * The server binary, built in place.
+ * The pid the server recorded for a card's agent.
  *
- * NB: this spec spawns it directly rather than through `cargo run`, because it
- * kills the pid it is handed. Cargo does not pass a SIGKILL on to the binary it
- * launched, so killing it would leave the server — and the agent this test is
- * about — running, and this spec would pass with the orphan it is meant to
- * catch still alive.
+ * NB: read back out of the server's own database rather than hunted down with
+ * `pgrep` and `/proc`. That worked, but it asked the kernel a question this
+ * server already knows the answer to — it matched every agent the user was
+ * running and leaned on a cwd check to tell them apart, and it only worked on
+ * Linux. `agent_pid` is what `sweep_orphans` uses to clean up after a crash, so
+ * reading it here tests the column the recovery path depends on.
  */
-function build() {
-  execFileSync("cargo", ["build", "--quiet"], { cwd: PROJECT, stdio: "inherit" });
-  const target = process.env.CARGO_TARGET_DIR ?? join(PROJECT, "target");
-  return join(target, "debug", "ledecky");
+function agentPid() {
+  const db = join(ROOT, "data/ledecky/ledecky.db");
+  if (!existsSync(db)) return undefined;
+
+  // Read-only, so this cannot be what unblocks a stuck writer.
+  const out = execFileSync(
+    "sqlite3",
+    [`file:${db}?mode=ro`, "SELECT agent_pid FROM cards WHERE id = 1"],
+    { encoding: "utf8" },
+  ).trim();
+
+  return out ? Number(out) : undefined;
 }
 
-/** Starts a server on a port of its own choosing and reports where it landed. */
-async function boot({ agentBin }) {
-  const server = spawn(build(), {
-    cwd: PROJECT,
-    env: {
-      ...process.env,
-      ROCKET_PORT: "0",
-      ROCKET_LOG_LEVEL: "critical",
-      XDG_DATA_HOME: join(ROOT, "data"),
-      LEDECKY_AGENT_BIN: agentBin,
-    },
-    stdio: ["ignore", "pipe", "inherit"],
-  });
-
-  const base = await new Promise((resolve, reject) => {
-    let out = "";
-    server.stdout.setEncoding("utf8");
-    server.stdout.on("data", (chunk) => {
-      out += chunk;
-      const url = out.match(/listening on (\S+)/)?.[1];
-      if (url) resolve(url);
-    });
-    // Nothing else says where the server is, so a death here is terminal.
-    server.on("exit", (code) => reject(new Error(`the server exited with ${code}`)));
-  });
-
-  return { server, base };
-}
+/** This spec's server, on its own root. */
+const boot = () => bootServer({ root: ROOT, agentBin: join(PROJECT, "tests/fake-agent.mjs") });
 
 async function startCard(request, base) {
   await request.post(`${base}/projects`, { form: { path: join(ROOT, "repo") } });
@@ -107,16 +73,7 @@ test.afterEach(() => {
 });
 
 test.beforeEach(() => {
-  rmSync(ROOT, { recursive: true, force: true });
-  mkdirSync(join(ROOT, "repo"), { recursive: true });
-
-  const repo = join(ROOT, "repo");
-  git(repo, "init", "-q", "-b", "main");
-  git(repo, "config", "user.email", "e2e@ledecky.test");
-  git(repo, "config", "user.name", "ledecky e2e");
-  writeFileSync(join(repo, "main.rs"), "fn main() {}\n");
-  git(repo, "add", "-A");
-  git(repo, "commit", "-qm", "init");
+  provision(ROOT);
 });
 
 /**
@@ -127,16 +84,15 @@ test.beforeEach(() => {
 test("SIGKILLing the server takes its agents with it", async ({ request }) => {
   test.slow();
 
-  let base;
-  ({ server, base } = await boot({ agentBin: join(PROJECT, "tests/fake-agent.mjs") }));
-  await startCard(request, base);
+  let url;
+  ({ server, url } = await boot());
+  await startCard(request, url);
 
-  const worktrees = join(ROOT, "data/ledecky/worktrees");
-  await expect.poll(() => agentPid(worktrees), { timeout: 20_000 }).toBeTruthy();
-  const pid = Number(agentPid(worktrees));
+  await expect.poll(agentPid, { timeout: SLOW }).toBeTruthy();
+  const pid = agentPid();
 
   process.kill(server.pid, "SIGKILL");
 
-  await expect.poll(() => alive(pid), { timeout: 15_000 }).toBe(false);
+  await expect.poll(() => alive(pid)).toBe(false);
 });
 

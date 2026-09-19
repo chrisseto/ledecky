@@ -204,10 +204,20 @@ git -C <project> for-each-ref --format='%(refname)' 'refs/ledecky/**' |
 ## Tests
 
 ```sh
-cargo test    # diff parsing, paste-needle selection, scope round-tripping
-pnpm e2e      # end-to-end, in a real browser
-pnpm e2e:ui   # the same, in Playwright's interactive runner
+cargo test     # diff parsing, paste-needle selection, scope round-tripping
+pnpm e2e       # end-to-end, in a real browser
+pnpm e2e:ui    # the same, in Playwright's interactive runner
+pnpm e2e:trace # the same, retried once with a trace and an HTML report
+pnpm e2e:shots # the screenshot pass, which is documentation rather than assertions
 ```
+
+The suite runs four workers, each with a server, a database and a scratch
+repository of its own, so no spec depends on another's state or on file order.
+`tests/support/fixtures.mjs` owns that; `tests/support/server.mjs` builds and
+starts the binary. The waits the agent plumbing makes in real time are settings
+(`ready_delay`, `dialog_grace` and friends in `Rocket.toml`), which is what
+keeps a run in seconds rather than minutes — see `AGENT_TIMINGS` in
+`playwright.config.mjs`.
 
 The end-to-end suite drives Chromium from the nix store — `PLAYWRIGHT_BROWSERS_PATH`
 comes from the flake, because Playwright's own browser download produces binaries
@@ -215,8 +225,11 @@ that will not run on NixOS. The npm `@playwright/test` version must match
 `playwright-driver` in nixpkgs; `$PLAYWRIGHT_VERSION` in the dev shell tells you
 which that is.
 
-Each run wipes `/tmp/ledecky-e2e`, builds a scratch repository there, and points
-the server at it via `XDG_DATA_HOME` — nothing touches a real board.
+Each run gets a `mkdtemp` directory of its own, builds a scratch repository
+under a per-worker subdirectory of it, and points that worker's server there via
+`XDG_DATA_HOME` — nothing touches a real board, and any number of runs can go at
+once. Teardown removes it again; `E2E_DEBUG=1` keeps it, and `LEDECKY_TEST_ROOT`
+puts it somewhere you choose (and leaves it to you to delete).
 
 ### The fake agent
 

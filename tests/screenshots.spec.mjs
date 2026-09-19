@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./support/fixtures.mjs";
 
+import { ROOT } from "./support/paths.mjs";
 import {
   addCard,
   addProject,
@@ -10,6 +11,7 @@ import {
   turnRefs,
   worktreeGit,
 } from "./support/board.mjs";
+import { terminalRows } from "./support/dom.mjs";
 
 // Not assertions so much as a way to look at the thing. Run with
 // `pnpm e2e tests/screenshots.spec.mjs` and open tests/.shots/.
@@ -20,14 +22,12 @@ const shot = (page, name) => page.screenshot({ path: `tests/.shots/${name}.png`,
 let projectUrl;
 let cardId;
 
-test("capture the whole flow", async ({ page }) => {
-  test.slow();
-
+test("capture the whole flow @shots", async ({ page }) => {
   await page.goto("/");
   await shot(page, "01-empty");
 
   await page.goto("/projects/new");
-  await page.getByLabel("Repository directory").fill("/tmp/ledecky-e2e/");
+  await page.getByLabel("Repository directory").fill(`${ROOT}/`);
   await expect(page.locator(".completions li").first()).toBeVisible();
   await shot(page, "02-add-project");
 
@@ -53,14 +53,14 @@ test("capture the whole flow", async ({ page }) => {
 
   await page.goto(projectUrl);
   await cardIn(page, "todo", "Add a build banner").dragTo(page.locator('[data-lane="in_progress"]'));
-  await expect.poll(() => turnRefs(cardId).length, { timeout: 25_000 }).toBe(1);
+  await expect.poll(() => turnRefs(cardId).length).toBe(1);
 
   await page.goto(projectUrl);
   await shot(page, "07-board-in-review");
 
   await openCard(page, cardId);
   await page.locator('label[for="tab-agent"]').click();
-  await expect(page.locator(".terminal .xterm-rows")).toContainText("fake-agent");
+  await expect(terminalRows(page)).toContainText("fake-agent");
   await shot(page, "08-agent");
 
   await page.locator('label[for="tab-review"]').click();

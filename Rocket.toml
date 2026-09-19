@@ -11,9 +11,31 @@ app_slug = "ledecky"
 # scripted stand-in.
 agent_bin = "claude"
 
+# Extra environment for that executable, on top of what this server inherited.
+# The end-to-end suite uses it to tell its stand-in how long to pretend to start
+# up for.
+agent_env = {}
+
 # How often a polled fragment re-checks the server, in milliseconds. Unchanged
 # fragments answer 304 and are not re-rendered, so this is cheap. The end-to-end
 # suite shrinks it so it does not have to wait in real time.
 poll_interval = 4000
 
 # data_dir defaults to $XDG_DATA_HOME/<app_slug>; set it to override.
+
+# The waits this server makes in real time while driving an agent, in
+# milliseconds — not the agent's own timings, which are the agent's business.
+# Listed here to document them; `Settings` carries the same values as defaults,
+# so deleting any of these changes nothing. The end-to-end suite overrides them
+# with `LEDECKY_*` so it does not have to wait in real time.
+#
+#   ready_delay    how long to hold off before offering the TUI a paste
+#   hook_grace     how long to wait for any hook before reporting misconfigured
+#   resume_timeout how long a resumed session has to prove itself
+#   dialog_grace   how long a requested dialog has to paint
+#   paste_poll     how often to re-check the input box while landing a paste
+ready_delay = 2500
+hook_grace = 15000
+resume_timeout = 5000
+dialog_grace = 5000
+paste_poll = 150

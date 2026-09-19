@@ -393,8 +393,16 @@ up.compiler(".review", (review) => {
   // Clicking away is what saves: an empty box was a change of mind.
   textarea.addEventListener("blur", () => {
     if (form.hidden) return;
-    if (textarea.value.trim()) up.submit(form);
-    else close();
+    if (!textarea.value.trim()) {
+      close();
+      return;
+    }
+
+    // NB: hidden before submitting, not after. `up.submit` swaps the pane, and
+    // the blur that swap fires on the outgoing textarea would otherwise post
+    // the same comment a second time.
+    form.hidden = true;
+    up.submit(form);
   });
 
   form.addEventListener("cancel-comment", close);

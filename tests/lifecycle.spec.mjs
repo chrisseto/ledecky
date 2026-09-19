@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./support/fixtures.mjs";
+import { SLOW } from "../playwright.config.mjs";
 
 import {
   addCard,
@@ -17,6 +18,7 @@ import {
   turnRefs,
   worktreeGit,
 } from "./support/board.mjs";
+import { terminal, terminalRows } from "./support/dom.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -28,7 +30,7 @@ let cardId;
 
 /** Turn snapshots are written by a hook, so they land a moment after the UI settles. */
 const expectTurns = (count) =>
-  expect.poll(() => turnRefs(cardId).length, { timeout: 25_000 }).toBe(count);
+  expect.poll(() => turnRefs(cardId).length).toBe(count);
 
 test.beforeAll(async ({ browser }) => {
   const page = await browser.newPage();
@@ -43,7 +45,7 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
   await cardIn(page, "todo", TITLE).dragTo(page.locator('[data-lane="in_progress"]'));
 
   await expect
-    .poll(() => git("worktree", "list"), { timeout: 15_000 })
+    .poll(() => git("worktree", "list"))
     .toMatch(new RegExp(`worktrees/${cardId}\\s+\\w+ \\(detached HEAD\\)`));
 
   // The starting commit is recorded, which is what diffs are measured from.
@@ -55,19 +57,21 @@ test("entering In Progress creates a detached worktree and starts an agent", asy
 test("the terminal streams the agent's screen", async ({ page }) => {
   await openAgent(page, cardId);
 
-  const rows = page.locator("div[data-terminal] .xterm-rows");
-  await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
+  const rows = terminalRows(page);
   // The agent is running inside the card's worktree, not the project checkout.
+  //
+  // NB: asserted rather than the agent's banner line. The banner is the very
+  // first thing it prints, so it is also the first thing any scroll takes away
+  // — and a turn landing before this looks is enough to do it.
   await expect(rows).toContainText(`worktrees/${cardId}`);
 });
 
 test("a wheel over the terminal never reaches the page behind it", async ({ page }) => {
   await openAgent(page, cardId);
 
-  const terminal = page.locator("div[data-terminal]");
-  await expect(terminal.locator(".xterm-rows")).toContainText("fake-agent", { timeout: 15_000 });
+  await expect(terminalRows(page)).toContainText(`worktrees/${cardId}`);
 
-  const box = await terminal.boundingBox();
+  const box = await terminal(page).boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
 
   // xterm only cancels a wheel it actually scrolled with, so at either end of
@@ -102,12 +106,12 @@ test("a wheel over the terminal never reaches the page behind it", async ({ page
 test("the scrollback the agent printed before the drawer opened is scrollable", async ({ page }) => {
   await openAgent(page, cardId);
 
-  const rows = page.locator("div[data-terminal] .xterm-rows");
-  await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
+  const rows = terminalRows(page);
+  await expect(rows).toContainText(`worktrees/${cardId}`);
 
   // The banner scrolled off the pty long before this client connected, so it is
   // only on screen if the server replayed its scrollback.
-  const box = await page.locator("div[data-terminal]").boundingBox();
+  const box = await terminal(page).boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   for (let i = 0; i < 20; i++) await page.mouse.wheel(0, -600);
 
@@ -118,7 +122,7 @@ test("the opening task is delivered and the finished turn moves the card to In R
   await expectTurns(1);
 
   await page.goto(projectUrl);
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible({ timeout: 15_000 });
+  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
 
   // The board card carries what the turn changed.
   await expect(cardIn(page, "in_review", TITLE).locator(".stat")).toContainText("+");
@@ -132,9 +136,7 @@ test("the card takes the name the session gave itself", async ({ page }) => {
 
   // The title the human typed is only a label until the agent names its
   // session; from then on the card follows that name.
-  await expect(page.locator(`#card-${cardId}`)).toContainText(`${TITLE} (named)`, {
-    timeout: 25_000,
-  });
+  await expect(page.locator(`#card-${cardId}`)).toContainText(`${TITLE} (named)`);
 });
 
 test("a terminal opened behind the review tab still fits its own pane", async ({ page }) => {
@@ -268,11 +270,11 @@ test("the pane keeps up with the worktree on its own", async ({ page }) => {
   editWorktree(cardId, "later.txt", "arrived while the drawer was open\n");
 
   // No reload: the pane polls its own URL.
-  await expect(fileSection(page, "later.txt")).toBeVisible({ timeout: 25_000 });
+  await expect(fileSection(page, "later.txt")).toBeVisible();
 
   // And once it settles, an unchanged diff is answered 304 rather than swapped
   // — which only holds because the worktree's tree id is stable.
-  await expect.poll(() => polls.filter((s) => s === 304).length, { timeout: 25_000 }).toBeGreaterThan(0);
+  await expect.poll(() => polls.filter((s) => s === 304).length).toBeGreaterThan(0);
 });
 
 test("a comment being written survives the poll", async ({ page }) => {
@@ -281,12 +283,26 @@ test("a comment being written survives the poll", async ({ page }) => {
   const line = page.locator("#review .line").first();
   await line.click();
 
+  // The state chip keeps polling while a compose box is open; the review pane
+  // deliberately stops. Counting the chip's ticks gives the pane real chances to
+  // swap the box out from under the text, which a fixed sleep only assumed.
+  const ticks = pollsOfPath(page, `/cards/${cardId}/state`);
+  const diffPolls = pollsOfPath(page, `/cards/${cardId}/diff`);
+
   const textarea = page.locator(".compose textarea");
   await textarea.fill("half a thought");
 
-  // Long enough for several ticks to have gone by had polling not stopped.
-  await page.waitForTimeout(3_000);
+  // NB: a poll already in flight when the box opened still lands afterwards, so
+  // give that one a tick to arrive before taking the count. Reading it any
+  // earlier makes the assertion below a race rather than a finding.
+  await expect.poll(() => ticks.length).toBeGreaterThan(1);
+  const before = diffPolls.length;
+
+  await expect.poll(() => ticks.length).toBeGreaterThan(5);
   await expect(textarea).toHaveValue("half a thought");
+  // Stronger than the sleep ever was: the pane did not merely leave the text
+  // alone, it issued no further polls at all.
+  expect(diffPolls).toHaveLength(before);
 });
 
 test("the tree jumps to a file instead of reloading the pane", async ({ page }) => {
@@ -410,6 +426,9 @@ test("a review comment goes back to the agent and produces its own turn", async 
   await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
 
   const draft = page.locator("#review .comment", { hasText: "Say hello instead." });
+  // Exactly one: saving is a blur, and `up.submit` swapping the pane fires
+  // another on the outgoing box — which used to post the comment twice.
+  await expect(draft).toHaveCount(1);
   await expect(draft).toBeVisible();
   await expect(draft.locator(".tag")).toHaveText("draft");
   await expect(page.locator("#review .batch-label")).toContainText("pending");
@@ -459,7 +478,7 @@ test("a rebase keeps upstream commits out of the card's diff", async ({ page }) 
   worktreeGit(cardId, "rebase", "main");
 
   // The pane's own poll is what notices; nothing external nudges the server.
-  await expect.poll(() => baseRef(cardId), { timeout: 25_000 }).toBe(upstream);
+  await expect.poll(() => baseRef(cardId)).toBe(upstream);
 
   // The regression this exists for — without the base following the rebase,
   // every upstream file would show up as the card's own work.
@@ -473,19 +492,23 @@ test("merging lands the work on the base branch and retires the card", async ({ 
   await openCard(page, cardId);
   await page.getByRole("button", { name: "Merge" }).click();
 
-  await expect.poll(() => git("rev-parse", "main"), { timeout: 25_000 }).not.toBe(before);
+  await expect.poll(() => git("rev-parse", "main")).not.toBe(before);
 
   // main now carries the agent's work.
   expect(git("show", "main:main.rs")).toContain(TASK);
   expect(git("show", "main:main.rs")).toContain("Say hello instead.");
 
   await page.goto(projectUrl);
-  await expect(cardIn(page, "done", TITLE)).toBeVisible({ timeout: 20_000 });
+  await expect(cardIn(page, "done", TITLE)).toBeVisible({ timeout: SLOW });
 
   // The worktree is pruned, but the turn history is kept. Three turns, not two:
   // the rebase above pulled `upstream.txt` into the worktree, so the snapshot
   // that followed had a tree of its own rather than matching turn 2 and
   // returning `None`.
-  expect(git("worktree", "list")).not.toContain(`worktrees/${cardId}`);
+  // Polled: the merge answers as soon as the branch has moved, and the worktree
+  // is pruned just behind it.
+  await expect
+    .poll(() => git("worktree", "list"), { timeout: SLOW })
+    .not.toContain(`worktrees/${cardId}`);
   expect(turnRefs(cardId)).toHaveLength(3);
 });

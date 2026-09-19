@@ -5,26 +5,15 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::agent::{Agent, Agents};
-use crate::config::Settings;
+use crate::config::{Settings, Timings};
 use crate::db::Db;
 use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
 use crate::review::DiffCache;
 
-/// How long the TUI needs before it will accept pasted input.
-///
-/// NB: a timer rather than a `SessionStart` hook, because that event only
-/// accepts `command` and `mcp_tool` handlers — an HTTP hook there never fires.
-const READY_DELAY: Duration = Duration::from_millis(2500);
-
-/// How long to wait after the opening prompt for *any* hook to come back before
-/// concluding our URLs are not reaching us.
-const HOOK_GRACE: Duration = Duration::from_secs(15);
-
-/// How long to wait for a resumed session to prove itself one way or the other.
+/// How often a resumed session is re-checked while it proves itself.
 const RESUME_POLL: Duration = Duration::from_millis(100);
-const RESUME_CHECKS: u32 = 50;
 
 /// How long to keep retrying the opening prompt while a modal holds the keyboard.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -37,6 +26,8 @@ pub fn start(
     settings: &Settings,
     card_id: i64,
 ) -> Result<Arc<Agent>> {
+    let timings = settings.timings();
+
     let conn = db.lock();
     let card = Card::find(&conn, card_id).context("no such card")?;
     let project = Project::find(&conn, card.project_id).context("no such project")?;
@@ -82,7 +73,7 @@ pub fn start(
     // written, or one since pruned. `--resume` then exits before drawing
     // anything, which would leave the card unable to start at all, so forget the
     // session and come back without it.
-    if card.session_id.is_some() && !resumed(&agent) {
+    if card.session_id.is_some() && !resumed(&agent, timings) {
         warn!("card {card_id}: the recorded session is gone; starting a fresh one");
         Card::clear_session_id(&db.lock(), card_id);
 
@@ -103,7 +94,7 @@ pub fn start(
 
     let started = agent.clone();
     let db = db.clone();
-    std::thread::spawn(move || deliver_opening_prompt(db, started, card_id));
+    std::thread::spawn(move || deliver_opening_prompt(db, started, card_id, timings));
 
     Ok(agent)
 }
@@ -114,8 +105,9 @@ pub fn start(
 /// without drawing anything when it was not, so the two outcomes are told apart
 /// as soon as either shows — no waiting out the whole budget on a good start.
 /// An undecided run is treated as fine; the ordinary delivery path handles it.
-fn resumed(agent: &Agent) -> bool {
-    for _ in 0..RESUME_CHECKS {
+fn resumed(agent: &Agent, timings: Timings) -> bool {
+    let checks = timings.resume_timeout.as_millis() / RESUME_POLL.as_millis().max(1);
+    for _ in 0..checks {
         if !agent.is_running() {
             return false;
         }
@@ -133,8 +125,12 @@ fn resumed(agent: &Agent) -> bool {
 /// or the consent dialog `bypassPermissions` shows the first time. Those are the
 /// user's to answer in the terminal pane, so the card reports that it is waiting
 /// on them rather than forcing an answer.
-fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64) {
-    std::thread::sleep(READY_DELAY);
+///
+/// NB: the readiness wait is a timer rather than a `SessionStart` hook, because
+/// that event only accepts `command` and `mcp_tool` handlers — an HTTP hook
+/// there never fires.
+fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64, timings: Timings) {
+    std::thread::sleep(timings.ready_delay);
 
     let mut waited = Duration::ZERO;
     loop {
@@ -157,8 +153,8 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64) {
             warn!("card {card_id}: could not deliver the opening prompt; the terminal is blocked");
             return;
         }
-        std::thread::sleep(READY_DELAY);
-        waited += READY_DELAY;
+        std::thread::sleep(timings.ready_delay);
+        waited += timings.ready_delay;
     }
 
     mark_delivered(&db, card_id);
@@ -166,9 +162,10 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64) {
     // Silence past this point means our hook URLs are not reaching us — most
     // likely an `allowedHttpHookUrls` allowlist. Without hooks there are no turn
     // snapshots and no lane transitions, so say so on the card.
-    std::thread::sleep(HOOK_GRACE);
+    std::thread::sleep(timings.hook_grace);
     if agent.is_running() && hook_events(&db, card_id) == 0 {
-        warn!("card {card_id}: no hooks received within {HOOK_GRACE:?}");
+        let grace = timings.hook_grace;
+        warn!("card {card_id}: no hooks received within {grace:?}");
         set_state(&db, card_id, AgentState::Misconfigured);
     }
 }
