@@ -27,12 +27,14 @@ It cannot pay for that footgun at this suite's size.
 
 - **Never add `page.waitForTimeout`.** Wait on something observable: an
   assertion, `expect.poll`, or `pollsOfPath()` from `tests/support/board.mjs`
-  when the point is that *nothing* happened. Counting real poll ticks proves
-  the server had the opportunity to misbehave; a sleep only proves the number
-  was big enough.
+  when the point is that *nothing* happened. Nothing polls any more, so the
+  clock to count against is *changes*: make one, wait for it to land, and assert
+  the fragment fetched itself exactly once more. That proves an update arrives
+  only when something asked for it; a sleep only proves the number was big
+  enough.
 - **Server timings are settings, not consts.** A new `thread::sleep` in
   `src/agent/` without a matching `Settings` field is a review failure — see
-  `poll_interval` and `Timings` in `src/config.rs`, and `AGENT_TIMINGS` in
+  `Timings` and `watch_debounce` in `src/config.rs`, and `AGENT_TIMINGS` in
   `playwright.config.mjs` for what the suite sets them to. If you are tempted to
   sleep a test out past a server delay, add the knob instead.
 - **Don't assert on the agent's banner line.** It is the first thing the fake

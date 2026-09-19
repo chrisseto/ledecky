@@ -19,8 +19,13 @@ const CAPACITY: usize = 64;
 /// immutable commits, so an entry can never go stale and there is no
 /// invalidation to get wrong. Entries are dropped when a card is torn down, and
 /// otherwise when the cache is full.
+/// Cloned into the worktree watcher, which invalidates a card's head from a
+/// thread of its own. Otherwise shared exactly as Rocket managed state.
+#[derive(Default, Clone)]
+pub struct DiffCache(Arc<Store>);
+
 #[derive(Default)]
-pub struct DiffCache {
+struct Store {
     entries: Mutex<Vec<(Key, Arc<Vec<ParsedFile>>)>>,
     stats: Mutex<Vec<(Key, Stat)>>,
     heads: Mutex<HashMap<i64, (Instant, String)>>,
@@ -76,6 +81,7 @@ impl DiffCache {
         };
 
         if let Some(hit) = self
+            .0
             .stats
             .lock()
             .ok()
@@ -90,7 +96,7 @@ impl DiffCache {
             deletions,
         };
 
-        if let Ok(mut stats) = self.stats.lock() {
+        if let Ok(mut stats) = self.0.stats.lock() {
             stats.push((key, stat));
             let overflow = stats.len().saturating_sub(CAPACITY);
             stats.drain(..overflow);
@@ -111,7 +117,7 @@ impl DiffCache {
         ttl: Duration,
         compute: impl FnOnce() -> Option<String>,
     ) -> Option<String> {
-        let Ok(mut heads) = self.heads.lock() else {
+        let Ok(mut heads) = self.0.heads.lock() else {
             return compute();
         };
 
@@ -127,7 +133,7 @@ impl DiffCache {
     }
 
     fn lookup(&self, key: &Key) -> Option<Arc<Vec<ParsedFile>>> {
-        let entries = self.entries.lock().ok()?;
+        let entries = self.0.entries.lock().ok()?;
         entries
             .iter()
             .find(|(k, _)| k == key)
@@ -135,7 +141,7 @@ impl DiffCache {
     }
 
     fn insert(&self, key: Key, parsed: Arc<Vec<ParsedFile>>) {
-        let Ok(mut entries) = self.entries.lock() else {
+        let Ok(mut entries) = self.0.entries.lock() else {
             return;
         };
 
@@ -149,10 +155,10 @@ impl DiffCache {
     /// Drops everything belonging to a repository, for when a card's worktree and
     /// refs go away.
     pub fn forget(&self, repo: &Path) {
-        if let Ok(mut entries) = self.entries.lock() {
+        if let Ok(mut entries) = self.0.entries.lock() {
             entries.retain(|(k, _)| k.repo != repo);
         }
-        if let Ok(mut stats) = self.stats.lock() {
+        if let Ok(mut stats) = self.0.stats.lock() {
             stats.retain(|(k, _)| k.repo != repo);
         }
     }
@@ -166,7 +172,7 @@ impl DiffCache {
     /// what the card already carried, where the chip would otherwise keep
     /// reporting its pre-rebase numbers until teardown.
     pub fn forget_stats(&self, repo: &Path, from: &str) {
-        if let Ok(mut stats) = self.stats.lock() {
+        if let Ok(mut stats) = self.0.stats.lock() {
             stats.retain(|(k, _)| !(k.repo == repo && k.from == from));
         }
     }
@@ -174,7 +180,7 @@ impl DiffCache {
     /// Drops a card's memoised head, so the next read sees the worktree it
     /// actually has — or notices that it no longer has one.
     pub fn forget_head(&self, card_id: i64) {
-        if let Ok(mut heads) = self.heads.lock() {
+        if let Ok(mut heads) = self.0.heads.lock() {
             heads.remove(&card_id);
         }
     }
@@ -211,6 +217,7 @@ mod tests {
         let cache = DiffCache::default();
         let push = |repo: &str, from: &str, to: &str| {
             cache
+                .0
                 .stats
                 .lock()
                 .unwrap()
@@ -222,7 +229,7 @@ mod tests {
 
         cache.forget_stats(Path::new("/srv/repo"), "refs/ledecky/1/base");
 
-        let stats = cache.stats.lock().unwrap();
+        let stats = cache.0.stats.lock().unwrap();
         let left: Vec<_> = stats.iter().map(|(k, _)| k.to.as_str()).collect();
         // Another card in the same repo, and the same card in another, both stay.
         assert_eq!(left, ["bbb", "ccc"]);
@@ -234,7 +241,7 @@ mod tests {
         cache.insert(key("/srv/repo", "aaa", "bbb"), parsed());
         cache.insert(key("/srv/repo", "aaa", "bbb"), parsed());
 
-        assert_eq!(cache.entries.lock().unwrap().len(), 1);
+        assert_eq!(cache.0.entries.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -244,7 +251,7 @@ mod tests {
             cache.insert(key("/srv/repo", "base", &i.to_string()), parsed());
         }
 
-        let entries = cache.entries.lock().unwrap();
+        let entries = cache.0.entries.lock().unwrap();
         assert_eq!(entries.len(), CAPACITY);
         // The earliest are gone; the most recent survive.
         assert_eq!(entries.first().unwrap().0.to, "10");

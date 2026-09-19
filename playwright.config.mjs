@@ -1,7 +1,5 @@
 import { defineConfig } from "@playwright/test";
 
-export const POLL_INTERVAL = 250;
-
 /**
  * How long to allow an assertion that is slower than the default on purpose.
  *
@@ -42,6 +40,10 @@ export const AGENT_TIMINGS = {
   // server gives up on a dialog that was merely slow to be read off the pty,
   // and answering it then resumes nothing.
   LEDECKY_DIALOG_GRACE: "2500",
+  // How long a burst of worktree writes settles for before the diff is
+  // announced as moved. Shrunk so a spec that edits a worktree is not waiting
+  // out a debounce meant for an agent writing a whole tree.
+  LEDECKY_WATCH_DEBOUNCE: "25",
 };
 
 export default defineConfig({

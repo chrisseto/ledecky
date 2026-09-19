@@ -1,18 +1,21 @@
 {#
-  The pane polls itself, so anything the reader is part-way through has to
-  survive a swap: `up-scroll="keep"` holds the diff where it was, and app.js
-  stops the poll outright while a comment or this menu is open.
+  Redrawn only when the worktree actually moves, and by morphing — so the diff
+  stays where it was scrolled to, and a comment being typed keeps its text and
+  its place. `hx-get` is this same view, so an update never changes the range.
+
+  One request queue for the whole pane, keyed on `#review`: a click replaces
+  whatever is in flight, and the pane's own update *drops* rather than replaces
+  — it was issued against the range the reader has just left, and letting it
+  land would undo the click. Nothing is lost by dropping it: the click's own
+  response is rendered after the change that announced itself.
 #}
 <div class="review" id="review" data-card="{{ card.id }}"
      data-scope="{{ scope }}" data-expand="{{ expand }}"
      data-additions="{{ additions }}" data-deletions="{{ deletions }}"
      data-has-diff="{{ 1 if has_diff else 0 }}"
-     up-poll up-interval="{{ poll_interval }}" up-source="{{ source }}"
-     {# Single-quoted: the digest substituted in carries its own double quotes,
-        as an ETag must. Only set when the pane is the whole response — inside
-        the board page the placeholder would take that page's digest, which this
-        poll could never match. #}
-     up-scroll="keep" {% if etag %}up-etag='{{ etag }}'{% endif %}>
+     hx-get="{{ source }}"
+     hx-trigger="diff from:body, reload from:body"
+     hx-swap="outerMorph" hx-sync="#review:drop">
   <nav class="tree">
     <div class="tree-head">
       {# One list of points in history, newest first; the toggle beside it picks
@@ -26,7 +29,8 @@
           <p class="menu-head">Measure from</p>
           {% for option in scopes %}
             <a class="menu-item anchor-{{ option.kind }} {% if option.selected %}on{% endif %}"
-               href="{{ option.href }}" up-follow up-target="#review" up-scroll="keep">
+               href="{{ option.href }}"
+               hx-get="{{ option.href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
               <span class="dot"></span>{{ option.label }}
             </a>
           {% endfor %}
@@ -37,7 +41,7 @@
         {% for option in modes %}
           {% if option.available %}
             <a class="mode {% if option.selected %}on{% endif %}" href="{{ option.href }}"
-               up-follow up-target="#review" up-scroll="keep">{{ option.label }}</a>
+               hx-get="{{ option.href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">{{ option.label }}</a>
           {% else %}
             <span class="mode" aria-disabled="true">{{ option.label }}</span>
           {% endif %}
@@ -46,7 +50,7 @@
     </div>
 
     {# Every file is already on the page, so these only have to jump to one. #}
-    <div class="tree-body">
+    <x-file-tree class="tree-body">
       {% for group in tree %}
         {% if group.dir %}
           <details class="dir" open>
@@ -73,7 +77,7 @@
 
         {% if group.dir %}</details>{% endif %}
       {% endfor %}
-    </div>
+    </x-file-tree>
 
     {% if turn_note or last_message %}
       <div class="tree-foot">
@@ -89,14 +93,14 @@
   </nav>
 
   <div class="diff">
-    {# The pane's one scroller. Named so unpoly can put it back after a swap,
-       and so the tree has somewhere to scroll to. #}
-    <div class="lines" id="diff-lines" up-viewport>
+    {# The pane's one scroller. Morph matches it by id and never replaces it,
+       which is what holds the scroll position; the tree scrolls to it too. #}
+    <div class="lines" id="diff-lines">
       {% for file in files %}
         <section class="file" id="file-{{ file.index }}" data-path="{{ file.path }}">
           <header class="file-head">
             <form method="post" action="/cards/{{ card.id }}/viewed"
-                  up-submit up-target="#review" up-scroll="keep">
+                  hx-post="/cards/{{ card.id }}/viewed" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
               <input type="hidden" name="file_path" value="{{ file.path }}" />
               <input type="hidden" name="scope" value="{{ scope }}" />
               <input type="hidden" name="expand" value="{{ expand }}" />
@@ -112,7 +116,7 @@
 
             {% if file.expand_all_href %}
               <a class="btn small" href="{{ file.expand_all_href }}"
-                 up-follow up-target="#review" up-scroll="keep">Expand whole file</a>
+                 hx-get="{{ file.expand_all_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">Expand whole file</a>
             {% endif %}
 
             <span class="stat mono">
@@ -124,7 +128,7 @@
           {% if file.viewed %}
             <div class="collapsed">
               <form method="post" action="/cards/{{ card.id }}/viewed"
-                    up-submit up-target="#review" up-scroll="keep">
+                    hx-post="/cards/{{ card.id }}/viewed" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
                 <input type="hidden" name="file_path" value="{{ file.path }}" />
                 <input type="hidden" name="scope" value="{{ scope }}" />
                 <input type="hidden" name="expand" value="{{ expand }}" />
@@ -136,7 +140,7 @@
           {% elif file.held_back %}
             <div class="collapsed">
               <a class="btn" href="{{ file.show_href }}"
-                 up-follow up-target="#review" up-scroll="keep">
+                 hx-get="{{ file.show_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
                 {{ file.held_back }} lines — held back so the rest stays quick. Show it.
               </a>
             </div>
@@ -147,17 +151,22 @@
               {% if hunk.above %}
                 <div class="expander">
                   <a href="{{ hunk.above.step_href }}"
-                     up-follow up-target="#review" up-scroll="keep">
+                     hx-get="{{ hunk.above.step_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
                     {{ icon("chevron-up") }} Expand {{ hunk.above.step }} lines above
                   </a>
                   <a class="all" href="{{ hunk.above.all_href }}"
-                     up-follow up-target="#review" up-scroll="keep">all {{ hunk.above.lines }}</a>
+                     hx-get="{{ hunk.above.all_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">all {{ hunk.above.lines }}</a>
                 </div>
               {% endif %}
 
               {% for line in hunk.lines %}
-                <div class="line l-{{ line.kind }}"
-                     data-file="{{ file.path }}" data-anchor="{{ line.anchor }}">
+                {% set key = file.path ~ "#" ~ line.anchor %}
+                {# Clicking a line opens its box; clicking it again closes it.
+                   Both are the same view with one query parameter changed. #}
+                <div class="line l-{{ line.kind }} {% if comment == key %}commenting{% endif %}"
+                     data-file="{{ file.path }}" data-anchor="{{ line.anchor }}"
+                     hx-get="{% if comment == key %}{{ comment_base }}{% else %}{{ comment_base }}&comment={{ key | urlencode }}{% endif %}"
+                     hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
                   <span class="add">+</span>
                   <span class="n">{{ line.old_line if line.old_line else "" }}</span>
                   <span class="n">{{ line.new_line if line.new_line else "" }}</span>
@@ -165,7 +174,24 @@
                   <span class="code">{{ line.html | safe }}</span>
                 </div>
 
-                {% set key = file.path ~ "#" ~ line.anchor %}
+                {% if comment == key %}
+                  <form class="compose" method="post" action="/cards/{{ card.id }}/comments"
+                        hx-post="/cards/{{ card.id }}/comments" hx-target="#review"
+                        hx-swap="outerMorph" hx-sync="#review:replace">
+                    <input type="hidden" name="file_path" value="{{ comment_file }}" />
+                    <input type="hidden" name="side" value="{{ comment_side }}" />
+                    <input type="hidden" name="line" value="{{ comment_line }}" />
+                    <input type="hidden" name="scope" value="{{ scope }}" />
+                    <input type="hidden" name="expand" value="{{ expand }}" />
+                    <textarea name="body" rows="3" data-autofocus
+                              placeholder="Comment on this line — click away to save"></textarea>
+                    {# What Escape and an emptied box both reach for. #}
+                    <a class="cancel" href="{{ comment_base }}" data-cancel-comment
+                       hx-get="{{ comment_base }}" hx-target="#review"
+                       hx-swap="outerMorph" hx-sync="#review:replace">Cancel</a>
+                  </form>
+                {% endif %}
+
                 {% if threads[key] %}
                   <div class="thread">
                     {% for comment in threads[key] %}
@@ -176,7 +202,7 @@
                             <span class="tag">draft</span>
                             <form method="post"
                                   action="/cards/{{ card.id }}/comments/{{ comment.id }}/delete"
-                                  up-submit up-target="#review" up-scroll="keep">
+                                  hx-post="/cards/{{ card.id }}/comments/{{ comment.id }}/delete" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
                               <input type="hidden" name="scope" value="{{ scope }}" />
                               <input type="hidden" name="expand" value="{{ expand }}" />
                               <button class="link" type="submit">Remove</button>
@@ -194,11 +220,11 @@
               {% if hunk.below %}
                 <div class="expander">
                   <a href="{{ hunk.below.step_href }}"
-                     up-follow up-target="#review" up-scroll="keep">
+                     hx-get="{{ hunk.below.step_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
                     {{ icon("chevron-down") }} Expand {{ hunk.below.step }} lines below
                   </a>
                   <a class="all" href="{{ hunk.below.all_href }}"
-                     up-follow up-target="#review" up-scroll="keep">all {{ hunk.below.lines }}</a>
+                     hx-get="{{ hunk.below.all_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">all {{ hunk.below.lines }}</a>
                 </div>
               {% endif %}
             {% endfor %}
@@ -230,7 +256,7 @@
 
       {% if drafts %}
         <form method="post" action="/cards/{{ card.id }}/comments/discard"
-              up-submit up-target="#review" up-scroll="keep">
+              hx-post="/cards/{{ card.id }}/comments/discard" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
           <input type="hidden" name="scope" value="{{ scope }}" />
           <input type="hidden" name="expand" value="{{ expand }}" />
           <button class="btn" type="submit">Discard</button>
@@ -238,7 +264,7 @@
       {% endif %}
 
       <form method="post" action="/cards/{{ card.id }}/review"
-            up-submit up-target="#review" up-scroll="keep">
+            hx-post="/cards/{{ card.id }}/review" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
         <input type="hidden" name="scope" value="{{ scope }}" />
         <input type="hidden" name="expand" value="{{ expand }}" />
         <button class="btn accent" type="submit" {% if not drafts %}disabled{% endif %}>
@@ -247,16 +273,15 @@
         </button>
       </form>
     </footer>
-
-    <form class="compose" hidden method="post" action="/cards/{{ card.id }}/comments"
-          up-submit up-target="#review" up-scroll="keep">
-      <input type="hidden" name="file_path" />
-      <input type="hidden" name="side" />
-      <input type="hidden" name="line" />
-      <input type="hidden" name="scope" value="{{ scope }}" />
-      <input type="hidden" name="expand" value="{{ expand }}" />
-      <textarea name="body" rows="3"
-                placeholder="Comment on this line — click away to save"></textarea>
-    </form>
   </div>
 </div>
+
+{% if standalone %}
+  {# The review tab's stat sits outside this fragment, so it comes back beside
+     it rather than inside it. #}
+  <span class="stat mono" id="tab-stat" hx-swap-oob="outerMorph"
+        {% if not has_diff %}hidden{% endif %}>
+    <span class="adds">+{{ additions }}</span>
+    <span class="dels">−{{ deletions }}</span>
+  </span>
+{% endif %}

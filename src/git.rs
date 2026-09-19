@@ -1,5 +1,6 @@
-use std::path::Path;
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Result};
 
@@ -21,6 +22,50 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
+}
+
+/// Whether every one of `paths` is ignored by the worktree's own rules.
+///
+/// What a build writes is not work anyone is reviewing, and it arrives in the
+/// thousands — so a burst that is entirely `target/` or `node_modules/` should
+/// not cost a restage, let alone one per reader.
+///
+/// NB: not `run`. `check-ignore` exits 1 to say "nothing matched", which is an
+/// answer rather than a failure. It also consults the index, so a tracked file
+/// is never reported ignored however the rules read — which errs towards
+/// announcing, the safe direction.
+pub fn all_ignored(worktree: &Path, paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+
+    let mut child = match Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["check-ignore", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        for path in paths {
+            if writeln!(stdin, "{}", path.display()).is_err() {
+                return false;
+            }
+        }
+    }
+
+    let Ok(out) = child.wait_with_output() else {
+        return false;
+    };
+
+    // One line back per ignored path, so all of them means all of them.
+    out.stdout.iter().filter(|b| **b == b'\n').count() == paths.len()
 }
 
 /// Local branches, with the checked-out one first so it can be the form default.
@@ -384,6 +429,28 @@ mod tests {
         .unwrap();
 
         (settings, repo)
+    }
+
+    /// What a build writes must not read as work to review, and one real edit
+    /// among it must not be lost either.
+    #[test]
+    fn a_burst_counts_as_a_build_only_when_every_path_is_ignored() {
+        let (_settings, repo) = scratch("ignored");
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        run(&repo, &["add", "-A"]).unwrap();
+        run(&repo, &["commit", "-qm", "ignore build output"]).unwrap();
+
+        let artefact = repo.join("target/debug/out.o");
+        std::fs::create_dir_all(artefact.parent().unwrap()).unwrap();
+        std::fs::write(&artefact, "").unwrap();
+
+        assert!(all_ignored(&repo, &[artefact.clone()]));
+
+        // One tracked file in the burst is enough to make it real.
+        assert!(!all_ignored(&repo, &[artefact, repo.join("a.txt")]));
+
+        // Nothing at all is not a build; saying so would swallow the burst.
+        assert!(!all_ignored(&repo, &[]));
     }
 
     /// The premise the diff cache and every `304` rest on: an unchanged

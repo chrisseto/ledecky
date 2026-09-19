@@ -1,5 +1,15 @@
-@import "unpoly/unpoly.css";
 @import "@xterm/xterm/css/xterm.css";
+
+/* Came from unpoly's stylesheet, which this replaced; several things here
+   still lean on it:
+   `.compose`, `.combo-menu`, `.empty-match` and `#tab-stat` are all shown and
+   hidden by the attribute alone, against rules that set `display` themselves.
+   Doubling the selector is what outweighs them. */
+[hidden][hidden] { display: none !important; }
+
+/* Custom elements are inline by default; these stand in for the divs they
+   replaced. The classes beside them carry the rest of the layout. */
+x-sortable-lane, x-terminal, x-file-tree, x-drawer-card { display: block; }
 
 /* Only the latin cuts are pulled in; the app is a local tool and the rest is
    weight nobody here loads. */

@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { AGENT_TIMINGS, POLL_INTERVAL } from "../../playwright.config.mjs";
+import { AGENT_TIMINGS } from "../../playwright.config.mjs";
 
 export const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -64,7 +64,6 @@ export async function boot({ root, agentBin } = {}) {
       XDG_DATA_HOME: join(root, "data"),
       LEDECKY_AGENT_BIN:
         agentBin ?? process.env.LEDECKY_AGENT_BIN ?? join(PROJECT, "tests/fake-agent.mjs"),
-      LEDECKY_POLL_INTERVAL: String(POLL_INTERVAL),
       ...AGENT_TIMINGS,
     },
     stdio: ["ignore", "pipe", "inherit"],

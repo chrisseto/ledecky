@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 use crate::agent::session;
 use crate::config::{Settings, Timings};
 use crate::db::Db;
+use crate::events::Changes;
 use crate::project::Card;
 
 const DEFAULT_ROWS: u16 = 40;
@@ -303,6 +304,7 @@ impl Agents {
     pub fn spawn(
         &self,
         db: &Db,
+        changes: &Changes,
         settings: &Settings,
         card: &Card,
         worktree: &Path,
@@ -399,7 +401,8 @@ impl Agents {
         let pumped = agent.clone();
         let db = db.clone();
         let card_id = card.id;
-        std::thread::spawn(move || pump(reader, pumped, db, card_id));
+        let changes = changes.clone();
+        std::thread::spawn(move || pump(reader, pumped, db, changes, card_id));
 
         Ok(agent)
     }
@@ -460,7 +463,13 @@ fn history_bytes(screen: &mut vt100::Screen, client_rows: Option<u16>) -> Vec<u8
 /// The watcher lives here because there is no hook for a permission being
 /// answered: the redraw that takes the dialog away is the only signal, and this
 /// is the only place it is seen.
-fn pump(mut reader: Box<dyn Read + Send>, agent: Arc<Agent>, db: Db, card_id: i64) {
+fn pump(
+    mut reader: Box<dyn Read + Send>,
+    agent: Arc<Agent>,
+    db: Db,
+    changes: Changes,
+    card_id: i64,
+) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -470,7 +479,7 @@ fn pump(mut reader: Box<dyn Read + Send>, agent: Arc<Agent>, db: Db, card_id: i6
                 agent.screen.lock().unwrap().process(&chunk);
 
                 if agent.watch_dialog() {
-                    session::resume_after_dialog(&db, card_id);
+                    session::resume_after_dialog(&db, &changes, card_id);
                 }
 
                 // No subscribers is the normal case when nobody has the card open.

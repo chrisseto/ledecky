@@ -147,10 +147,10 @@ test("a terminal opened behind the review tab still fits its own pane", async ({
 
   await page.locator('label[for="tab-agent"]').click();
 
-  const rows = page.locator("div[data-terminal] .xterm-rows");
+  const rows = terminalRows(page);
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });
 
-  const box = await page.locator("div[data-terminal]").boundingBox();
+  const box = await terminal(page).boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   for (let i = 0; i < 20; i++) await page.mouse.wheel(0, -600);
 
@@ -263,46 +263,58 @@ test("a commit the agent made is a point of its own in the picker", async ({ pag
 });
 
 test("the pane keeps up with the worktree on its own", async ({ page }) => {
-  const polls = pollsOfPath(page, `/cards/${cardId}/diff`);
+  const refetches = pollsOfPath(page, `/cards/${cardId}/diff`);
   await openCard(page, cardId);
   await expect(page.locator("#review .file").first()).toBeVisible();
 
   editWorktree(cardId, "later.txt", "arrived while the drawer was open\n");
 
-  // No reload: the pane polls its own URL.
+  // No reload: the worktree watcher announces the write and the pane fetches
+  // itself in answer.
   await expect(fileSection(page, "later.txt")).toBeVisible();
 
-  // And once it settles, an unchanged diff is answered 304 rather than swapped
-  // — which only holds because the worktree's tree id is stable.
-  await expect.poll(() => polls.filter((s) => s === 304).length).toBeGreaterThan(0);
+  // One fetch per change rather than one per tick. A second write moves the
+  // pane again, and the single fetch between the two is the whole contract:
+  // nothing arrives that a change did not ask for.
+  const afterFirst = refetches.length;
+  editWorktree(cardId, "later-still.txt", "and another\n");
+  await expect(fileSection(page, "later-still.txt")).toBeVisible();
+  expect(refetches).toHaveLength(afterFirst + 1);
 });
 
-test("a comment being written survives the poll", async ({ page }) => {
+test("a comment being written survives an update to the diff", async ({ page }) => {
   await openCard(page, cardId);
 
   const line = page.locator("#review .line").first();
   await line.click();
 
-  // The state chip keeps polling while a compose box is open; the review pane
-  // deliberately stops. Counting the chip's ticks gives the pane real chances to
-  // swap the box out from under the text, which a fixed sleep only assumed.
-  const ticks = pollsOfPath(page, `/cards/${cardId}/state`);
-  const diffPolls = pollsOfPath(page, `/cards/${cardId}/diff`);
-
   const textarea = page.locator(".compose textarea");
   await textarea.fill("half a thought");
 
-  // NB: a poll already in flight when the box opened still lands afterwards, so
-  // give that one a tick to arrive before taking the count. Reading it any
-  // earlier makes the assertion below a race rather than a finding.
-  await expect.poll(() => ticks.length).toBeGreaterThan(1);
-  const before = diffPolls.length;
+  // The box is anchored in the pane's own URL, so the update this write
+  // triggers redraws it in place rather than arriving without it. Morphing is
+  // what keeps the half-typed text.
+  editWorktree(cardId, "during-comment.txt", "written while a comment was open\n");
+  await expect(fileSection(page, "during-comment.txt")).toBeVisible();
 
-  await expect.poll(() => ticks.length).toBeGreaterThan(5);
   await expect(textarea).toHaveValue("half a thought");
-  // Stronger than the sleep ever was: the pane did not merely leave the text
-  // alone, it issued no further polls at all.
-  expect(diffPolls).toHaveLength(before);
+  // Stronger than a sleep ever was: the pane did not merely leave the text
+  // alone, it redrew underneath it and the box came back with it.
+  await expect(page.locator(".compose")).toBeVisible();
+});
+
+test("Escape throws a comment away rather than filing it", async ({ page }) => {
+  await openCard(page, cardId);
+
+  await page.locator("#review .line").first().click();
+  await page.locator(".compose textarea").fill("thought better of it");
+
+  // Blurring is what files a draft, and Escape blurs on its way out — so the
+  // box closing is not on its own proof that the text went with it.
+  await page.keyboard.press("Escape");
+
+  await expect(page.locator(".compose")).toHaveCount(0);
+  await expect(page.locator("#review .comment", { hasText: "thought better of it" })).toHaveCount(0);
 });
 
 test("the tree jumps to a file instead of reloading the pane", async ({ page }) => {
@@ -343,9 +355,9 @@ test("every link out of the pane carries a usable query", async ({ page }) => {
   );
   expect(hrefs.filter((href) => href.includes("amp;"))).toEqual([]);
 
-  // The pane polls this one, so a dropped parameter would reset the range on
-  // every tick rather than just on a click.
-  const source = await page.locator("#review").getAttribute("up-source");
+  // The pane refetches this one, so a dropped parameter would reset the range
+  // on every update rather than just on a click.
+  const source = await page.locator("#review").getAttribute("hx-get");
   expect(source).not.toContain("amp;");
   expect(source).toContain("scope=");
 });

@@ -245,6 +245,19 @@ impl Card {
         .unwrap_or_default()
     }
 
+    /// The cards on a board that still have a worktree, as `(id, path)`.
+    pub fn live_worktrees(conn: &Connection, project_id: i64) -> Vec<(i64, String)> {
+        conn.prepare(
+            "SELECT id, worktree_path FROM cards
+             WHERE project_id = ?1 AND worktree_path IS NOT NULL",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default()
+    }
+
     pub fn create(conn: &Connection, new: NewCard<'_>) -> rusqlite::Result<i64> {
         let position: f64 = conn
             .query_row(

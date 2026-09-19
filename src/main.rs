@@ -4,11 +4,13 @@ extern crate rocket;
 mod agent;
 mod config;
 mod db;
+mod events;
 mod git;
 mod hooks;
 mod project;
 mod review;
 mod tmpl;
+mod watch;
 
 use anyhow::Context;
 use rocket::fairing::AdHoc;
@@ -40,14 +42,27 @@ fn rocket() -> _ {
     // A previous run may have been killed without getting to its shutdown hook.
     agent::session::sweep_orphans(&db, &settings);
 
+    // The watcher needs its own handles on both, so they are built here rather
+    // than inline in `manage`.
+    let cache = review::DiffCache::default();
+    let changes = events::Changes::default();
+    let worktrees = watch::Worktrees::new(
+        cache.clone(),
+        changes.clone(),
+        std::time::Duration::from_millis(settings.watch_debounce),
+    );
+
     rocket
         .manage(settings)
         .manage(db)
         .manage(templates)
         .manage(agent::Agents::default())
-        .manage(review::DiffCache::default())
+        .manage(cache)
         .manage(hooks::HookAuth::new())
+        .manage(changes)
+        .manage(worktrees)
         .mount("/static", FileServer::from("static"))
+        .mount("/", rocket::routes![events::stream])
         .mount("/", project::routes())
         .mount("/", agent::routes())
         .mount("/", review::routes())

@@ -165,29 +165,43 @@ test("deleting a card removes it from the board", async ({ page }) => {
   await expect(cardIn(page, "todo", "Second card")).toHaveCount(0);
 });
 
-test("a poll that finds nothing new leaves the board alone", async ({ page }) => {
-  const polls = pollsOf(page, projectUrl);
+test("the board fetches once per change and not otherwise", async ({ page }) => {
+  const refetches = pollsOf(page, projectUrl);
+  const streams = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/events") streams.push(request.url());
+  });
 
   await page.goto(projectUrl);
-  await expect(cardIn(page, "todo", "Third card")).toBeVisible();
+  const card = cardIn(page, "todo", "Third card");
+  await expect(card).toBeVisible();
+  const id = await card.getAttribute("data-card-id");
 
-  // Server-rendered, so even the first poll carries an If-None-Match.
-  await expect(page.locator("#board")).toHaveAttribute("up-etag", /^".+"$/);
+  // One connection carries every update, and opening it costs a single resync
+  // — so a page rendered just before its stream came up cannot be left stale.
+  await expect.poll(() => streams.length).toBe(1);
+  await expect.poll(() => refetches.length).toBe(1);
 
   await page.evaluate(() => {
     window.__board = document.querySelector("#board");
-    window.__card = document.querySelector("#board .card");
   });
 
-  // Asserting the count too, so the test cannot pass by polling never firing.
-  await expect.poll(() => polls.length).toBeGreaterThanOrEqual(3);
-  expect(polls).toEqual(polls.map(() => 304));
+  // Each change costs exactly one more fetch, and the awaited round trips
+  // between them are real elapsed time — so anything left on a timer would show
+  // up here as a count that climbed on its own.
+  await moveCard(page, id, "in_review", 0);
+  await expect(cardIn(page, "in_review", "Third card")).toBeVisible();
+  expect(refetches).toHaveLength(2);
 
-  const kept = await page.evaluate(() => window.__board.isConnected && window.__card.isConnected);
-  expect(kept).toBe(true);
+  await moveCard(page, id, "todo", 0);
+  await expect(cardIn(page, "todo", "Third card")).toBeVisible();
+  expect(refetches).toHaveLength(3);
+
+  expect(streams).toHaveLength(1);
+  expect(await page.evaluate(() => window.__board.isConnected)).toBe(true);
 });
 
-test("a poll picks up a change made elsewhere", async ({ page }) => {
+test("a change made elsewhere arrives unasked", async ({ page }) => {
   await page.goto(projectUrl);
   const id = await cardIn(page, "todo", "Third card").getAttribute("data-card-id");
 
@@ -197,7 +211,7 @@ test("a poll picks up a change made elsewhere", async ({ page }) => {
   await expect(cardIn(page, "in_review", "Third card")).toBeVisible();
 });
 
-test("a swap leaves the cards it did not change alone", async ({ page }) => {
+test("an update leaves the cards it did not change alone", async ({ page }) => {
   await addCard(page, projectUrl, { title: "Neighbour" });
   await page.goto(projectUrl);
 
@@ -210,12 +224,12 @@ test("a swap leaves the cards it did not change alone", async ({ page }) => {
   await moveCard(page, id, "done", 0);
   await expect(cardIn(page, "done", "Neighbour")).toBeVisible();
 
-  // The board really was replaced; `up-keep` is what saved this node.
+  // The board really was redrawn; morphing it by id is what saved this node.
   expect(untouched).not.toBe(`card-${id}`);
   expect(await page.evaluate(() => window.__card.isConnected)).toBe(true);
 });
 
-test("a swap keeps each lane's scroll position", async ({ page }) => {
+test("an update keeps each lane's scroll position", async ({ page }) => {
   await page.goto(projectUrl);
 
   // Shrink the lane rather than seeding filler cards — every spec file shares

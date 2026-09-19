@@ -16,10 +16,14 @@ agent_bin = "claude"
 # up for.
 agent_env = {}
 
-# How often a polled fragment re-checks the server, in milliseconds. Unchanged
-# fragments answer 304 and are not re-rendered, so this is cheap. The end-to-end
-# suite shrinks it so it does not have to wait in real time.
-poll_interval = 4000
+# How long a burst of worktree writes settles for, in milliseconds, before the
+# diff is announced as moved. The end-to-end suite shrinks it.
+watch_debounce = 250
+
+# How long a staged worktree head stays good without the watcher saying
+# otherwise, in milliseconds. A backstop for a missed event, not the mechanism.
+head_ttl = 30000
+
 
 # data_dir defaults to $XDG_DATA_HOME/<app_slug>; set it to override.
 

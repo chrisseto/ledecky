@@ -2,11 +2,17 @@
   <div class="modal-head">
     <h2>Add project</h2>
     <span class="spacer"></span>
-    <a class="btn icon-only" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
-       up-follow up-target="#overlay" aria-label="Close" data-close-overlay>{{ icon("x") }}</a>
+    <a class="btn icon-only" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}" aria-label="Close" data-close-overlay
+       hx-get="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("x") }}</a>
   </div>
 
-  <form method="post" action="/projects" up-submit up-target="body">
+{# NB: `outerHTML`, not a morph. Morphing deliberately preserves what is in an
+   input, and only resets a textarea whose value the reader is not currently in
+   — so "Create more" would hand back the task just submitted, or not, depending
+   on where focus happened to be when the response landed. A form that has to
+   come back empty cannot be merged into. #}
+  <form method="post" action="/projects"
+        hx-post="/projects" hx-target="body" hx-swap="outerHTML" hx-push-url="true">
     {% if project %}<input type="hidden" name="board" value="{{ project.id }}" />{% endif %}
     {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
 
@@ -33,8 +39,8 @@
 
     <footer>
       <span class="spacer"></span>
-      <a class="btn" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
-         up-follow up-target="#overlay" data-close-overlay>Cancel</a>
+      <a class="btn" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}" data-close-overlay
+         hx-get="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">Cancel</a>
       <button class="btn accent" type="submit">{{ icon("check") }} Add project</button>
     </footer>
   </form>

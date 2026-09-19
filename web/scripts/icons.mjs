@@ -1,5 +1,5 @@
 // Copies the icons we actually use out of lucide-static into static/icons/.
-// The server inlines them at render time, so unpoly fragment swaps need no JS re-init.
+// The server inlines them at render time, so a fragment update needs no JS re-init.
 import { mkdir, copyFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";

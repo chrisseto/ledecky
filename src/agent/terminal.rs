@@ -10,11 +10,13 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::agent::{session, Agents};
 use crate::config::Settings;
 use crate::db::Db;
+use crate::events::Changes;
 use crate::hooks::HookAuth;
 use crate::project::board::{self, Shell};
 use crate::project::{Card, Project};
 use crate::review::{self, DiffCache};
 use crate::tmpl::Tmpl;
+use crate::watch::Worktrees;
 
 #[get("/cards/<id>?<scope>")]
 pub fn focus(
@@ -45,15 +47,12 @@ pub fn focus(
     ))
 }
 
-/// Just the agent-state chip, so the focus view can poll it without re-running a
-/// diff every few seconds.
+/// Just the agent-state chip, so a state change redraws it without re-running a
+/// diff behind it.
 #[get("/cards/<id>/state")]
-pub fn state(db: &State<Db>, settings: &State<Settings>, id: i64) -> Result<Tmpl, Status> {
+pub fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
     let card = Card::find(&db.lock(), id).ok_or(Status::NotFound)?;
-    Ok(Tmpl(
-        "_state.html",
-        context! { card, poll_interval => settings.poll_interval },
-    ))
+    Ok(Tmpl("_state.html", context! { card }))
 }
 
 #[post("/cards/<id>/start")]
@@ -62,9 +61,11 @@ pub fn start(
     agents: &State<Agents>,
     auth: &State<HookAuth>,
     settings: &State<Settings>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
     id: i64,
 ) -> Result<Redirect, Status> {
-    match session::start(db, agents, auth, settings, id) {
+    match session::start(db, agents, auth, settings, changes, worktrees, id) {
         // The drawer is what asked, and it has a terminal to put up now.
         Ok(_) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
@@ -75,14 +76,24 @@ pub fn start(
 }
 
 #[post("/cards/<id>/stop")]
-pub fn stop(db: &State<Db>, agents: &State<Agents>, id: i64) -> Redirect {
-    session::stop(db, agents, id);
+pub fn stop(
+    db: &State<Db>,
+    agents: &State<Agents>,
+    changes: &State<Changes>,
+    id: i64,
+) -> Redirect {
+    session::stop(db, agents, changes, id);
     Redirect::to(format!("/cards/{id}"))
 }
 
 #[post("/cards/<id>/merge")]
-pub fn merge(db: &State<Db>, agents: &State<Agents>, id: i64) -> Result<Redirect, Status> {
-    match session::request_merge(db, agents, id) {
+pub fn merge(
+    db: &State<Db>,
+    agents: &State<Agents>,
+    changes: &State<Changes>,
+    id: i64,
+) -> Result<Redirect, Status> {
+    match session::request_merge(db, agents, changes, id) {
         Ok(()) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
             warn!("card {id}: merge request failed: {err:#}");

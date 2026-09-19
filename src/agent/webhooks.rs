@@ -8,9 +8,11 @@ use serde_json::{json, Value};
 use crate::agent::{session, Agents};
 use crate::config::Settings;
 use crate::db::Db;
+use crate::events::{Changes, Kind};
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
 use crate::review::{DiffCache, Turn};
+use crate::watch::Worktrees;
 
 /// Receives Claude Code's HTTP hooks. Always answers 200 with an empty decision:
 /// a hook that blocks or errors would stall the agent, and nothing here is worth
@@ -22,6 +24,8 @@ pub fn receive(
     auth: &State<HookAuth>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
     token: &str,
     card_id: i64,
     event: &str,
@@ -56,20 +60,20 @@ pub fn receive(
     }
 
     match event {
-        "prompt" => session::resume(db, card_id),
+        "prompt" => session::resume(db, changes, card_id),
         // NB: a tool permission, a question, a plan to approve and an MCP
         // elicitation all arrive here — which is why the card says "needs you"
         // rather than naming one of them. Nothing reports the answer, so the
         // terminal watcher is armed here and clears the card once the dialog
         // leaves the screen.
         "needs-user" => {
-            session::await_user(db, card_id);
+            session::await_user(db, changes, card_id);
             if let Some(agent) = agents.get(card_id) {
                 agent.expect_dialog();
             }
         }
-        "stop" => on_stop(db, agents, settings, cache, card_id, &payload),
-        "end" => session::set_state(db, card_id, AgentState::Stopped),
+        "stop" => on_stop(db, agents, settings, cache, changes, worktrees, card_id, &payload),
+        "end" => session::set_state(db, changes, card_id, AgentState::Stopped),
         _ => {}
     }
 
@@ -81,6 +85,8 @@ fn on_stop(
     agents: &Agents,
     settings: &Settings,
     cache: &DiffCache,
+    changes: &Changes,
+    worktrees: &Worktrees,
     card_id: i64,
     payload: &Value,
 ) {
@@ -89,26 +95,33 @@ fn on_stop(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    if let Err(err) = snapshot(db, settings, card_id, last_message) {
-        error!("card {card_id}: snapshotting the turn failed: {err:#}");
+    match snapshot(db, settings, card_id, last_message) {
+        // The turn is a new point in the picker, and its message is what the
+        // pane's footer shows. Nothing else announces it: a commit the agent
+        // made touches only `.git`, which the worktree watcher filters out.
+        Ok(()) => changes.card(db, card_id, Kind::Diff),
+        Err(err) => error!("card {card_id}: snapshotting the turn failed: {err:#}"),
     }
 
     if is_paused(payload) {
         return;
     }
 
-    session::set_state(db, card_id, AgentState::Idle);
+    session::set_state(db, changes, card_id, AgentState::Idle);
 
     let conn = db.lock();
     let lane = Card::find(&conn, card_id).map(|c| c.lane);
     if lane == Some(Lane::InProgress) {
         Card::set_lane(&conn, card_id, Lane::InReview);
+        drop(conn);
+        changes.card(db, card_id, Kind::Board);
+    } else {
+        drop(conn);
     }
-    drop(conn);
 
     // Last, so that a merge landing this turn overrides the lane and state set
     // above with Done and a torn-down worktree.
-    session::check_merge(db, agents, settings, cache, card_id);
+    session::check_merge(db, agents, settings, cache, changes, worktrees, card_id);
 }
 
 /// A non-empty `background_tasks` means the turn ended but work is still in

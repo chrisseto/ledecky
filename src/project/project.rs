@@ -177,7 +177,7 @@ pub fn create(
 }
 
 /// Server-rendered directory autocomplete. Returns just the `<ul>` fragment;
-/// unpoly swaps it in on every keystroke.
+/// htmx swaps it in on every keystroke.
 #[get("/projects/complete?<q>")]
 pub fn complete(q: Option<String>) -> Tmpl {
     let q = q.unwrap_or_default();

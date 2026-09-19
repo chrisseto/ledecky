@@ -1,7 +1,9 @@
-{# `up-keep` compares this element's own markup across a swap: unchanged cards
-   keep their live node, so a change to one card does not disturb the rest. #}
-<article class="card" id="card-{{ card.id }}" up-keep="same-html" data-card-id="{{ card.id }}">
-  <a class="card-open" href="/cards/{{ card.id }}" up-follow up-target="#overlay">
+{# The id is the whole mechanism: morph matches on it, so a card that did not
+   change keeps its live node and a change to one does not disturb the rest. #}
+<article class="card" id="card-{{ card.id }}" data-card-id="{{ card.id }}">
+  <a class="card-open" href="/cards/{{ card.id }}"
+     hx-get="/cards/{{ card.id }}" hx-target="#overlay" hx-select="#overlay"
+     hx-swap="outerMorph" hx-push-url="true">
     {{ card.title or card.task }}
   </a>
 

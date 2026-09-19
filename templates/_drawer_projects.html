@@ -4,10 +4,10 @@
     <span class="spacer"></span>
 
     <a class="btn accent" href="/projects/new{% if project %}?board={{ project.id }}{% endif %}"
-       up-follow up-target="#overlay">{{ icon("plus") }} Add project</a>
+       hx-get="/projects/new{% if project %}?board={{ project.id }}{% endif %}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("plus") }} Add project</a>
 
-    <a class="btn icon-only" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}"
-       up-follow up-target="#overlay" aria-label="Close" data-close-overlay>{{ icon("x") }}</a>
+    <a class="btn icon-only" href="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}" aria-label="Close" data-close-overlay
+       hx-get="{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("x") }}</a>
   </div>
 
   <div class="project-list">

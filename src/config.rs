@@ -35,9 +35,14 @@ pub struct Settings {
     /// suite, to tell its stand-in how long to pretend to start up for.
     pub agent_env: HashMap<String, String>,
 
-    /// How often, in milliseconds, a polled fragment re-checks the server.
-    /// Overridable so the end-to-end suite does not have to wait in real time.
-    pub poll_interval: u64,
+    /// How long to let a burst of worktree writes settle, in milliseconds,
+    /// before announcing that the diff moved. Saving one file touches it
+    /// several times and a build touches thousands.
+    pub watch_debounce: u64,
+
+    /// How long, in milliseconds, a staged worktree head stays good for without
+    /// the watcher saying otherwise. A backstop, not the mechanism.
+    pub head_ttl: u64,
 
     /// How long the TUI needs, in milliseconds, before it will accept pasted
     /// input.
@@ -69,7 +74,8 @@ impl Default for Settings {
             data_dir: None,
             agent_bin: "claude".to_owned(),
             agent_env: HashMap::new(),
-            poll_interval: 4000,
+            watch_debounce: 250,
+            head_ttl: 30_000,
             ready_delay: 2500,
             hook_grace: 15_000,
             resume_timeout: 5000,
@@ -83,8 +89,8 @@ impl Default for Settings {
 ///
 /// Bundled and `Copy` because `deliver_opening_prompt` runs on a detached
 /// thread and `Settings` is neither. Every one of these is overridable for the
-/// same reason `poll_interval` is: so the end-to-end suite does not have to
-/// wait in real time.
+/// same reason every other wait here is: so the end-to-end suite does not have
+/// to wait in real time.
 #[derive(Debug, Clone, Copy)]
 pub struct Timings {
     pub ready_delay: Duration,
@@ -186,7 +192,7 @@ mod tests {
         let s = settings(&[("data_dir", "/srv/board")]);
         assert_eq!(s.app_slug, "ledecky");
         assert_eq!(s.agent_bin, "claude");
-        assert_eq!(s.poll_interval, 4000);
+        assert_eq!(s.watch_debounce, 250);
         assert!(s.agent_env.is_empty());
         assert_eq!(s.db_path(), PathBuf::from("/srv/board/ledecky.db"));
 

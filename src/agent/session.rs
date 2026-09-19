@@ -7,10 +7,12 @@ use anyhow::{bail, Context, Result};
 use crate::agent::{Agent, Agents};
 use crate::config::{Settings, Timings};
 use crate::db::Db;
+use crate::events::{Changes, Kind};
 use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
 use crate::review::DiffCache;
+use crate::watch::Worktrees;
 
 /// How often a resumed session is re-checked while it proves itself.
 const RESUME_POLL: Duration = Duration::from_millis(100);
@@ -24,6 +26,8 @@ pub fn start(
     agents: &Agents,
     auth: &HookAuth,
     settings: &Settings,
+    changes: &Changes,
+    worktrees: &Worktrees,
     card_id: i64,
 ) -> Result<Arc<Agent>> {
     let timings = settings.timings();
@@ -53,6 +57,11 @@ pub fn start(
         Card::set_agent_state(&conn, card_id, AgentState::Starting);
     }
 
+    // Said before the spawn, which blocks: a client that learned of the move
+    // over the bus would otherwise keep showing the pre-start state — and the
+    // drawer "no agent running" — until the opening prompt lands.
+    changes.card(db, card_id, Kind::State);
+
     let card = {
         let conn = db.lock();
         Card::find(&conn, card_id).context("card vanished")?
@@ -61,6 +70,7 @@ pub fn start(
     let mut agent = agents
         .spawn(
             db,
+            changes,
             settings,
             &card,
             &worktree,
@@ -81,6 +91,7 @@ pub fn start(
         agent = agents
             .spawn(
                 db,
+                changes,
                 settings,
                 &card,
                 &worktree,
@@ -92,9 +103,19 @@ pub fn start(
 
     Card::set_agent_pid(&db.lock(), card_id, agent.pid);
 
+    // Again, because whether the drawer shows a terminal turns on the agent
+    // being up rather than on anything the card records.
+    changes.card(db, card_id, Kind::State);
+
+    // After the spawn, deliberately: establishing a recursive watch walks the
+    // whole checkout, and nothing should stand between the agent starting and
+    // the card being able to say so.
+    worktrees.ensure(card_id, card.project_id, &worktree);
+
     let started = agent.clone();
     let db = db.clone();
-    std::thread::spawn(move || deliver_opening_prompt(db, started, card_id, timings));
+    let changes = changes.clone();
+    std::thread::spawn(move || deliver_opening_prompt(db, changes, started, card_id, timings));
 
     Ok(agent)
 }
@@ -129,7 +150,13 @@ fn resumed(agent: &Agent, timings: Timings) -> bool {
 /// NB: the readiness wait is a timer rather than a `SessionStart` hook, because
 /// that event only accepts `command` and `mcp_tool` handlers — an HTTP hook
 /// there never fires.
-fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64, timings: Timings) {
+fn deliver_opening_prompt(
+    db: Db,
+    changes: Changes,
+    agent: Arc<Agent>,
+    card_id: i64,
+    timings: Timings,
+) {
     std::thread::sleep(timings.ready_delay);
 
     let mut waited = Duration::ZERO;
@@ -146,7 +173,7 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64, timings: Timi
         // permission prompt sends them looking for one that is not there.
         if agent.is_blocked() {
             agent.saw_dialog();
-            await_user(&db, card_id);
+            await_user(&db, &changes, card_id);
         }
 
         if waited >= PROMPT_TIMEOUT {
@@ -157,7 +184,7 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64, timings: Timi
         waited += timings.ready_delay;
     }
 
-    mark_delivered(&db, card_id);
+    mark_delivered(&db, &changes, card_id);
 
     // Silence past this point means our hook URLs are not reaching us — most
     // likely an `allowedHttpHookUrls` allowlist. Without hooks there are no turn
@@ -166,7 +193,7 @@ fn deliver_opening_prompt(db: Db, agent: Arc<Agent>, card_id: i64, timings: Timi
     if agent.is_running() && hook_events(&db, card_id) == 0 {
         let grace = timings.hook_grace;
         warn!("card {card_id}: no hooks received within {grace:?}");
-        set_state(&db, card_id, AgentState::Misconfigured);
+        set_state(&db, &changes, card_id, AgentState::Misconfigured);
     }
 }
 
@@ -181,7 +208,7 @@ fn hook_events(db: &Db, card_id: i64) -> i64 {
 }
 
 /// Kills the agent but leaves the worktree and its refs in place.
-pub fn stop(db: &Db, agents: &Agents, card_id: i64) {
+pub fn stop(db: &Db, agents: &Agents, changes: &Changes, card_id: i64) {
     if let Some(agent) = agents.remove(card_id) {
         agent.kill();
     }
@@ -189,11 +216,24 @@ pub fn stop(db: &Db, agents: &Agents, card_id: i64) {
     let conn = db.lock();
     Card::set_agent_pid(&conn, card_id, None);
     Card::set_agent_state(&conn, card_id, AgentState::Stopped);
+    drop(conn);
+
+    changes.card(db, card_id, Kind::State);
 }
 
 /// Kills the agent and removes the worktree. Turn refs are kept.
-pub fn teardown(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCache, card_id: i64) {
-    stop(db, agents, card_id);
+pub fn teardown(
+    db: &Db,
+    agents: &Agents,
+    settings: &Settings,
+    cache: &DiffCache,
+    changes: &Changes,
+    worktrees: &Worktrees,
+    card_id: i64,
+) {
+    stop(db, agents, changes, card_id);
+    // Before the directory goes, so the watch does not fire on its removal.
+    worktrees.forget(card_id);
 
     let conn = db.lock();
     let card = Card::find(&conn, card_id);
@@ -223,29 +263,36 @@ pub fn teardown(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCache
     cache.forget_head(card_id);
 
     Card::detach_worktree(&db.lock(), card_id);
+    changes.card(db, card_id, Kind::Board);
 }
 
-pub fn set_state(db: &Db, card_id: i64, state: AgentState) {
+pub fn set_state(db: &Db, changes: &Changes, card_id: i64, state: AgentState) {
     Card::set_agent_state(&db.lock(), card_id, state);
+    changes.card(db, card_id, Kind::State);
 }
 
 /// Parks a card that is waiting on a dialog in In Review.
 ///
 /// A chip is easy to miss at board scale; a lane is not.
-pub fn await_user(db: &Db, card_id: i64) {
+pub fn await_user(db: &Db, changes: &Changes, card_id: i64) {
     let conn = db.lock();
     Card::set_agent_state(&conn, card_id, AgentState::AwaitingUser);
 
     if Card::find(&conn, card_id).is_some_and(|card| card.lane == Lane::InProgress) {
         Card::set_lane(&conn, card_id, Lane::InReview);
     }
+    drop(conn);
+
+    // NB: one event, though the lane moved too — the board listens for a state
+    // change as well, so announcing it twice would only fetch it twice.
+    changes.card(db, card_id, Kind::State);
 }
 
 /// The other half: the agent is working, so the card belongs in In Progress.
 ///
 /// Driven by `UserPromptSubmit` rather than by anything dialog-shaped, so a
 /// review sent to an idle card moves it too.
-pub fn resume(db: &Db, card_id: i64) {
+pub fn resume(db: &Db, changes: &Changes, card_id: i64) {
     let conn = db.lock();
     let Some(card) = Card::find(&conn, card_id) else {
         return;
@@ -258,6 +305,9 @@ pub fn resume(db: &Db, card_id: i64) {
     if card.lane == Lane::InReview && !card.merge_requested {
         Card::set_lane(&conn, card_id, Lane::InProgress);
     }
+    drop(conn);
+
+    changes.card(db, card_id, Kind::State);
 }
 
 /// Resumes a card whose dialog has left the screen.
@@ -265,12 +315,12 @@ pub fn resume(db: &Db, card_id: i64) {
 /// NB: only overwrites the state we set ourselves. A turn can end — and its
 /// `Stop` hook record `idle` — before the redraw that proves the dialog is gone,
 /// and writing `running` over that would leave the card claiming to work.
-pub fn resume_after_dialog(db: &Db, card_id: i64) {
+pub fn resume_after_dialog(db: &Db, changes: &Changes, card_id: i64) {
     let awaiting = Card::find(&db.lock(), card_id)
         .is_some_and(|card| card.agent_state == AgentState::AwaitingUser);
 
     if awaiting {
-        resume(db, card_id);
+        resume(db, changes, card_id);
     }
 }
 
@@ -281,7 +331,7 @@ pub fn resume_after_dialog(db: &Db, card_id: i64) {
 /// quick agent can finish the whole turn first. Writing `running` over the
 /// `idle` its `Stop` hook just recorded would leave the card claiming to be
 /// working for as long as it sat there.
-fn mark_delivered(db: &Db, card_id: i64) {
+fn mark_delivered(db: &Db, changes: &Changes, card_id: i64) {
     let stale = Card::find(&db.lock(), card_id).is_some_and(|card| {
         matches!(
             card.agent_state,
@@ -290,7 +340,7 @@ fn mark_delivered(db: &Db, card_id: i64) {
     });
 
     if stale {
-        resume(db, card_id);
+        resume(db, changes, card_id);
     }
 }
 
@@ -299,7 +349,7 @@ fn mark_delivered(db: &Db, card_id: i64) {
 /// The server never rewrites the user's branches itself — conflicts are exactly
 /// the situation an agent is good at, and a failed rebase run by the server
 /// would just leave a mess for someone else to unpick.
-pub fn request_merge(db: &Db, agents: &Agents, card_id: i64) -> Result<()> {
+pub fn request_merge(db: &Db, agents: &Agents, changes: &Changes, card_id: i64) -> Result<()> {
     let conn = db.lock();
     let card = Card::find(&conn, card_id).context("no such card")?;
     let project = Project::find(&conn, card.project_id).context("no such project")?;
@@ -324,6 +374,7 @@ pub fn request_merge(db: &Db, agents: &Agents, card_id: i64) -> Result<()> {
         bail!("the terminal is busy; answer the prompt showing in it first");
     }
 
+    changes.card(db, card_id, Kind::Board);
     Ok(())
 }
 
@@ -361,7 +412,15 @@ fn merge_landed(
 }
 
 /// Called after each turn snapshot while a merge is outstanding.
-pub fn check_merge(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCache, card_id: i64) {
+pub fn check_merge(
+    db: &Db,
+    agents: &Agents,
+    settings: &Settings,
+    cache: &DiffCache,
+    changes: &Changes,
+    worktrees: &Worktrees,
+    card_id: i64,
+) {
     let conn = db.lock();
     let Some(card) = Card::find(&conn, card_id).filter(|c| c.merge_requested) else {
         return;
@@ -404,7 +463,7 @@ pub fn check_merge(db: &Db, agents: &Agents, settings: &Settings, cache: &DiffCa
         Card::set_lane(&conn, card_id, Lane::Done);
         Card::clear_merge_request(&conn, card_id);
     }
-    teardown(db, agents, settings, cache, card_id);
+    teardown(db, agents, settings, cache, changes, worktrees, card_id);
 }
 
 /// Kills agents left behind by a server that did not shut down cleanly.
@@ -521,6 +580,12 @@ mod tests {
         card
     }
 
+    /// A bus with no subscribers — these cover the state machine, not the
+    /// announcing.
+    fn bus() -> Changes {
+        Changes::default()
+    }
+
     fn look(db: &Db, card_id: i64) -> (Lane, AgentState) {
         let card = Card::find(&db.lock(), card_id).unwrap();
         (card.lane, card.agent_state)
@@ -531,10 +596,10 @@ mod tests {
         let db = memory_db();
         let card = card_in(&db, Lane::InProgress, AgentState::Running);
 
-        await_user(&db, card);
+        await_user(&db, &bus(), card);
         assert_eq!(look(&db, card), (Lane::InReview, AgentState::AwaitingUser));
 
-        resume_after_dialog(&db, card);
+        resume_after_dialog(&db, &bus(), card);
         assert_eq!(look(&db, card), (Lane::InProgress, AgentState::Running));
     }
 
@@ -543,7 +608,7 @@ mod tests {
         let db = memory_db();
         let card = card_in(&db, Lane::InReview, AgentState::Running);
 
-        await_user(&db, card);
+        await_user(&db, &bus(), card);
         assert_eq!(look(&db, card), (Lane::InReview, AgentState::AwaitingUser));
     }
 
@@ -554,7 +619,7 @@ mod tests {
         let db = memory_db();
         let card = card_in(&db, Lane::InReview, AgentState::Idle);
 
-        resume(&db, card);
+        resume(&db, &bus(), card);
         assert_eq!(look(&db, card), (Lane::InProgress, AgentState::Running));
     }
 
@@ -566,7 +631,7 @@ mod tests {
         let card = card_in(&db, Lane::InReview, AgentState::Idle);
         Card::request_merge(&db.lock(), card, "abc123");
 
-        resume(&db, card);
+        resume(&db, &bus(), card);
         assert_eq!(look(&db, card), (Lane::InReview, AgentState::Running));
     }
 
@@ -577,7 +642,7 @@ mod tests {
         let db = memory_db();
         let card = card_in(&db, Lane::InReview, AgentState::Idle);
 
-        resume_after_dialog(&db, card);
+        resume_after_dialog(&db, &bus(), card);
         assert_eq!(look(&db, card), (Lane::InReview, AgentState::Idle));
     }
 

@@ -1,4 +1,6 @@
 <span class="state state-{{ card.agent_state }}" id="agent-state"
-      up-poll up-interval="{{ poll_interval }}" up-source="/cards/{{ card.id }}/state">
+      hx-get="/cards/{{ card.id }}/state"
+      hx-trigger="state from:body, reload from:body"
+      hx-swap="outerMorph" hx-sync="replace">
   <span class="pulse state-{{ card.agent_state }}"></span>{{ card.agent_state_label }}
 </span>

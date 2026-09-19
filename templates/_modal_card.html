@@ -7,9 +7,14 @@
 
 <div class="modal modal-card" role="dialog"
      aria-label="{% if editing %}Edit card{% else %}New card{% endif %}">
+{# NB: `outerHTML`, not a morph. Morphing deliberately preserves what is in an
+   input, and only resets a textarea whose value the reader is not currently in
+   — so "Create more" would hand back the task just submitted, or not, depending
+   on where focus happened to be when the response landed. A form that has to
+   come back empty cannot be merged into. #}
   <form method="post"
-        action="{% if editing %}/cards/{{ card.id }}{% else %}/projects/{{ project.id }}/cards{% endif %}"
-        up-submit up-target="body" data-submit-shortcuts>
+        action="{% if editing %}/cards/{{ card.id }}{% else %}/projects/{{ project.id }}/cards{% endif %}" data-submit-shortcuts
+        hx-post="{% if editing %}/cards/{{ card.id }}{% else %}/projects/{{ project.id }}/cards{% endif %}" hx-target="body" hx-swap="outerHTML" hx-push-url="true">
     {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
 
     <label>
@@ -56,8 +61,9 @@
       <span class="spacer"></span>
 
       {% if editing %}
-        <a class="btn" href="/cards/{{ card.id }}" up-follow up-target="#overlay"
-           data-close-overlay>Cancel</a>
+        <a class="btn" href="/cards/{{ card.id }}"
+           data-close-overlay
+           hx-get="/cards/{{ card.id }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">Cancel</a>
         <button class="btn accent" type="submit">
           {{ icon("check") }} Save <kbd class="mono" aria-hidden="true">⌘↵</kbd>
         </button>

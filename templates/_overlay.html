@@ -7,9 +7,11 @@
 {% if overlay %}
   {# Closing lands where the overlay was opened from: the edit form over a card
      goes back to that card, everything else to the board. #}
-  <a class="scrim"
-     href="{% if overlay == 'editcard' %}/cards/{{ card.id }}{% elif project %}/projects/{{ project.id }}{% else %}/{% endif %}"
-     up-follow up-target="#overlay" aria-label="Close" data-close-overlay></a>
+  {% set back %}{% if overlay == 'editcard' %}/cards/{{ card.id }}{% elif project %}/projects/{{ project.id }}{% else %}/{% endif %}{% endset %}
+  <a class="scrim" href="{{ back }}"
+     hx-get="{{ back }}" hx-target="#overlay" hx-select="#overlay"
+     hx-swap="outerMorph" hx-push-url="true"
+     aria-label="Close" data-close-overlay></a>
 
   {% if overlay == "card" %}{% include "_drawer_card.html" %}
   {% elif overlay == "projects" %}{% include "_drawer_projects.html" %}

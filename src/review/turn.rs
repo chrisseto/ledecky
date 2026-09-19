@@ -160,31 +160,27 @@ pub fn live_head(
     };
 
     cache
-        .head(
-            card.id,
-            Duration::from_millis(settings.poll_interval),
-            || {
-                // Before anything measures from it: the pane reads `base..HEAD`
-                // for its commit list and the board takes a stat from the same
-                // ref, both after this returns.
-                reconcile(cache, settings, repo, live, card);
+        .head(card.id, Duration::from_millis(settings.head_ttl), || {
+            // Before anything measures from it: the pane reads `base..HEAD`
+            // for its commit list and the board takes a stat from the same
+            // ref, both after this returns.
+            reconcile(cache, settings, repo, live, card);
 
-                match git::working_tree(settings, repo, live, card.id) {
-                    Ok(tree) => Some(tree),
-                    Err(err) => {
-                        warn!("card {}: staging the worktree: {err:#}", card.id);
-                        settled()
-                    }
+            match git::working_tree(settings, repo, live, card.id) {
+                Ok(tree) => Some(tree),
+                Err(err) => {
+                    warn!("card {}: staging the worktree: {err:#}", card.id);
+                    settled()
                 }
-            },
-        )
+            }
+        })
         .or_else(settled)
 }
 
 /// Keeps the card's base ref pointing at whatever its worktree branches from.
 ///
 /// Rides inside [`DiffCache::head`]'s memo, so it costs at most one `merge-base`
-/// per card per poll interval rather than one per request.
+/// per card per head TTL rather than one per request.
 fn reconcile(cache: &DiffCache, settings: &Settings, repo: &Path, worktree: &Path, card: &Card) {
     // NB: not while a merge is outstanding. The agent has been asked to land its
     // commits on the base branch, and once that ff-merge goes in the merge base

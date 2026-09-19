@@ -1,85 +1,84 @@
-// NB: unpoly ships a CommonJS bundle that only assigns `window.up` — it has no
-// usable default export, so this is an import for the side effect. Reading the
-// global is the supported way to reach the API.
-import "unpoly";
-import Sortable from "sortablejs";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
+// NB: htmx's ESM build assigns `window.htmx` as a side effect and the
+// extensions are plain scripts registering against that global, so htmx has to
+// be imported first and read off the window afterwards.
+import "htmx.org";
+import "htmx.org/dist/ext/hx-sse.js";
 
-const { up } = window;
+import { DrawerCard } from "./components/drawer-card.js";
+import { FileTree } from "./components/file-tree.js";
+import { SortableLane } from "./components/sortable-lane.js";
+import { TerminalPane } from "./components/terminal.js";
+
+const { htmx } = window;
+
+// Everything that owns something a swap must not leak — a socket, an observer,
+// a Sortable instance — is a custom element, so the browser's own
+// `disconnectedCallback` is what tears it down. Registered here rather than
+// beside each class so the tag names read as one list.
+customElements.define("x-drawer-card", DrawerCard);
+customElements.define("x-file-tree", FileTree);
+customElements.define("x-sortable-lane", SortableLane);
+customElements.define("x-terminal", TerminalPane);
 
 // ---- overlays ---------------------------------------------------------------
 // Drawers and modals are server-rendered into #overlay, so closing one is a
 // navigation like any other: Escape follows the same link the scrim carries.
 
-up.on("keydown", (event) => {
+document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
 
-  const compose = document.querySelector(".compose:not([hidden])");
-  if (compose) {
-    compose.dispatchEvent(new CustomEvent("cancel-comment", { bubbles: true }));
+  const cancel = document.querySelector("#review [data-cancel-comment]");
+  if (cancel) {
+    discardComment(cancel);
     return;
   }
 
   document.querySelector("#overlay [data-close-overlay]")?.click();
 });
 
-// ---- drawer resize -----------------------------------------------------------
-// The drawer resizes itself; this only outlives it. The resizer writes an inline
-// width that the #overlay swap throws away on the next lane move, so the width
-// is mirrored onto :root — which the swap leaves alone — as the fraction of the
-// viewport that board.html reads back before paint.
-
-up.compiler(".drawer-card", (drawer) => {
-  const observer = new MutationObserver(() => {
-    const fraction = drawer.offsetWidth / window.innerWidth;
-    document.documentElement.style.setProperty("--drawer-width", fraction);
-    localStorage.setItem("drawer-width", fraction);
-  });
-
-  observer.observe(drawer, { attributeFilter: ["style"] });
-
-  return () => observer.disconnect();
-});
-
 // ⌘↵ submits a form; adding shift takes the second button, which keeps the form
 // open for the next one.
-up.compiler("[data-submit-shortcuts]", (form) => {
-  const submit = (event) => {
-    if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
-    event.preventDefault();
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
 
-    const buttons = form.querySelectorAll('button[type="submit"]');
-    (event.shiftKey ? buttons[0] : buttons[buttons.length - 1]).click();
-  };
+  const form = event.target.closest?.("[data-submit-shortcuts]");
+  if (!form) return;
+  event.preventDefault();
 
-  form.addEventListener("keydown", submit);
+  const buttons = form.querySelectorAll('button[type="submit"]');
+  (event.shiftKey ? buttons[0] : buttons[buttons.length - 1]).click();
 });
 
 // ---- server-rendered autocomplete -------------------------------------------
 // The input names its own target and endpoint; every keystroke re-renders that
 // fragment from the server. No client-side filtering or matching logic.
 
-up.compiler("[data-complete-for]", (input) => {
-  const { completeFor: target, completeUrl: url } = input.dataset;
-  let timer;
+let completeTimer;
 
-  const refresh = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      up.render({
-        target,
-        url: `${url}?q=${encodeURIComponent(input.value)}`,
-        cache: false,
-      });
-    }, 120);
-  };
+const completions = (input) => {
+  clearTimeout(completeTimer);
+  completeTimer = setTimeout(() => {
+    const { completeFor: target, completeUrl: url } = input.dataset;
+    htmx.ajax("GET", `${url}?q=${encodeURIComponent(input.value)}`, {
+      target,
+      swap: "outerHTML",
+    });
+  }, 120);
+};
 
-  input.addEventListener("input", refresh);
-  input.addEventListener("focus", refresh);
-});
+const onCompleteInput = (event) => {
+  const input = event.target.closest?.("[data-complete-for]");
+  if (input) completions(input);
+};
 
-up.on("click", ".completions button[data-path]", (event, button) => {
+document.addEventListener("input", onCompleteInput);
+// `focus` does not bubble; `focusin` is the delegable form of it.
+document.addEventListener("focusin", onCompleteInput);
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest?.(".completions button[data-path]");
+  if (!button) return;
+
   event.preventDefault();
   const input = document.querySelector("[data-complete-for]");
   if (!input) return;
@@ -93,408 +92,91 @@ up.on("click", ".completions button[data-path]", (event, button) => {
 // The whole branch list is already on the page, so narrowing it is a filter over
 // the rendered options rather than a round trip.
 
-up.compiler("[data-branch-filter]", (input) => {
+const filterBranches = (input) => {
   const menu = input.parentElement.querySelector(".combo-menu");
-  const options = [...menu.querySelectorAll("[data-branch]")];
+  if (!menu) return;
+
+  const wanted = input.value.trim().toLowerCase();
+  let shown = 0;
+
+  for (const option of menu.querySelectorAll("[data-branch]")) {
+    const matches = option.textContent.trim().toLowerCase().includes(wanted);
+    option.hidden = !matches;
+    shown += matches ? 1 : 0;
+  }
+
   const noMatch = menu.querySelector(".empty-match");
+  if (noMatch) noMatch.hidden = shown > 0;
+  menu.hidden = false;
+};
 
-  const filter = () => {
-    const wanted = input.value.trim().toLowerCase();
-    let shown = 0;
+const onBranchInput = (event) => {
+  const input = event.target.closest?.("[data-branch-filter]");
+  if (input) filterBranches(input);
+};
 
-    for (const option of options) {
-      const matches = option.textContent.trim().toLowerCase().includes(wanted);
-      option.hidden = !matches;
-      shown += matches ? 1 : 0;
-    }
+document.addEventListener("input", onBranchInput);
+document.addEventListener("focusin", onBranchInput);
 
-    noMatch.hidden = shown > 0;
-    menu.hidden = false;
-  };
+document.addEventListener("focusout", (event) => {
+  const input = event.target.closest?.("[data-branch-filter]");
+  if (!input) return;
 
-  input.addEventListener("focus", filter);
-  input.addEventListener("input", filter);
+  const menu = input.parentElement.querySelector(".combo-menu");
   // Late enough for a click on an option to land first.
-  input.addEventListener("blur", () => setTimeout(() => { menu.hidden = true; }, 120));
-
-  menu.addEventListener("click", (event) => {
-    const option = event.target.closest("[data-branch]");
-    if (!option) return;
-
-    input.value = option.textContent.trim();
-    menu.hidden = true;
-  });
+  setTimeout(() => {
+    if (menu) menu.hidden = true;
+  }, 120);
 });
 
-// ---- kanban drag and drop ---------------------------------------------------
-// SortableJS moves the DOM node; the server is told the destination lane and the
-// drop index, and owns the ordering from there.
+document.addEventListener("click", (event) => {
+  const option = event.target.closest?.(".combo-menu [data-branch]");
+  if (!option) return;
 
-up.compiler("[data-sortable]", (lane) => {
-  const board = lane.closest("[up-poll]");
+  const input = option.closest(".combo")?.querySelector("[data-branch-filter]");
+  if (!input) return;
 
-  const sortable = Sortable.create(lane, {
-    group: "cards",
-    animation: 120,
-    draggable: ".card",
-    ghostClass: "card-ghost",
-
-    // Polling mid-drag would yank the card out from under the cursor.
-    onStart: () => board && up.radio.stopPolling(board),
-
-    onEnd: async (event) => {
-      const id = event.item.dataset.cardId;
-      try {
-        await up.request(`/cards/${id}/move`, {
-          method: "post",
-          params: { lane: event.to.dataset.lane, index: event.newIndex },
-        });
-      } finally {
-        if (board) {
-          up.radio.startPolling(board);
-          // This reload reconciles the optimistic move above with server truth,
-          // so it must not be answered with a 304 — a failed move would leave
-          // the card sitting in the wrong lane. The swap brings a fresh etag.
-          board.removeAttribute("up-etag");
-          up.reload(board);
-        }
-      }
-    },
-  });
-
-  return () => sortable.destroy();
+  input.value = option.textContent.trim();
+  option.closest(".combo-menu").hidden = true;
 });
-
-// ---- terminal ---------------------------------------------------------------
-// The socket carries raw pty bytes in both directions. The screen's size rides
-// on its URL, so the pty is already the client's shape when the replay is
-// rendered; later resizes go over HTTP and the socket needs no envelope.
-
-/** Opens a terminal on `host` and attaches it to the agent behind it. */
-const attach = (host) => {
-  const term = new Terminal({
-    convertEol: false,
-    cursorBlink: true,
-    fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono").trim(),
-    fontSize: 13,
-    scrollback: 5000,
-    // The ground and text of the pane it sits in, which xterm needs as hex.
-    theme: { background: "#0f1318", foreground: "#d5d0c8" },
-  });
-
-  const fit = new FitAddon();
-  term.loadAddon(fit);
-  term.open(host);
-  fit.fit();
-
-  const url = new URL(host.dataset.terminal, location.href);
-  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("rows", term.rows);
-  url.searchParams.set("cols", term.cols);
-
-  // The server sizes the pty to this before it renders a byte, so the screen
-  // that comes back is already ours and nothing has to be reflowed into place.
-  let sent = `${term.rows}x${term.cols}`;
-
-  const socket = new WebSocket(url);
-  socket.binaryType = "arraybuffer";
-
-  socket.addEventListener("message", (event) => {
-    term.write(new Uint8Array(event.data));
-  });
-  socket.addEventListener("close", () => {
-    term.write("\r\n\x1b[2m-- agent disconnected --\x1b[0m\r\n");
-  });
-
-  const encoder = new TextEncoder();
-  term.onData((data) => {
-    if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
-  });
-
-  const resize = () => {
-    fit.fit();
-    const { rows, cols } = term;
-    const key = `${rows}x${cols}`;
-    if (key === sent) return;
-
-    sent = key;
-    up.request(host.dataset.resizeUrl, { method: "post", params: { rows, cols } });
-  };
-
-  // The first fit measures whatever font is up at the time, and the box it
-  // measured in never changes afterwards — so nothing else would ever notice
-  // the real one arriving.
-  document.fonts.ready.then(resize);
-
-  return {
-    resize,
-    stop: () => {
-      socket.close();
-      term.dispose();
-    },
-  };
-};
-
-up.compiler("[data-terminal]", (host) => {
-  // xterm cancels a wheel only when it actually scrolled the viewport with it; at
-  // either end of the scrollback it lets the event through and the page behind the
-  // drawer scrolls instead. Nothing in this pane should ever move the board.
-  host.addEventListener("wheel", (event) => event.preventDefault(), { passive: false });
-
-  let session;
-  let debounce;
-
-  // NB: the review tab hides this pane, and the drawer opens on it whenever
-  // there is a diff to read — so this compiles at 0x0 as often as not. xterm
-  // opened into that measures no cell at all and never re-measures, and the
-  // replay would land in its 80x24 default, wrapped at a width that is not the
-  // agent's. Nothing starts until the pane is on screen.
-  const tick = () => {
-    if (!host.clientWidth || !host.clientHeight) return;
-
-    if (session) session.resize();
-    else session = attach(host);
-  };
-
-  const observer = new ResizeObserver(() => {
-    clearTimeout(debounce);
-    debounce = setTimeout(tick, 80);
-  });
-  observer.observe(host);
-  tick();
-
-  return () => {
-    observer.disconnect();
-    clearTimeout(debounce);
-    session?.stop();
-  };
-});
-
-// ---- review pane ------------------------------------------------------------
-
-/**
- * Holds the pane still while the reader is part-way through something.
- *
- * Stopping the timer is not enough on its own: a poll issued moments earlier is
- * still on its way, and its response would swap away the comment box being
- * typed into or the menu being read.
- *
- * NB: the *request* is aborted, not the fragment. `up.fragment.abort` would
- * also cancel whatever the reader goes on to click, since that request is bound
- * to this fragment too — which reads as a dropdown that does nothing.
- */
-const holdPane = (review) => {
-  up.radio.stopPolling(review);
-  up.network.abort((request) => request.background);
-};
-
-/**
- * Polls only while the pane is the tab on screen and nobody is mid-sentence.
- *
- * Both panes are always in the DOM so that switching tabs never tears down the
- * terminal, and unpoly polls whatever carries `up-poll` whether or not it is
- * visible — so without this the agent's tab would stage the worktree every few
- * seconds for a diff nobody is looking at.
- */
-up.compiler(".review", (review) => {
-  const tabs = document.querySelector(".drawer-card .tabs");
-  if (!tabs) return;
-
-  const follow = () => {
-    const showing = tabs.querySelector("#tab-review")?.checked;
-    const busy = review.querySelector(".compose:not([hidden]), [data-range-menu][open]");
-
-    if (showing && !busy) up.radio.startPolling(review);
-    else up.radio.stopPolling(review);
-  };
-
-  follow();
-  tabs.addEventListener("change", follow);
-  // NB: the tabs outlive this fragment, so the listener has to come off with
-  // it — otherwise every poll leaves another one behind.
-  return () => tabs.removeEventListener("change", follow);
-});
-
-/** The reader is part-way through something the pane must not move under. */
-const paneBusy = () =>
-  !!document.querySelector("#review .compose:not([hidden]), #review [data-range-menu][open]");
-
-/** Which range a request asked for. Only the pane's own polls name one. */
-const rangeOf = (url) => new URL(url, location.href).searchParams.get("scope");
-
-// The last word on whether a poll gets to redraw the pane, and the only one that
-// closes the window completely: stopping the timer and aborting in flight both
-// happen before a response exists, so neither can stop one already downloaded
-// and on its way to being rendered — which reads as the picker closing itself
-// mid-choice, or a range change that does nothing.
-const skipResponse = up.fragment.config.skipResponse;
-up.fragment.config.skipResponse = (props) => {
-  if (skipResponse(props)) return true;
-  if (!props.request.background) return false;
-
-  // NB: scoped to the pane's own polls. Everything else that polls the page —
-  // the board, the agent-state chip — has no range to name, and skipping those
-  // would freeze them on whatever they first rendered.
-  const asked = rangeOf(props.request.url);
-  if (!asked) return false;
-
-  if (paneBusy()) return true;
-
-  // A poll that set out before the reader picked a different range describes
-  // the one they just left, and rendering it would undo the click.
-  const showing = document.querySelector("#review")?.dataset.scope;
-  return !!showing && asked !== showing;
-};
 
 // ---- review comments --------------------------------------------------------
-// Clicking a diff line moves the (single) compose box under it and points it at
-// that line. Clicking away saves it as a draft; the server owns everything else.
+// Which line is being commented on lives in the pane's query string, so the box
+// arrives from the server already in place. Clicking away is what saves it as a
+// draft; an empty box was a change of mind.
 
-up.compiler(".review", (review) => {
-  const form = review.querySelector(".compose");
-  if (!form) return;
+// NB: closing the box blurs it either way, and a blur is what saves — so both
+// ways out have to say which they are. A mouse announces itself by pressing
+// Cancel; Escape has to say so on its own.
+let discarding = false;
 
-  const textarea = form.querySelector("textarea");
-
-  const close = () => {
-    form.hidden = true;
-    textarea.value = "";
-    review.querySelectorAll(".line.commenting").forEach((line) => line.classList.remove("commenting"));
-    up.radio.startPolling(review);
-  };
-
-  const open = (line) => {
-    const [side, number] = line.dataset.anchor.split(":");
-    form.elements.file_path.value = line.dataset.file;
-    form.elements.side.value = side;
-    form.elements.line.value = number;
-
-    line.after(form);
-    form.hidden = false;
-    line.classList.add("commenting");
-    textarea.focus();
-
-    // A poll swaps the pane out from under this box, half-typed comment and
-    // all. Nothing is lost by holding still until it is put away.
-    holdPane(review);
-  };
-
-  review.addEventListener("click", (event) => {
-    if (event.target.closest(".compose, .thread, a, button, summary")) return;
-
-    const line = event.target.closest(".line");
-    if (!line) return;
-
-    const reopening = line.classList.contains("commenting");
-    close();
-    if (!reopening) open(line);
-  });
-
-  // Clicking away is what saves: an empty box was a change of mind.
-  textarea.addEventListener("blur", () => {
-    if (form.hidden) return;
-    if (!textarea.value.trim()) {
-      close();
-      return;
-    }
-
-    // NB: hidden before submitting, not after. `up.submit` swaps the pane, and
-    // the blur that swap fires on the outgoing textarea would otherwise post
-    // the same comment a second time.
-    form.hidden = true;
-    up.submit(form);
-  });
-
-  form.addEventListener("cancel-comment", close);
+document.addEventListener("mousedown", (event) => {
+  discarding = !!event.target.closest?.("[data-cancel-comment]");
 });
 
-// ---- file tree as a jump list -----------------------------------------------
-// Every file in the range is already in the diff, so picking one out of the tree
-// is a scroll rather than a round trip. Which node is highlighted follows the
-// scroller instead of the click, so it stays honest when the reader scrolls past
-// a file on their own.
+/** Throws the box away: marks the blur that follows, then closes it. */
+function discardComment(cancel) {
+  discarding = true;
+  cancel.click();
+}
 
-up.compiler(".review", (review) => {
-  const lines = review.querySelector("#diff-lines");
-  const tree = review.querySelector(".tree-body");
-  if (!lines || !tree) return;
+document.addEventListener("focusout", (event) => {
+  const textarea = event.target.closest?.(".compose textarea");
+  if (!textarea) return;
 
-  const nodeFor = (section) => tree.querySelector(`[href="#${section.id}"]`);
+  // One blur per way out, so the mark cannot outlive what set it.
+  if (discarding) {
+    discarding = false;
+    return;
+  }
 
-  tree.addEventListener("click", (event) => {
-    const node = event.target.closest(".file-node");
-    if (!node) return;
-
-    event.preventDefault();
-    // Not the browser's own hash navigation: that pushes history, which unpoly
-    // then has to reconcile against a fragment it never navigated to.
-    review.querySelector(node.getAttribute("href"))?.scrollIntoView({ block: "start" });
-  });
-
-  // The file being read is the first one not yet scrolled past, which is what
-  // the sticky header is showing. Derived from geometry rather than from the
-  // entries, because any one entry only reports its own file.
-  const observer = new IntersectionObserver(
-    () => {
-      const sections = [...lines.querySelectorAll(".file")];
-      const top = lines.getBoundingClientRect().top;
-      const reading =
-        sections.find((section) => section.getBoundingClientRect().bottom > top + 1) ??
-        sections[sections.length - 1];
-
-      for (const section of sections) {
-        nodeFor(section)?.classList.toggle("selected", section === reading);
-      }
-      if (reading) nodeFor(reading)?.scrollIntoView({ block: "nearest" });
-    },
-    { root: lines, threshold: [0, 1] },
-  );
-
-  for (const section of lines.querySelectorAll(".file")) observer.observe(section);
-
-  return () => observer.disconnect();
+  const form = textarea.closest("form");
+  if (textarea.value.trim()) form.requestSubmit();
+  else form.querySelector("[data-cancel-comment]")?.click();
 });
 
-// ---- diff range -------------------------------------------------------------
-// Every anchor and both halves of the toggle are ordinary links the server
-// built, so picking a range needs no script at all. What is left is keeping the
-// pane's own poll out of the way of someone using them.
-
-// Following any of them has to hold the poll off until the swap lands: the
-// timer would otherwise fire while the click's own request is still out, and
-// that poll carries the *old* `up-source`, so its response would put the pane
-// back on the range just left. The replacement fragment brings `up-poll` with
-// it, which starts it again.
-up.compiler(".review", (review) => {
-  review.addEventListener("click", (event) => {
-    if (event.target.closest("a[up-follow], [up-submit]")) holdPane(review);
-  });
-});
-
-up.compiler("[data-range-menu]", (menu) => {
-  const review = menu.closest(".review");
-
-  // Opening it holds the pane: a swap underneath would close it mid-choice.
-  //
-  // NB: nothing closes it on the way out. Picking a range replaces the pane,
-  // and the menu that arrives with it is closed — whereas closing this one by
-  // hand fires `toggle`, which would start the poll again while the click's own
-  // request is still out, and that poll would answer with the range just left.
-  menu.addEventListener("toggle", () => {
-    if (menu.open) holdPane(review);
-    else up.radio.startPolling(review);
-  });
-});
-
-// ---- the review tab's stat --------------------------------------------------
-// The tab label sits outside `#review`, so a poll cannot reach it. The pane
-// carries its own totals; this copies them across after each render.
-
-up.compiler(".review", (review) => {
-  const stat = document.querySelector("#tab-stat");
-  if (!stat) return;
-
-  stat.hidden = review.dataset.hasDiff !== "1";
-  stat.querySelector(".adds").textContent = `+${review.dataset.additions}`;
-  stat.querySelector(".dels").textContent = `−${review.dataset.deletions}`;
+// The box is server-rendered, so it has to be focused once it arrives.
+document.addEventListener("htmx:after:settle", () => {
+  const textarea = document.querySelector(".compose textarea[data-autofocus]");
+  if (textarea && document.activeElement !== textarea) textarea.focus();
 });

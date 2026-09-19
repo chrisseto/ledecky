@@ -19,13 +19,17 @@
     <link rel="stylesheet" href="/static/app.css" />
     <script src="/static/app.js" defer></script>
   </head>
-  <body>
+  {# One connection per board. Every fragment below listens for the named
+     events it carries, so nothing else opens one of its own. #}
+  <body {% if project %}hx-sse:connect="/events?project={{ project.id }}"{% endif %}>
     <header class="top">
       <span class="brand">ledecky</span>
 
       {% if project %}
         <a class="switcher" href="/projects?board={{ project.id }}"
-           up-follow up-target="#overlay" title="Switch project">
+           hx-get="/projects?board={{ project.id }}" hx-target="#overlay"
+           hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true"
+           title="Switch project">
           <span class="dot hue-{{ project.id % 4 }}"></span>
           {{ project.name }}
           {{ icon("chevron-down") }}
@@ -34,11 +38,13 @@
     </header>
 
     {% if project %}
-      {# `up-etag` is single-quoted because the server substitutes a quoted ETag
-         into it, and unpoly sends the attribute back verbatim as
-         `If-None-Match`. #}
-      <main class="board" id="board" up-poll up-interval="{{ poll_interval }}"
-            up-source="/projects/{{ project.id }}" up-etag='__up_etag__'>
+      {# Redrawn when the server says something moved, never on a timer. The
+         response is the whole page, so `hx-select` takes this fragment back out
+         of it; morphing it means untouched cards keep their live nodes. #}
+      <main class="board" id="board"
+            hx-get="/projects/{{ project.id }}"
+            hx-trigger="board from:body, state from:body, diff from:body, reload from:body"
+            hx-select="#board" hx-swap="outerMorph" hx-sync="replace">
         {% for lane in lanes %}
           <section class="lane lane-{{ lane.key }}">
             <header>
@@ -49,15 +55,18 @@
 
             {% if lane.key == "todo" %}
               <a class="new-card" href="/projects/{{ project.id }}/cards/new"
-                 up-follow up-target="#overlay">{{ icon("plus") }} New card</a>
+                 hx-get="/projects/{{ project.id }}/cards/new" hx-target="#overlay"
+                 hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true"
+                 >{{ icon("plus") }} New card</a>
             {% endif %}
 
-            {# The id is what makes the lane a targetable viewport, so
-               `scroll: keep` can put it back where it was after a swap. #}
-            <div class="lane-cards" id="lane-{{ lane.key }}" up-viewport
-                 data-sortable data-lane="{{ lane.key }}">
+            {# The id is what morph matches on, so this element — and the
+               scroll position and Sortable instance it carries — survives an
+               update rather than being rebuilt. #}
+            <x-sortable-lane class="lane-cards" id="lane-{{ lane.key }}"
+                             data-lane="{{ lane.key }}">
               {% for card in lane.cards %}{% include "_card.html" %}{% endfor %}
-            </div>
+            </x-sortable-lane>
 
             {% if not lane.cards and lane.key != "todo" %}
               <p class="drop-here">Drop a card here</p>
@@ -68,7 +77,9 @@
     {% else %}
       <main class="board-empty">
         <p>No projects yet.</p>
-        <a class="btn accent" href="/projects/new" up-follow up-target="#overlay">
+        <a class="btn accent" href="/projects/new"
+           hx-get="/projects/new" hx-target="#overlay" hx-select="#overlay"
+           hx-swap="outerMorph" hx-push-url="true">
           {{ icon("plus") }} Add project
         </a>
       </main>

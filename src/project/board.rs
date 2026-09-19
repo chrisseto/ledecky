@@ -9,11 +9,13 @@ use rocket::{get, post, State};
 use crate::agent::{session, Agents};
 use crate::config::Settings;
 use crate::db::Db;
+use crate::events::{Changes, Kind};
 use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, CardEdit, Lane, NewCard, Project};
 use crate::review::{self, DiffCache, Turn};
 use crate::tmpl::Tmpl;
+use crate::watch::Worktrees;
 
 pub const PERMISSION_MODES: &[(&str, &str)] = &[
     (
@@ -128,7 +130,6 @@ impl Shell<'_> {
             "board.html",
             context! {
                 project, lanes, overlay,
-                poll_interval => self.settings.poll_interval,
                 projects => projects.iter().zip(counts)
                     .map(|(project, cards)| context! { cards, ..minijinja::Value::from_serialize(project) })
                     .collect::<Vec<_>>(),
@@ -298,6 +299,7 @@ pub fn create_card(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
+    changes: &State<Changes>,
     id: i64,
     form: Form<CardForm>,
 ) -> Result<Redirect, Tmpl> {
@@ -332,6 +334,8 @@ pub fn create_card(
         return Ok(Redirect::to(format!("/projects/{id}")));
     }
 
+    changes.project(id, Kind::Board);
+
     Ok(match form.more {
         Some(_) => Redirect::to(format!("/projects/{id}/cards/new")),
         None => Redirect::to(format!("/projects/{id}")),
@@ -345,6 +349,7 @@ pub fn update_card(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
+    changes: &State<Changes>,
     id: i64,
     form: Form<CardForm>,
 ) -> Result<Result<Redirect, Tmpl>, Status> {
@@ -381,7 +386,10 @@ pub fn update_card(
     );
 
     match edited {
-        Ok(true) => Ok(Ok(Redirect::to(format!("/cards/{id}")))),
+        Ok(true) => {
+            changes.project(card.project_id, Kind::Board);
+            Ok(Ok(Redirect::to(format!("/cards/{id}"))))
+        }
         // The card was started while the form was open: the agent has the old
         // task already, so this edit would only pretend to have changed it.
         Ok(false) => Err(Status::Conflict),
@@ -419,10 +427,12 @@ pub fn move_card(
     agents: &State<Agents>,
     auth: &State<HookAuth>,
     settings: &State<Settings>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
     id: i64,
     form: Form<MoveForm>,
 ) -> Result<Status, Status> {
-    relane(db, agents, auth, settings, id, &form.lane, form.index)?;
+    relane(db, agents, auth, settings, changes, worktrees, id, &form.lane, form.index)?;
     Ok(Status::NoContent)
 }
 
@@ -433,10 +443,12 @@ pub fn move_card_to_lane(
     agents: &State<Agents>,
     auth: &State<HookAuth>,
     settings: &State<Settings>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
     id: i64,
     form: Form<MoveForm>,
 ) -> Result<Redirect, Status> {
-    relane(db, agents, auth, settings, id, &form.lane, form.index)?;
+    relane(db, agents, auth, settings, changes, worktrees, id, &form.lane, form.index)?;
     Ok(Redirect::to(format!("/cards/{id}")))
 }
 
@@ -445,6 +457,8 @@ fn relane(
     agents: &State<Agents>,
     auth: &State<HookAuth>,
     settings: &State<Settings>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
     id: i64,
     lane: &str,
     index: usize,
@@ -456,12 +470,14 @@ fn relane(
     Card::reorder(&conn, id, card.project_id, lane, index);
     drop(conn);
 
+    changes.project(card.project_id, Kind::Board);
+
     // Entering In Progress is what creates the worktree and starts the agent.
     // Re-entering it with a live agent is a no-op.
     if lane == Lane::InProgress && card.lane != Lane::InProgress {
-        if let Err(err) = session::start(db, agents, auth, settings, id) {
+        if let Err(err) = session::start(db, agents, auth, settings, changes, worktrees, id) {
             error!("card {id}: {err:#}");
-            session::set_state(db, id, AgentState::Error);
+            session::set_state(db, changes, id, AgentState::Error);
         }
     }
 
@@ -474,6 +490,8 @@ pub fn delete_card(
     agents: &State<Agents>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
     id: i64,
 ) -> Result<Redirect, Status> {
     let project_id = {
@@ -481,8 +499,9 @@ pub fn delete_card(
         Card::find(&conn, id).ok_or(Status::NotFound)?.project_id
     };
 
-    session::teardown(db, agents, settings, cache, id);
+    session::teardown(db, agents, settings, cache, changes, worktrees, id);
     Card::delete(&db.lock(), id).map_err(|_| Status::InternalServerError)?;
+    changes.project(project_id, Kind::Board);
 
     Ok(Redirect::to(format!("/projects/{project_id}")))
 }

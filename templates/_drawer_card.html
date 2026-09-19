@@ -1,4 +1,7 @@
-<aside class="drawer drawer-card" aria-label="{{ card.title or card.task }}">
+{# A custom element so the width mirror has a lifecycle to hang off; `role`
+   keeps what the `<aside>` it replaced carried. #}
+<x-drawer-card class="drawer drawer-card" role="complementary"
+               aria-label="{{ card.title or card.task }}">
   <div class="drawer-head">
     <details class="lane-menu">
       <summary class="chip lane-{{ card.lane }}" title="Move this card">
@@ -8,7 +11,8 @@
         <p class="menu-head">Move to</p>
         {% for lane in lanes %}
           {% if lane.key != card.lane %}
-            <form method="post" action="/cards/{{ card.id }}/lane" up-submit up-target="body">
+            <form method="post" action="/cards/{{ card.id }}/lane"
+                  hx-post="/cards/{{ card.id }}/lane" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
               <input type="hidden" name="lane" value="{{ lane.key }}" />
               <button class="menu-item lane-{{ lane.key }}" type="submit">
                 <span class="dot"></span>{{ lane.label }}
@@ -40,8 +44,8 @@
       <input type="radio" name="tab" id="tab-review" {% if reviewing %}checked{% endif %} />
       <label for="tab-review">
         Review
-        {# Outside `#review`, so the pane's poll cannot swap it — app.js copies
-           the totals across instead. #}
+        {# Outside `#review`, so an update to the pane cannot reach it; the
+           pane's own response carries an out-of-band copy of this instead. #}
         <span class="stat mono" id="tab-stat" {% if not has_diff %}hidden{% endif %}>
           <span class="adds">+{{ additions }}</span>
           <span class="dels">−{{ deletions }}</span>
@@ -50,7 +54,8 @@
     </div>
 
     {% if card.lane == "in_review" %}
-      <form method="post" action="/cards/{{ card.id }}/merge" up-submit up-target="body">
+      <form method="post" action="/cards/{{ card.id }}/merge"
+            hx-post="/cards/{{ card.id }}/merge" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
         <button class="btn" type="submit"
                 title="Ask the agent to apply its commits onto {{ card.base_branch }}">
           {{ icon("git-merge") }} Merge
@@ -59,28 +64,44 @@
     {% endif %}
 
     {% if editable %}
-      <a class="btn" href="/cards/{{ card.id }}/edit" up-follow up-target="#overlay"
-         title="Change the task before an agent sees it">{{ icon("pencil") }} Edit</a>
+      <a class="btn" href="/cards/{{ card.id }}/edit"
+         title="Change the task before an agent sees it"
+         hx-get="/cards/{{ card.id }}/edit" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("pencil") }} Edit</a>
     {% endif %}
 
     {% if live %}
-      <form method="post" action="/cards/{{ card.id }}/stop" up-submit up-target="body">
+      <form method="post" action="/cards/{{ card.id }}/stop"
+            hx-post="/cards/{{ card.id }}/stop" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
         <button class="btn accent" type="submit">{{ icon("square") }} Stop agent</button>
       </form>
     {% else %}
-      <form method="post" action="/cards/{{ card.id }}/start" up-submit up-target="body">
+      <form method="post" action="/cards/{{ card.id }}/start"
+            hx-post="/cards/{{ card.id }}/start" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
         <button class="btn accent" type="submit">{{ icon("play") }} Start agent</button>
       </form>
     {% endif %}
 
-    <a class="btn icon-only" href="/projects/{{ project.id }}" up-follow up-target="#overlay"
-       aria-label="Close" data-close-overlay>{{ icon("x") }}</a>
+    <a class="btn icon-only" href="/projects/{{ project.id }}"
+       aria-label="Close" data-close-overlay
+       hx-get="/projects/{{ project.id }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("x") }}</a>
   </div>
 
-  <section class="pane pane-agent">
+  {# Whether there is a terminal to show turns on the agent being up, which
+     happens on its own clock — a card opened mid-start would otherwise sit on
+     "No agent running" until it was reloaded. The same event that moves the
+     chip redraws this. #}
+  <section class="pane pane-agent"
+           hx-get="/cards/{{ card.id }}" hx-select=".pane-agent"
+           hx-trigger="state from:body, reload from:body"
+           hx-swap="outerMorph" hx-sync="replace">
     {% if live %}
-      <div class="terminal" data-terminal="/cards/{{ card.id }}/terminal"
-           data-resize-url="/cards/{{ card.id }}/resize"></div>
+      {# `hx-morph-skip` because xterm builds this subtree on the client and the
+         server knows nothing about it — a morph would reconcile it away. The id
+         names the card, so opening a different one replaces the element and its
+         socket outright rather than reusing this one. #}
+      <x-terminal class="terminal" id="terminal-{{ card.id }}" hx-morph-skip
+                  data-terminal="/cards/{{ card.id }}/terminal"
+                  data-resize-url="/cards/{{ card.id }}/resize"></x-terminal>
     {% else %}
       <p class="empty">
         No agent running. Move this card to <strong>In Progress</strong>, or start one here.
@@ -89,4 +110,4 @@
   </section>
 
   <section class="pane pane-review">{% include "_review.html" %}</section>
-</aside>
+</x-drawer-card>

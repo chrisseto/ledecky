@@ -9,7 +9,7 @@
  */
 
 /** The terminal pane for the open card. */
-export const terminal = (page) => page.locator("div[data-terminal]");
+export const terminal = (page) => page.locator("[data-terminal]");
 
 /** The rows xterm has painted — what the agent's screen currently says. */
 export const terminalRows = (page) => terminal(page).locator(".xterm-rows");

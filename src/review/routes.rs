@@ -121,9 +121,14 @@ struct FileView {
 struct View<'a> {
     scope: Option<&'a str>,
     expand: Option<&'a str>,
+    /// Which line has the compose box open, as `<path>#<side>:<line>`.
+    ///
+    /// Kept in the URL rather than in the DOM so an update re-renders the box
+    /// where it already was, instead of the pane arriving without it.
+    comment: Option<&'a str>,
 }
 
-#[get("/cards/<id>/diff?<scope>&<expand>")]
+#[get("/cards/<id>/diff?<scope>&<expand>&<comment>")]
 pub fn diff_pane(
     db: &State<Db>,
     settings: &State<Settings>,
@@ -131,20 +136,17 @@ pub fn diff_pane(
     id: i64,
     scope: Option<&str>,
     expand: Option<&str>,
+    comment: Option<&str>,
 ) -> Result<Tmpl, Status> {
-    let view = View { scope, expand };
-    // Only here is the pane a response of its own, so only here can it carry an
-    // ETag over its own bytes — see `initial`.
-    let context = context! { etag => Tmpl::ETAG_SLOT, ..pane(db, settings, cache, id, view)? };
-    Ok(Tmpl("_review.html", context))
+    let view = View {
+        scope,
+        expand,
+        comment,
+    };
+    Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
 }
 
 /// Everything `_review.html` needs, for the drawer's first render.
-///
-/// NB: no ETag. The placeholder is filled with the digest of whatever response
-/// carries it, and here that is the whole board page — a value the pane's own
-/// poll could never match. The first tick after opening a card is a plain `200`
-/// and every one after it is conditional.
 pub fn initial(
     db: &Db,
     settings: &Settings,
@@ -152,16 +154,21 @@ pub fn initial(
     id: i64,
     scope: Option<&str>,
 ) -> Result<minijinja::Value, Status> {
-    pane(
-        db,
-        settings,
-        cache,
-        id,
-        View {
-            scope,
-            ..View::default()
-        },
-    )
+    // Nested in the board page, so the out-of-band copy of the review tab's
+    // stat is left off — the markup it would update is in this same response.
+    Ok(context! {
+        standalone => false,
+        ..pane(
+            db,
+            settings,
+            cache,
+            id,
+            View {
+                scope,
+                ..View::default()
+            },
+        )?
+    })
 }
 
 fn pane(
@@ -199,11 +206,19 @@ fn pane(
         rocket::uri!(diff_pane(
             id = id,
             scope = Some(scope),
-            expand = Some(expand)
+            expand = Some(expand),
+            comment = Option::<&str>::None
         ))
         .to_string()
     };
     let opening = |expansion: &Expansion| link(&scope_key, &expansion.key());
+
+    // `<path>#<side>:<line>` split back into what the comment form posts.
+    let anchored = view.comment.and_then(|key| {
+        let (path, anchor) = key.rsplit_once('#')?;
+        let (side, line) = anchor.split_once(':')?;
+        Some((path.to_owned(), side.to_owned(), line.to_owned()))
+    });
 
     // What the card last had recorded of it, as a tree, so the worktree can be
     // compared against it.
@@ -374,10 +389,23 @@ fn pane(
         scope_kind => scope.anchor.kind(),
         additions => totals.0,
         deletions => totals.1,
+        standalone => true,
         scope => scope_key,
         expand => expand_key,
-        poll_interval => settings.poll_interval,
-        source => link(&scope_key, &expand_key),
+        // The same view with nothing being commented on: what a line links to
+        // when its box is already open, and what closing one lands on.
+        comment_base => link(&scope_key, &expand_key),
+        comment => view.comment,
+        comment_file => anchored.as_ref().map(|a| a.0.clone()),
+        comment_side => anchored.as_ref().map(|a| a.1.clone()),
+        comment_line => anchored.as_ref().map(|a| a.2.clone()),
+        // Carries the open box, so an update redraws it rather than dropping it.
+        source => rocket::uri!(diff_pane(
+            id = id,
+            scope = Some(&scope_key),
+            expand = Some(&expand_key),
+            comment = view.comment
+        )).to_string(),
     })
 }
 
@@ -455,6 +483,7 @@ impl ViewForm {
         View {
             scope: Some(&self.scope),
             expand: self.expand.as_deref(),
+            comment: None,
         }
     }
 }
@@ -497,6 +526,7 @@ pub fn add_comment(
     let view = View {
         scope: Some(&form.scope),
         expand: form.expand.as_deref(),
+        comment: None,
     };
     Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
 }
@@ -556,6 +586,7 @@ pub fn toggle_viewed(
     let view = View {
         scope: Some(&form.scope),
         expand: form.expand.as_deref(),
+        comment: None,
     };
     Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
 }

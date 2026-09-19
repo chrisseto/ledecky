@@ -70,9 +70,9 @@ commit would carry a timestamp and so change on every read, defeating both the
 diff cache and the pane's ETag. `refs/ledecky/<card>/working` holds it so `gc`
 cannot prune it mid-read, and it goes away with the worktree.
 
-The pane polls, so a range that ends at the worktree keeps up on its own. It
-holds still while a comment is open or the picker is down, and an unchanged diff
-is answered `304` and never swapped.
+A range that ends at the worktree keeps up on its own: the watcher notices the
+write and the pane redraws by morphing, so a comment being typed keeps its text
+and its place rather than having to hold the update off.
 
 **Review.** The diff is rendered by piping `git diff` through [delta][] at full
 context. Full context is what makes highlighting correct: a block comment or
@@ -93,10 +93,12 @@ to one. The diff opens with three lines of context; *Expand N lines above/below*
 takes a bite out of a gap and *Expand whole file* opens all of them. What is
 open lives in the pane's query string, so nothing about it is server state — and
 it is keyed by path rather than by position in the diff, so a file appearing
-upstream mid-poll cannot slide it onto a different one. Ticking *Viewed* folds a
+upstream mid-update cannot slide it onto a different one. Ticking *Viewed* folds a
 file away, and that much is remembered per card.
 
-Click any diff line to comment; clicking away saves it as a draft. *Send N to
+Click any diff line to comment; which line is open lives in the pane's query
+string like everything else, so an update redraws the box where it already was.
+Clicking away saves it as a draft. *Send N to
 agent* formats the batch into one message and pastes it into the agent's
 terminal.
 
@@ -124,13 +126,28 @@ that never paints one is given up on after five seconds.
 
 [delta]: https://github.com/dandavison/delta
 
-**Polling.** The board and the agent-state chip poll themselves through unpoly.
-Every template response carries an `ETag` over its own rendered bytes, so a poll
-that finds nothing new is answered `304` and unpoly skips the update entirely —
-the board is not re-rendered, and hover, selection and per-lane scroll survive.
-The board's etag is rendered into `up-etag` so even the first poll is
-conditional. When something has changed, `up-keep` on each card means only the
-cards that actually differ are replaced.
+**Updates.** Nothing polls. A board holds one `EventSource` open on `/events`,
+and every fragment that used to poll — the board, the agent-state chip, the
+agent pane, the review pane — listens for a named event on it and fetches itself
+when one lands. The events are signals only, so rendering stays in the ordinary
+routes and a connected client costs no template work.
+
+Three things produce them: the writes that change a card, the agent-state
+changes the hooks report, and a `notify` watch on each live worktree — that last
+one being the only change the server has no other way to hear about, since an
+agent editing files runs no route and fires no hook. A burst of writes that git
+ignores in its entirety — a build, an install — is not work anyone is reviewing
+and is dropped rather than restaged, which is the difference between one `git
+add -A` and one per reader for as long as the build runs. Every connection opens with
+a resync, so a page rendered just before the stream came up, or one whose tab was
+backgrounded, cannot be left showing something stale.
+
+Updates are applied by morphing, so an element keeps its identity: a card that
+did not change keeps its live node, each lane keeps its scroll position, and a
+comment half-typed into the review pane keeps both its text and its place. The
+terminal carries `hx-morph-skip` because xterm builds that subtree on the client
+and the server knows nothing about it. Responses still carry an `ETag` over
+their own bytes, which now saves the bytes rather than the redraw.
 
 **Merge.** Available in In Review. The server asks the agent to land its commits
 on the base branch and never rewrites branches itself. On the next turn it
@@ -149,7 +166,11 @@ variable:
 | `app_slug` | `ledecky` | Names the data directory and the `refs/<slug>/` namespace |
 | `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
 | `agent_bin` | `claude` | The executable spawned for an agent |
-| `poll_interval` | `4000` | How often a polled fragment re-checks the server, in ms |
+| `watch_debounce` | `250` | How long a burst of worktree writes settles before the diff is announced, in ms |
+| `head_ttl` | `30000` | How long a staged worktree head stands without the watcher, in ms |
+
+`Rocket.toml` carries the agent plumbing's real-time waits beside these; the
+end-to-end suite shrinks every one of them rather than waiting them out.
 
 The port is fixed in `Rocket.toml` because hook URLs have to be stable.
 
