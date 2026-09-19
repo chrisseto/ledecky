@@ -489,14 +489,26 @@ test("a review comment goes back to the agent and produces its own turn", async 
 
   await page.getByRole("button", { name: /Send \d+ to agent/ }).click();
 
-  // Once sent the comment stays put, marked as delivered.
-  await expect(draft.locator(".tag")).toHaveText("sent to agent");
+  // Feedback already given is not feedback to give: every working range ends at
+  // the live head, so sending takes the batch off the screen it was written on.
+  await expect(page.locator("#review .comment")).toHaveCount(0);
   await expectTurns(2);
 
   // Scoping to the second turn shows only what the review round added.
   const scoped = addedLines(`refs/ledecky/${cardId}/turn-1`, `refs/ledecky/${cardId}/turn-2`);
   expect(scoped).toContain("Say hello instead.");
   expect(scoped).not.toContain(TASK);
+
+  // And asking for the turn it was written against is asking for its record:
+  // there it is, delivered and no longer yours to withdraw.
+  const menu = page.locator("#review [data-range-menu]");
+  await menu.locator("summary").click();
+  await menu.locator(".menu-item.anchor-turn", { hasText: "Turn 1" }).click();
+  await page.locator("#review .modes a.mode", { hasText: "Just this" }).click();
+
+  await expect(draft).toHaveCount(1);
+  await expect(draft.locator(".tag")).toHaveText("sent to agent");
+  await expect(draft.getByRole("button", { name: "Remove" })).toHaveCount(0);
 });
 
 test("drafts can be thrown away in one go", async ({ page }) => {
@@ -508,8 +520,35 @@ test("drafts can be thrown away in one go", async ({ page }) => {
   await page.getByRole("button", { name: "Discard" }).click();
 
   await expect(page.locator("#review .comment-draft")).toHaveCount(0);
-  // What was already sent is not a draft, so it stays.
-  await expect(page.locator("#review .comment-submitted")).toBeVisible();
+  // The round before this one was sent, and sent comments live on their own
+  // turn rather than on the range the card is at now.
+  await expect(page.locator("#review .comment-submitted")).toHaveCount(0);
+});
+
+test("a comment left on an older turn stays there", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const review = page.locator("#review");
+  const menu = review.locator("[data-range-menu]");
+
+  await menu.locator("summary").click();
+  await menu.locator(".menu-item.anchor-turn", { hasText: "Turn 1" }).click();
+  await review.locator(".modes a.mode", { hasText: "Just this" }).click();
+
+  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Old news.");
+  const draft = review.locator(".comment", { hasText: "Old news." });
+  await expect(draft).toHaveCount(1);
+
+  // Back at the head of the card it is not on screen — but the count is
+  // card-wide, so it is not lost either.
+  await menu.locator("summary").click();
+  await menu.getByText("What this card is based on").click();
+
+  await expect(draft).toHaveCount(0);
+  await expect(review.locator(".batch-label")).toContainText("1 on another range");
+
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(review.locator(".batch-label")).not.toContainText("another range");
 });
 
 test("a rebase keeps upstream commits out of the card's diff", async ({ page }) => {

@@ -245,6 +245,8 @@
       <span class="batch-label">
         {% if drafts %}
           {{ drafts }} comment{{ "" if drafts == 1 else "s" }} pending
+          {# The count is card-wide, so say when some of it is not on screen. #}
+          {% if stranded %}<span class="aside">· {{ stranded }} on another range</span>{% endif %}
         {% elif submitted %}
           {{ submitted }} sent · add comments to send a batch
         {% else %}

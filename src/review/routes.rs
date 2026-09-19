@@ -185,8 +185,21 @@ fn pane(
     let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
     let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
     let turns = Turn::for_card(&conn, id);
-    let comments = Comment::for_card(&conn, id);
     let viewed = Viewed::for_card(&conn, id);
+
+    // A comment belongs to the point in history it was written against, so only
+    // the range that ends there asks for it.
+    let here = Comment::find_in_range(
+        &conn,
+        id,
+        viewing_turn(&scope, &turns),
+        scope.snapshot_turn().is_some(),
+    )
+    .map_err(|err| failed(id, "reading the comments", err))?;
+    // The batch goes whole, so the count is card-wide even where the range is
+    // not: a draft left on another one is never simply lost.
+    let pending =
+        Comment::draft_count(&conn, id).map_err(|err| failed(id, "counting the drafts", err))?;
     drop(conn);
 
     // Everything below shells out to git, so the lock is already back.
@@ -271,12 +284,13 @@ fn pane(
         })
         .collect();
 
-    let drafts = comments.iter().filter(|c| c.is_draft()).count();
-    let submitted = comments.len() - drafts;
+    let showing = here.iter().filter(|c| c.is_draft()).count();
+    let stranded = pending - showing as i64;
+    let submitted = here.len() - showing;
 
     // Comments hang off `<file>#<side>:<line>` so a template lookup is one hit.
     let mut threads: HashMap<String, Vec<Comment>> = HashMap::new();
-    for comment in &comments {
+    for comment in &here {
         threads
             .entry(comment.anchor())
             .or_default()
@@ -294,7 +308,9 @@ fn pane(
         None => Default::default(),
     };
 
-    let counts = |path: &str| comments.iter().filter(|c| c.file_path == path).count();
+    // Only what the reader will actually find in that file: a badge over a
+    // range that renders none of them would send them looking for nothing.
+    let counts = |path: &str| here.iter().filter(|c| c.file_path == path).count();
     let tree = group(&files, &viewed, counts);
 
     let rendered: Vec<FileView> = files
@@ -378,7 +394,8 @@ fn pane(
     });
 
     Ok(context! {
-        card, tree, threads, scopes, modes, drafts, submitted, last_message, turn_note,
+        card, tree, threads, scopes, modes, submitted, stranded, last_message, turn_note,
+        drafts => pending,
         files => rendered,
         has_diff => !files.is_empty(),
         // Whether the card has any history at all to point the picker at — not
@@ -407,6 +424,27 @@ fn pane(
             comment = view.comment
         )).to_string(),
     })
+}
+
+/// A query that did not answer. Nothing the pane reads is optional, so there is
+/// no half-rendered version of it worth serving.
+fn failed(card_id: i64, what: &str, err: rusqlite::Error) -> Status {
+    error!("card {card_id}: {what}: {err:#}");
+    Status::InternalServerError
+}
+
+/// The turn a range ends at.
+///
+/// This is both what a comment written on that range belongs to and what
+/// decides whether an existing one still has a place on it, so the write and
+/// the read have to agree — a comment left while pinned to turn 1 that answered
+/// to the latest turn would vanish the moment it was saved.
+fn viewing_turn(scope: &Scope, turns: &[Turn]) -> Option<i64> {
+    match scope.snapshot_turn() {
+        Some(n) => turns.iter().find(|turn| turn.n == n).map(|turn| turn.id),
+        // Every other range ends at the live head, which is the card as it is.
+        None => turns.last().map(|turn| turn.id),
+    }
 }
 
 /// What the agent's worktree has checked out, for listing the commits it made.
@@ -510,11 +548,11 @@ pub fn add_comment(
     let body = form.body.trim();
     if !body.is_empty() {
         let conn = db.lock();
-        let turn_id = Turn::latest_id(&conn, id);
+        let turns = Turn::for_card(&conn, id);
         Comment::create(
             &conn,
             id,
-            turn_id,
+            viewing_turn(&Scope::parse(Some(&form.scope)), &turns),
             &form.file_path,
             form.line,
             Side::parse(&form.side),
@@ -601,7 +639,14 @@ pub fn submit_review(
     id: i64,
     form: Form<ViewForm>,
 ) -> Result<Tmpl, Status> {
-    let drafts = Comment::drafts(&db.lock(), id);
+    let scope = Scope::parse(Some(&form.scope));
+    let (drafts, turn) = {
+        let conn = db.lock();
+        let turns = Turn::for_card(&conn, id);
+        let drafts =
+            Comment::drafts(&conn, id).map_err(|err| failed(id, "reading the drafts", err))?;
+        (drafts, viewing_turn(&scope, &turns))
+    };
 
     if !drafts.is_empty() {
         let agent = agents
@@ -609,13 +654,12 @@ pub fn submit_review(
             .filter(|a| a.is_running())
             .ok_or(Status::Conflict)?;
 
-        let scope = Scope::parse(Some(&form.scope));
         // A busy terminal means a modal is up; leave the drafts alone to retry.
         if !agent.inject(&format_review(&drafts, &scope.label())) {
             return Err(Status::Conflict);
         }
 
-        Comment::mark_submitted(&db.lock(), id);
+        Comment::mark_submitted(&db.lock(), id, turn);
     }
 
     Ok(Tmpl(

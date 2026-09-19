@@ -79,23 +79,73 @@ impl Comment {
         format!("{}#{}:{}", self.file_path, self.side, self.line)
     }
 
-    pub fn for_card(conn: &Connection, card_id: i64) -> Vec<Self> {
-        conn.prepare(&format!(
-            "SELECT {} FROM comments WHERE card_id = ?1 ORDER BY id",
-            Self::COLUMNS
-        ))
-        .and_then(|mut stmt| {
-            stmt.query_map([card_id], Self::from_row)
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
-        .unwrap_or_default()
+    fn query(
+        conn: &Connection,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> rusqlite::Result<Vec<Self>> {
+        conn.prepare(&format!("SELECT {} FROM comments {sql}", Self::COLUMNS))?
+            .query_map(params, Self::from_row)?
+            .collect()
     }
 
-    pub fn drafts(conn: &Connection, card_id: i64) -> Vec<Self> {
-        Self::for_card(conn, card_id)
-            .into_iter()
-            .filter(Self::is_draft)
-            .collect()
+    /// The comments that belong on one range of the card's diff.
+    ///
+    /// `turn` is the turn the range ends at. `history` says that range is a
+    /// snapshot of a turn already past rather than the card as it stands — the
+    /// difference between a record to read back and somewhere feedback has yet
+    /// to go, which is what decides whether comments already sent come with it.
+    ///
+    /// NB: this is why a batch leaves the screen the moment it is sent. Every
+    /// working range ends at the live head and so asks for drafts alone; the
+    /// comments are reachable again only by naming their turn in the picker.
+    ///
+    /// NB: `IS` rather than `=`, to compare null-safely — a card with no turns
+    /// yet has no id to match against. A comment written in that window names
+    /// no turn either, and belongs to the working range until sending pins it.
+    ///
+    /// Ordered by id, which is the order they were written: a line carrying
+    /// more than one reads as the thread it was.
+    pub fn find_in_range(
+        conn: &Connection,
+        card_id: i64,
+        turn: Option<i64>,
+        history: bool,
+    ) -> rusqlite::Result<Vec<Self>> {
+        match history {
+            true => Self::query(
+                conn,
+                "WHERE card_id = ?1 AND turn_id IS ?2 ORDER BY id",
+                rusqlite::params![card_id, turn],
+            ),
+            false => Self::query(
+                conn,
+                "WHERE card_id = ?1 AND state = 'draft'
+                   AND (turn_id IS ?2 OR turn_id IS NULL)
+                 ORDER BY id",
+                rusqlite::params![card_id, turn],
+            ),
+        }
+    }
+
+    /// Ordered by id so the batch reaches the agent in the order it was written,
+    /// which is the order the reviewer was thinking in.
+    pub fn drafts(conn: &Connection, card_id: i64) -> rusqlite::Result<Vec<Self>> {
+        Self::query(
+            conn,
+            "WHERE card_id = ?1 AND state = 'draft' ORDER BY id",
+            [card_id],
+        )
+    }
+
+    /// Every draft on the card, including any the range on screen does not
+    /// render — the batch goes to the agent whole, so the count has to say so.
+    pub fn draft_count(conn: &Connection, card_id: i64) -> rusqlite::Result<i64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM comments WHERE card_id = ?1 AND state = 'draft'",
+            [card_id],
+            |r| r.get(0),
+        )
     }
 
     pub fn create(
@@ -131,10 +181,34 @@ impl Comment {
         );
     }
 
-    pub fn mark_submitted(conn: &Connection, card_id: i64) {
+    /// Sends the card's drafts, pinning them to the turn they were given at.
+    ///
+    /// Sending is what turns a note into a record, so it is also where one
+    /// written before the card had any turn finally gets one — up to then it
+    /// answers to the working range and needs no id of its own.
+    pub fn mark_submitted(conn: &Connection, card_id: i64, turn: Option<i64>) {
         let _ = conn.execute(
-            "UPDATE comments SET state = 'submitted' WHERE card_id = ?1 AND state = 'draft'",
-            [card_id],
+            "UPDATE comments
+                SET state = 'submitted', turn_id = COALESCE(turn_id, ?2)
+              WHERE card_id = ?1 AND state = 'draft'",
+            rusqlite::params![card_id, turn],
+        );
+    }
+
+    /// Files under `turn` the comments that were sent before the card had one.
+    ///
+    /// Sending is what pins a comment, and a review given while the agent's
+    /// first turn was still running has nothing to be pinned to: the worktree
+    /// was reviewable long before any turn recorded it. The turn that lands
+    /// next is the record of the work it was written against, and without this
+    /// it would be a row no range ever renders again — not a draft, so no
+    /// working range wants it, and named by no turn, so no snapshot has it.
+    pub fn adopt_orphans(conn: &Connection, card_id: i64, turn: i64) {
+        let _ = conn.execute(
+            "UPDATE comments
+                SET turn_id = ?2
+              WHERE card_id = ?1 AND turn_id IS NULL AND state = 'submitted'",
+            rusqlite::params![card_id, turn],
         );
     }
 }
@@ -177,6 +251,24 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Every row on the card, whatever range it answers to. Unordered: what
+    /// these assertions count does not depend on it.
+    fn all(conn: &Connection, card_id: i64) -> Vec<Comment> {
+        Comment::query(conn, "WHERE card_id = ?1", [card_id]).unwrap()
+    }
+
+    /// `turn_id` is a foreign key, so a comment can only name a turn that is
+    /// really there.
+    fn turn(conn: &Connection, card_id: i64, n: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO turns (card_id, n, ref_name, commit_sha, parent_sha)
+             VALUES (?1, ?2, ?3, ?4, '')",
+            rusqlite::params![card_id, n, format!("refs/x/turn-{n}"), format!("sha{n}")],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
     }
 
     fn sample(file_path: &str, line: i64, side: &str, body: &str) -> Comment {
@@ -235,6 +327,90 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_shows_only_on_the_range_that_ends_where_it_was_written() {
+        let db = memory_db();
+        let conn = db.lock();
+        let card_id = card(&conn);
+        let (first, second) = (turn(&conn, card_id, 1), turn(&conn, card_id, 2));
+
+        Comment::create(&conn, card_id, Some(first), "a.rs", 1, Side::New, "on 1").unwrap();
+        Comment::create(&conn, card_id, Some(second), "a.rs", 2, Side::New, "on 2").unwrap();
+        Comment::mark_submitted(&conn, card_id, Some(second));
+        Comment::create(&conn, card_id, Some(second), "a.rs", 3, Side::New, "fresh").unwrap();
+
+        let bodies = |turn, history| {
+            Comment::find_in_range(&conn, card_id, turn, history)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.body)
+                .collect::<Vec<_>>()
+        };
+
+        // The card as it stands wants feedback still to give, not feedback given.
+        assert_eq!(bodies(Some(second), false), ["fresh"]);
+        // Reading turn 2 back is reading its record, which is both.
+        assert_eq!(bodies(Some(second), true), ["on 2", "fresh"]);
+        // And turn 1 keeps its own, wherever turn 2 has got to.
+        assert_eq!(bodies(Some(first), true), ["on 1"]);
+        assert!(bodies(Some(first), false).is_empty());
+    }
+
+    #[test]
+    fn a_comment_written_before_the_first_turn_waits_on_the_working_range() {
+        let db = memory_db();
+        let conn = db.lock();
+        let card_id = card(&conn);
+
+        // A dirty worktree is reviewable long before a turn records it, so there
+        // is no turn for this to name yet.
+        Comment::create(&conn, card_id, None, "a.rs", 1, Side::New, "early").unwrap();
+        let bodies = |turn, history| {
+            Comment::find_in_range(&conn, card_id, turn, history)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.body)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bodies(None, false), ["early"]);
+
+        // A turn lands under it; it is still the card as it stands, so it stays.
+        let first = turn(&conn, card_id, 1);
+        assert_eq!(bodies(Some(first), false), ["early"]);
+
+        // Sending is what pins it, so it can be read back afterwards.
+        Comment::mark_submitted(&conn, card_id, Some(first));
+        assert!(bodies(Some(first), false).is_empty());
+        assert_eq!(bodies(Some(first), true), ["early"]);
+    }
+
+    #[test]
+    fn a_review_sent_before_the_first_turn_is_filed_under_it() {
+        let db = memory_db();
+        let conn = db.lock();
+        let card_id = card(&conn);
+
+        // The agent is on its first turn and has already dirtied the worktree,
+        // so there is something to review and nothing yet to pin it to.
+        Comment::create(&conn, card_id, None, "a.rs", 1, Side::New, "early").unwrap();
+        Comment::mark_submitted(&conn, card_id, None);
+
+        let first = turn(&conn, card_id, 1);
+        Comment::adopt_orphans(&conn, card_id, first);
+
+        let bodies = |turn, history| {
+            Comment::find_in_range(&conn, card_id, turn, history)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.body)
+                .collect::<Vec<_>>()
+        };
+
+        // Without the turn it names, this row would be on no range at all.
+        assert_eq!(bodies(Some(first), true), ["early"]);
+        assert!(bodies(Some(first), false).is_empty());
+    }
+
+    #[test]
     fn drafts_are_separated_from_submitted_comments() {
         let db = memory_db();
         let conn = db.lock();
@@ -242,15 +418,16 @@ mod tests {
 
         Comment::create(&conn, card_id, None, "a.rs", 1, Side::New, "first").unwrap();
         Comment::create(&conn, card_id, None, "a.rs", 2, Side::New, "second").unwrap();
-        assert_eq!(Comment::drafts(&conn, card_id).len(), 2);
+        assert_eq!(Comment::drafts(&conn, card_id).unwrap().len(), 2);
 
-        Comment::mark_submitted(&conn, card_id);
-        assert!(Comment::drafts(&conn, card_id).is_empty());
+        Comment::mark_submitted(&conn, card_id, None);
+        assert!(Comment::drafts(&conn, card_id).unwrap().is_empty());
 
-        // Submitted comments stay visible on the diff.
-        let all = Comment::for_card(&conn, card_id);
-        assert_eq!(all.len(), 2);
-        assert!(all.iter().all(|c| c.state == Comment::SUBMITTED));
+        // Sending keeps the rows; which range still renders them is
+        // `find_in_range`'s business.
+        let sent = all(&conn, card_id);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|c| c.state == Comment::SUBMITTED));
     }
 
     #[test]
@@ -261,13 +438,13 @@ mod tests {
 
         let draft = Comment::create(&conn, card_id, None, "a.rs", 1, Side::New, "oops").unwrap();
         Comment::delete_draft(&conn, card_id, draft);
-        assert!(Comment::for_card(&conn, card_id).is_empty());
+        assert!(all(&conn, card_id).is_empty());
 
         let sent = Comment::create(&conn, card_id, None, "a.rs", 1, Side::New, "sent").unwrap();
-        Comment::mark_submitted(&conn, card_id);
+        Comment::mark_submitted(&conn, card_id, None);
         Comment::delete_draft(&conn, card_id, sent);
 
         // Already delivered to the agent, so removing it would rewrite history.
-        assert_eq!(Comment::for_card(&conn, card_id).len(), 1);
+        assert_eq!(all(&conn, card_id).len(), 1);
     }
 }

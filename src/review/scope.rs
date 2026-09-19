@@ -167,6 +167,32 @@ impl Scope {
         }
     }
 
+    /// The turn this range is a snapshot of, if it is one.
+    ///
+    /// Only one turn read on its own is a point in the past a comment can be
+    /// named by, which is what decides whether a comment already sent to the
+    /// agent belongs on screen — the difference between reading a record back
+    /// and reviewing work still in front of you.
+    ///
+    /// NB: `Just <commit>` is fixed too — `parent..commit` moves no more than a
+    /// turn does — but a commit is not what a comment is pinned to, so it is
+    /// read here as the card as it stands. A comment left on one is filed under
+    /// the turn that swallowed it and comes back on that turn's range, which is
+    /// a wider diff than the commit it was written on.
+    ///
+    /// NB: this identifies the turn, not the range a comment was written on.
+    /// One left on "All changes" spans `base..turn n` and comes back on
+    /// `turn n-1..turn n` — a different diff with the same post-image, so its
+    /// new-side line still lands while an old-side one describes a pre-image
+    /// that is no longer there. Naming the pair exactly would mean recording
+    /// both revisions and giving the picker an as-of to reach them by.
+    pub fn snapshot_turn(&self) -> Option<i64> {
+        match (&self.anchor, self.mode) {
+            (Anchor::Turn(n), Mode::Just) => Some(*n),
+            _ => None,
+        }
+    }
+
     /// The pair of revisions to diff, or `None` when there is nothing yet.
     ///
     /// Pure: `head` is resolved by the caller, which is the only part of this
@@ -405,6 +431,22 @@ mod tests {
         // And a key naming one of them is not honoured.
         assert_eq!(Scope::parse(Some("since-live")), Scope::default());
         assert_eq!(Scope::parse(Some("just-base")), Scope::default());
+    }
+
+    #[test]
+    fn only_one_turn_on_its_own_is_a_fixed_snapshot() {
+        assert_eq!(scope(Mode::Just, Anchor::Turn(3)).snapshot_turn(), Some(3));
+
+        // Everything else names no turn, so it is read as the card as it stands.
+        for other in [
+            scope(Mode::Since, Anchor::Turn(3)),
+            scope(Mode::Since, Anchor::Base),
+            scope(Mode::Just, Anchor::Live),
+            scope(Mode::Just, Anchor::Commit("abc1234".into())),
+            scope(Mode::Since, Anchor::Commit("abc1234".into())),
+        ] {
+            assert_eq!(other.snapshot_turn(), None, "{}", other.key());
+        }
     }
 
     #[test]

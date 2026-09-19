@@ -7,7 +7,7 @@ use rusqlite::{Connection, Row};
 use crate::config::Settings;
 use crate::git;
 use crate::project::Card;
-use crate::review::DiffCache;
+use crate::review::{Comment, DiffCache};
 
 /// A snapshot of the worktree at the end of one agent turn.
 ///
@@ -67,15 +67,6 @@ impl Turn {
         .ok()
     }
 
-    pub fn latest_id(conn: &Connection, card_id: i64) -> Option<i64> {
-        conn.query_row(
-            "SELECT id FROM turns WHERE card_id = ?1 ORDER BY n DESC LIMIT 1",
-            [card_id],
-            |r| r.get(0),
-        )
-        .ok()
-    }
-
     fn next_number(conn: &Connection, card_id: i64) -> i64 {
         conn.query_row(
             "SELECT COALESCE(MAX(n), 0) + 1 FROM turns WHERE card_id = ?1",
@@ -94,7 +85,7 @@ impl Turn {
         parent_sha: &str,
         message: &str,
     ) {
-        let _ = conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO turns
                  (card_id, n, ref_name, commit_sha, parent_sha, last_assistant_message)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -107,6 +98,12 @@ impl Turn {
                 message
             ],
         );
+
+        // NB: a review sent while this turn was still running had no turn to be
+        // pinned to; this one is the record of what it was written against.
+        if inserted.is_ok() {
+            Comment::adopt_orphans(conn, card_id, conn.last_insert_rowid());
+        }
     }
 
     /// Snapshots `worktree` as the card's next turn.
@@ -290,7 +287,6 @@ mod tests {
         assert_eq!(latest.last_assistant_message.as_deref(), Some("second"));
 
         assert_eq!(Turn::for_card(&conn, card_id).len(), 2);
-        assert_eq!(Turn::latest_id(&conn, card_id), Some(latest.id));
     }
 
     #[test]

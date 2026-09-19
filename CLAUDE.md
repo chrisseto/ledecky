@@ -59,6 +59,21 @@ It cannot pay for that footgun at this suite's size.
   by `global-setup` and passed to the workers in `LEDECKY_TEST_ROOT`. Teardown
   removes it, so set `E2E_DEBUG=1` when you want to read what a run left.
 
+## Writing queries
+
+**A query returns `rusqlite::Result`, never a default.** `unwrap_or_default()`
+on a `SELECT` turns a broken statement into an empty board, an empty diff or a
+card with no comments — the page renders, nothing says anything is wrong, and
+the bug surfaces as "my data disappeared". Propagate, and let the route decide:
+routes returning `Result<_, Status>` log and answer `500`. There is older code
+that swallows; don't copy it.
+
+Keep the SQL plain. No `CASE` — branch in Rust and hand each arm its own
+statement. No comments inside the string; the reason belongs in the doc comment
+or an `NB:` above the call. An `ORDER BY` needs a reason a caller can feel: a
+thread reading in the order it was written, a batch reaching the agent that way.
+Don't add one to a query whose caller only counts.
+
 ## Iterating on Rust only
 
 `LEDECKY_SKIP_ASSETS=1` skips the `pnpm build` in `build.rs` and embeds

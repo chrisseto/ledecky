@@ -1024,6 +1024,7 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 .batch-label { font-size: 12.5px; font-weight: 600; color: var(--fg-dim); }
 .batch.pending { background: oklch(0.7 0.08 80 / 0.08); }
 .batch.pending .batch-label { color: var(--warn-text); }
+.batch-label .aside { font-weight: 500; color: var(--fg-dim); }
 
 /* ---- diff syntax tokens ---- */
 /*
