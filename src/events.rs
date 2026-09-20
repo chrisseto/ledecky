@@ -129,10 +129,12 @@ pub fn stream(
     // watching. Doing it on connect rather than at worktree creation is what
     // carries the watches across a restart.
     //
-    // NB: off this thread. Establishing a recursive watch walks the whole
-    // checkout — ~90ms for one an agent has run a build in — and this is a sync
-    // handler, so doing it inline would hold a Rocket worker and keep the
-    // stream from opening for as long as it took. Nothing below waits on it.
+    // NB: off this thread. Establishing a watch walks the checkout, and this is
+    // a sync handler — so doing it inline would hold a Rocket worker and keep
+    // the stream from opening for as long as it took. The walk stops at every
+    // directory git ignores now, so that is the repo's size rather than its
+    // build output's, but it is still a walk per live card. Nothing below waits
+    // on it.
     let db = db.inner().clone();
     let worktrees = worktrees.inner().clone();
     let announce = changes.inner().clone();

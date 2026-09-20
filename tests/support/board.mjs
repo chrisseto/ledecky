@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { expect } from "@playwright/test";
 
 import { terminalRows } from "./dom.mjs";
@@ -18,8 +18,17 @@ export const worktreeOf = (cardId) => join(DATA_HOME, "ledecky", "worktrees", St
  * The fake agent only ever appends on a prompt, so work that arrives *between*
  * turns — which is most of what a real agent does — has to be made here.
  */
-export const editWorktree = (cardId, path, body) =>
-  writeFileSync(join(worktreeOf(cardId), path), body);
+export const editWorktree = (cardId, path, body) => {
+  const file = join(worktreeOf(cardId), path);
+  // A directory the agent makes on its way is a case of its own for the
+  // watcher, so writing into one has to be sayable here.
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, body);
+};
+
+/** The other half of `editWorktree`: work the agent took away. */
+export const removeInWorktree = (cardId, path) =>
+  rmSync(join(worktreeOf(cardId), path), { recursive: true, force: true });
 
 export const worktreeGit = (cardId, ...args) =>
   execFileSync("git", ["-C", worktreeOf(cardId), ...args], { encoding: "utf8" }).trim();

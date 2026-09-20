@@ -136,12 +136,17 @@ routes and a connected client costs no template work.
 Three things produce them: the writes that change a card, the agent-state
 changes the hooks report, and a `notify` watch on each live worktree — that last
 one being the only change the server has no other way to hear about, since an
-agent editing files runs no route and fires no hook. A burst of writes that git
-ignores in its entirety — a build, an install — is not work anyone is reviewing
-and is dropped rather than restaged, which is the difference between one `git
-add -A` and one per reader for as long as the build runs. Every connection opens with
-a resync, so a page rendered just before the stream came up, or one whose tab was
-backgrounded, cannot be left showing something stale.
+agent editing files runs no route and fires no hook. What git ignores is not
+watched at all: the watch is a descriptor per directory, so a recursive one over
+a worktree an agent has built in spends hundreds against a repo's dozen — enough
+for one `node_modules` to exhaust `fs.inotify.max_user_watches` where that is
+the common 8192. The set is walked instead, pruned at every ignored directory,
+and kept up as directories come and go. A burst that git ignores in its entirety
+is dropped rather than restaged anyway, since rules can change under a live
+watch — the difference between one `git add -A` and one per reader for as long
+as the build runs. Every connection opens with a resync, so a page rendered just
+before the stream came up, or one whose tab was backgrounded, cannot be left
+showing something stale.
 
 Updates are applied by morphing, so an element keeps its identity: a card that
 did not change keeps its live node, each lane keeps its scroll position, and a

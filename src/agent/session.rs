@@ -107,9 +107,10 @@ pub fn start(
     // being up rather than on anything the card records.
     changes.card(db, card_id, Kind::State);
 
-    // After the spawn, deliberately: establishing a recursive watch walks the
-    // whole checkout, and nothing should stand between the agent starting and
-    // the card being able to say so.
+    // After the spawn, deliberately: this runs on the request thread and
+    // establishing a watch walks the worktree. A worktree this new holds only
+    // what the checkout put there, so the walk is short — but nothing should
+    // stand between the agent starting and the card being able to say so.
     worktrees.ensure(card_id, card.project_id, &worktree);
 
     let started = agent.clone();

@@ -15,6 +15,7 @@ import {
   openAgent,
   openCard,
   pollsOfPath,
+  removeInWorktree,
   turnRefs,
   worktreeGit,
 } from "./support/board.mjs";
@@ -280,6 +281,47 @@ test("the pane keeps up with the worktree on its own", async ({ page }) => {
   editWorktree(cardId, "later-still.txt", "and another\n");
   await expect(fileSection(page, "later-still.txt")).toBeVisible();
   expect(refetches).toHaveLength(afterFirst + 1);
+});
+
+test("work in a directory the agent just made announces itself too", async ({ page }) => {
+  const refetches = pollsOfPath(page, `/cards/${cardId}/diff`);
+  await openCard(page, cardId);
+  await expect(page.locator("#review .file").first()).toBeVisible();
+
+  // Nothing git ignores is watched, so a new directory has to be picked up as
+  // it arrives — and the file inside it lands before the watch on it does.
+  editWorktree(cardId, "pkg/arrived.txt", "written into a directory that did not exist\n");
+  await expect(fileSection(page, "pkg/arrived.txt")).toBeVisible();
+
+  // And it is watched from then on rather than merely swept up the once: a
+  // second write to the same directory moves the pane by itself, and only once.
+  const afterFirst = refetches.length;
+  editWorktree(cardId, "pkg/again.txt", "and again, into one that now exists\n");
+  await expect(fileSection(page, "pkg/again.txt")).toBeVisible();
+  expect(refetches).toHaveLength(afterFirst + 1);
+});
+
+test("a directory replaced wholesale is watched again", async ({ page }) => {
+  const refetches = pollsOfPath(page, `/cards/${cardId}/diff`);
+  await openCard(page, cardId);
+
+  // Watched for certain before it is replaced: the write has to have landed.
+  editWorktree(cardId, "swap/first.txt", "a directory to take away again\n");
+  await expect(fileSection(page, "swap/first.txt")).toBeVisible();
+
+  // Deleted and remade inside one burst. The descriptor was on the old inode,
+  // which the kernel dropped with it, so the watch has to be laid again — the
+  // directory being there under the same name says nothing about that.
+  removeInWorktree(cardId, "swap");
+  editWorktree(cardId, "swap/remade.txt", "the directory was replaced under it\n");
+  await expect(fileSection(page, "swap/remade.txt")).toBeVisible();
+
+  // And it is the new directory that is watched, rather than the burst that
+  // replaced it having swept the file up the once.
+  const afterRemake = refetches.length;
+  editWorktree(cardId, "swap/once-more.txt", "still keeping up\n");
+  await expect(fileSection(page, "swap/once-more.txt")).toBeVisible();
+  expect(refetches).toHaveLength(afterRemake + 1);
 });
 
 test("a comment being written survives an update to the diff", async ({ page }) => {

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,48 +25,93 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
 }
 
-/// Whether every one of `paths` is ignored by the worktree's own rules.
+/// Which of `paths` — absolute, files or directories — the worktree's own rules
+/// ignore.
 ///
-/// What a build writes is not work anyone is reviewing, and it arrives in the
-/// thousands — so a burst that is entirely `target/` or `node_modules/` should
-/// not cost a restage, let alone one per reader.
-///
-/// NB: not `run`. `check-ignore` exits 1 to say "nothing matched", which is an
-/// answer rather than a failure. It also consults the index, so a tracked file
-/// is never reported ignored however the rules read — which errs towards
-/// announcing, the safe direction.
-pub fn all_ignored(worktree: &Path, paths: &[PathBuf]) -> bool {
+/// NB: not `run`. `check-ignore` exits 1 for "nothing matched", which is an
+/// answer rather than a failure; anything else truncates the reply where git
+/// stopped, and is read here as "none of them". Both err towards announcing, as
+/// does its consulting the index, which keeps tracked work out of the answer
+/// however the rules read.
+pub fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     if paths.is_empty() {
-        return false;
+        return HashSet::new();
     }
 
     let mut child = match Command::new("git")
         .arg("-C")
         .arg(worktree)
-        .args(["check-ignore", "--stdin"])
+        .args(["check-ignore", "-z", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return false,
+        Err(err) => {
+            warn!("check-ignore in {}: {err}", worktree.display());
+            return HashSet::new();
+        }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        for path in paths {
-            if writeln!(stdin, "{}", path.display()).is_err() {
-                return false;
-            }
-        }
-    }
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashSet::new();
+    };
+
+    // NB: fed from a thread of its own. check-ignore echoes the ignored paths
+    // back as it reads, so writing a batch from this thread deadlocks once both
+    // pipes are full — measured at 1024 paths of ~160 bytes against the usual
+    // 64 KiB, and a burst carries twice that. Asking once up front instead is
+    // not open: the rules change under a live watch, and the paths are whatever
+    // the burst touched.
+    let feed: Vec<u8> = paths
+        .iter()
+        .flat_map(|path| {
+            let mut line = path.to_string_lossy().into_owned().into_bytes();
+            line.push(0);
+            line
+        })
+        .collect();
+    let writer = std::thread::spawn(move || stdin.write_all(&feed));
 
     let Ok(out) = child.wait_with_output() else {
-        return false;
+        return HashSet::new();
     };
+    let _ = writer.join();
 
-    // One line back per ignored path, so all of them means all of them.
-    out.stdout.iter().filter(|b| **b == b'\n').count() == paths.len()
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        warn!(
+            "check-ignore in {} gave up ({}); treating nothing as ignored",
+            worktree.display(),
+            out.status
+        );
+        return HashSet::new();
+    }
+
+    // NUL on both sides, so git never has to quote a path and we never have to
+    // parse the quoting back.
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        .collect()
+}
+
+/// Whether every one of `paths` is ignored by the worktree's own rules — the
+/// burst filter, asked once per settled burst by the worktree watcher.
+///
+/// What a build writes is not work anyone is reviewing, and it arrives in the
+/// thousands — so a burst that is entirely `target/` or `node_modules/` should
+/// not cost a restage, let alone one per reader.
+///
+/// Nothing at all is not a build, and answering "yes" would swallow the burst.
+pub fn all_ignored(worktree: &Path, paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+
+    let ignored = ignored(worktree, paths);
+    paths.iter().all(|path| ignored.contains(path))
 }
 
 /// Local branches, with the checked-out one first so it can be the form default.
@@ -451,6 +497,47 @@ mod tests {
 
         // Nothing at all is not a build; saying so would swallow the burst.
         assert!(!all_ignored(&repo, &[]));
+    }
+
+    /// What keeps a walk from pruning a directory the diff is showing: git
+    /// reads tracked work under an ignored path as work, so nothing built on
+    /// this can drop it.
+    #[test]
+    fn an_ignored_directory_holding_tracked_work_is_not_ignored() {
+        let (_settings, repo) = scratch("tracked-under-ignored");
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(repo.join("target")).unwrap();
+        std::fs::write(repo.join("target/kept.txt"), "tracked anyway\n").unwrap();
+        run(&repo, &["add", "-A", "-f"]).unwrap();
+        run(
+            &repo,
+            &["commit", "-qm", "a tracked file under an ignored path"],
+        )
+        .unwrap();
+
+        assert!(ignored(&repo, &[repo.join("target")]).is_empty());
+        assert!(!all_ignored(&repo, &[repo.join("target/kept.txt")]));
+    }
+
+    #[test]
+    fn the_ignored_subset_comes_back_and_the_rest_does_not() {
+        let (_settings, repo) = scratch("subset");
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        run(&repo, &["add", "-A"]).unwrap();
+        run(&repo, &["commit", "-qm", "ignore build output"]).unwrap();
+
+        let artefact = repo.join("target/debug/out.o");
+        let paths = [artefact.clone(), repo.join("a.txt")];
+        assert_eq!(ignored(&repo, &paths), HashSet::from([artefact.clone()]));
+        assert!(ignored(&repo, &[]).is_empty());
+
+        // A path outside the repository stops check-ignore where it stands.
+        // Whatever is left unanswered has to read as work rather than as build
+        // output, or a burst carrying one would be swallowed whole.
+        assert!(!all_ignored(
+            &repo,
+            &[PathBuf::from("/etc/hosts"), artefact]
+        ));
     }
 
     /// The premise the diff cache and every `304` rest on: an unchanged
