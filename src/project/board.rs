@@ -116,7 +116,7 @@ impl Shell<'_> {
             })
             .collect();
 
-        let lanes: Vec<_> = Lane::ALL
+        let lanes: Vec<_> = Lane::VISIBLE
             .iter()
             .map(|lane| {
                 context! {
@@ -471,6 +471,12 @@ fn relane(
 ) -> Result<(), Status> {
     let lane = Lane::parse(lane);
 
+    // Only `collect_garbage` may put a card here; arriving by drag or by a
+    // hand-written POST would hide it with its worktree still on disk.
+    if lane == Lane::GarbageCollected {
+        return Err(Status::BadRequest);
+    }
+
     let conn = db.lock();
     let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
     Card::reorder(&conn, id, card.project_id, lane, index);
@@ -510,6 +516,37 @@ pub fn delete_card(
     changes.project(project_id, Kind::Board);
 
     Ok(Redirect::to(format!("/projects/{project_id}")))
+}
+
+/// Reclaims the disk every card in Done is still holding.
+///
+/// The rows stay and the cards leave the board: what they own on disk is gone,
+/// so there is nothing left to go back to.
+#[post("/projects/<id>/cards/garbage")]
+pub fn collect_garbage(
+    db: &State<Db>,
+    manager: &State<Arc<AgentManager>>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    changes: &State<Changes>,
+    worktrees: &State<Worktrees>,
+    id: i64,
+) -> Result<Redirect, Status> {
+    // Read under the lock and acted on without it: each card shells out to git,
+    // and rendering takes the same lock.
+    let done: Vec<Card> = Card::for_project(&db.lock(), id)
+        .into_iter()
+        .filter(|card| card.lane == Lane::Done)
+        .collect();
+
+    for card in &done {
+        card.collect_garbage(manager, settings, cache, worktrees);
+    }
+
+    // One event for the batch: the board refetches once, however many went.
+    changes.project(id, Kind::Board);
+
+    Ok(Redirect::to(format!("/projects/{id}")))
 }
 
 #[cfg(test)]

@@ -51,6 +51,17 @@
               <span class="dot"></span>
               <span class="label">{{ lane.label }}</span>
               <span class="count mono">{{ lane.cards | length }}</span>
+
+              {% if lane.key == "done" and lane.cards %}
+                <form method="post" action="/projects/{{ project.id }}/cards/garbage"
+                      hx-post="/projects/{{ project.id }}/cards/garbage"
+                      hx-target="body" hx-swap="outerMorph" hx-push-url="true"
+                      hx-confirm="Clean up {{ lane.cards | length }} done card(s)? Their worktrees and git refs go for good.">
+                  <button class="lane-gc" type="submit" title="Clean up done cards">
+                    {{ icon("trash-2") }}
+                  </button>
+                </form>
+              {% endif %}
             </header>
 
             {% if lane.key == "todo" %}

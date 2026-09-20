@@ -321,3 +321,59 @@ test("a card that has left To Do is no longer a draft", async ({ page }) => {
   await page.goto(projectUrl);
   await expect(cardIn(page, "done", "Rewritten errand")).toBeVisible();
 });
+
+test("the garbage button clears Done and takes its cards off the board", async ({ page }) => {
+  await addCard(page, projectUrl, { title: "Finished work" });
+  await page.goto(projectUrl);
+
+  const id = await cardIn(page, "todo", "Finished work").getAttribute("data-card-id");
+  const path = new URL(projectUrl).pathname;
+  const switcher = `/projects?board=${path.split("/").pop()}`;
+  const counted = async () => {
+    await page.goto(switcher);
+    const text = await page.locator(`.project-card[href="${path}"] .count`).innerText();
+    return Number(text.split(" ")[0]);
+  };
+
+  await moveCard(page, id, "done");
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "done", "Finished work")).toBeVisible();
+
+  // Earlier tests in this file retire cards too, so the whole lane goes.
+  const collecting = await lane(page, "done").locator(".card").count();
+  expect(collecting).toBeGreaterThan(1);
+  const before = await counted();
+
+  await page.goto(projectUrl);
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.locator(".lane-done .lane-gc").click();
+
+  await expect(lane(page, "done").locator(".card")).toHaveCount(0);
+  await expect(page.locator(".lane-done .lane-gc")).toHaveCount(0);
+
+  // The collected lane is drawn nowhere, so the card is off the board entirely.
+  await page.reload();
+  await expect(cardIn(page, "done", "Finished work")).toHaveCount(0);
+  await expect(page.locator('[data-lane="garbage_collected"]')).toHaveCount(0);
+
+  // ...and out of the project's count, which reads every card, not every column.
+  expect(await counted()).toBe(before - collecting);
+});
+
+test("a card cannot be moved into the collected lane by hand", async ({ page }) => {
+  await addCard(page, projectUrl, { title: "Stays put" });
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "todo", "Stays put").getAttribute("data-card-id");
+
+  // Collection is the only way in, because it is the only path that also
+  // clears the disk; a plain move would hide the card with its worktree intact.
+  for (const path of [`/cards/${id}/move`, `/cards/${id}/lane`]) {
+    const response = await page.request.post(path, {
+      form: { lane: "garbage_collected", index: 0 },
+    });
+    expect(response.status()).toBe(400);
+  }
+
+  await page.reload();
+  await expect(cardIn(page, "todo", "Stays put")).toBeVisible();
+});

@@ -195,6 +195,24 @@ pub fn remove_worktree(repo: &Path, path: &Path) {
     let _ = run(repo, &["worktree", "prune"]);
 }
 
+/// Deletes every ref under `prefix`. Best-effort, like [`remove_worktree`].
+pub fn purge_refs(repo: &Path, prefix: &str) {
+    let Ok(listed) = run(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("{prefix}**"),
+        ],
+    ) else {
+        return;
+    };
+
+    for name in listed.lines() {
+        let _ = run(repo, &["update-ref", "-d", name]);
+    }
+}
+
 fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);

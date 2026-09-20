@@ -33,10 +33,15 @@ export const removeInWorktree = (cardId, path) =>
 export const worktreeGit = (cardId, ...args) =>
   execFileSync("git", ["-C", worktreeOf(cardId), ...args], { encoding: "utf8" }).trim();
 
+/** The card's scratch directory, where its git index files live. */
+export const cardDirOf = (cardId) => join(DATA_HOME, "ledecky", "cards", String(cardId));
+
 export const refs = (pattern = "refs/ledecky/**") =>
   git("for-each-ref", "--format=%(refname)", pattern).split("\n").filter(Boolean);
 
 export const turnRefs = (cardId) => refs(`refs/ledecky/${cardId}/turn-*`);
+
+export const cardRefs = (cardId) => refs(`refs/ledecky/${cardId}/**`);
 
 /** The commit a card's diffs are measured from, which follows a rebase. */
 export const baseRef = (cardId) => git("rev-parse", `refs/ledecky/${cardId}/base`);

@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import { expect, test } from "./support/fixtures.mjs";
 import { SLOW } from "../playwright.config.mjs";
 
@@ -7,17 +9,21 @@ import {
   addedLines,
   baseRef,
   cardIn,
+  cardDirOf,
+  cardRefs,
   commitInRepo,
   comment,
   editWorktree,
   fileSection,
   git,
+  lane,
   openAgent,
   openCard,
   pollsOfPath,
   removeInWorktree,
   turnRefs,
   worktreeGit,
+  worktreeOf,
 } from "./support/board.mjs";
 import { terminal, terminalRows } from "./support/dom.mjs";
 
@@ -604,4 +610,40 @@ test("merging lands the work on the base branch and retires the card", async ({ 
     .poll(() => git("worktree", "list"), { timeout: SLOW })
     .not.toContain(`worktrees/${cardId}`);
   expect(turnRefs(cardId)).toHaveLength(3);
+});
+
+test("collecting the garbage reclaims what the finished card still held", async ({ page }) => {
+  // The merge above left the turn refs and the scratch index behind, which is
+  // what there is to reclaim.
+  expect(cardRefs(cardId).length).toBeGreaterThan(0);
+  expect(existsSync(cardDirOf(cardId))).toBe(true);
+
+  await page.goto(projectUrl);
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.locator(".lane-done .lane-gc").click();
+
+  await expect(cardIn(page, "done", TITLE)).toHaveCount(0);
+
+  // Every ref the card owned is gone — base and turns, not just the working one
+  // a teardown drops — so nothing keeps its snapshots reachable any more.
+  expect(cardRefs(cardId)).toHaveLength(0);
+  expect(existsSync(cardDirOf(cardId))).toBe(false);
+  expect(existsSync(worktreeOf(cardId))).toBe(false);
+  expect(git("worktree", "list")).not.toContain(`worktrees/${cardId}`);
+
+  // The merge itself is untouched: this collects the card, not its work.
+  expect(git("show", "main:main.rs")).toContain(TASK);
+
+  await page.reload();
+  await expect(lane(page, "done").locator(".card")).toHaveCount(0);
+
+  // The record survives what the disk lost: this route reads the card's own row
+  // and still answers for it, lane and all.
+  const state = await page.request.get(`/cards/${cardId}/state`);
+  expect(state.status()).toBe(200);
+  expect(await state.text()).toContain("stopped");
+
+  // Its review cannot be reopened, though — the refs its turns name are gone, so
+  // the drawer declines rather than trying to diff against nothing.
+  expect((await page.request.get(`/cards/${cardId}`)).status()).toBe(404);
 });

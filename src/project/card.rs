@@ -12,10 +12,22 @@ pub enum Lane {
     InProgress,
     InReview,
     Done,
+    GarbageCollected,
 }
 
 impl Lane {
-    pub const ALL: &'static [Self] = &[Self::Todo, Self::InProgress, Self::InReview, Self::Done];
+    pub const ALL: &'static [Self] = &[
+        Self::Todo,
+        Self::InProgress,
+        Self::InReview,
+        Self::Done,
+        Self::GarbageCollected,
+    ];
+
+    /// The lanes that are shown. `GarbageCollected` is deliberately absent: a
+    /// collected card is a record, not something to look at or drag.
+    pub const VISIBLE: &'static [Self] =
+        &[Self::Todo, Self::InProgress, Self::InReview, Self::Done];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -23,6 +35,7 @@ impl Lane {
             Self::InProgress => "in_progress",
             Self::InReview => "in_review",
             Self::Done => "done",
+            Self::GarbageCollected => "garbage_collected",
         }
     }
 
@@ -32,6 +45,7 @@ impl Lane {
             Self::InProgress => "In Progress",
             Self::InReview => "In Review",
             Self::Done => "Done",
+            Self::GarbageCollected => "Garbage Collected",
         }
     }
 
@@ -220,10 +234,17 @@ impl Card {
         .ok()
     }
 
+    /// Every card the board and its counts should see.
+    ///
+    /// NB: collected cards are excluded here rather than at each call site —
+    /// this is the only read that feeds the board, and they belong on none of it.
     pub fn for_project(conn: &Connection, project_id: i64) -> Vec<Self> {
         conn.prepare(&format!(
-            "SELECT {} FROM cards WHERE project_id = ?1 ORDER BY position",
-            Self::COLUMNS
+            "SELECT {} FROM cards
+             WHERE project_id = ?1 AND lane != '{}'
+             ORDER BY position",
+            Self::COLUMNS,
+            Lane::GarbageCollected.as_str()
         ))
         .and_then(|mut stmt| {
             stmt.query_map([project_id], Self::from_row)
@@ -461,6 +482,13 @@ mod tests {
     }
 
     #[test]
+    fn every_lane_but_the_collected_one_is_visible() {
+        assert!(Lane::VISIBLE.iter().all(|lane| Lane::ALL.contains(lane)));
+        assert_eq!(Lane::VISIBLE.len(), Lane::ALL.len() - 1);
+        assert!(!Lane::VISIBLE.contains(&Lane::GarbageCollected));
+    }
+
+    #[test]
     fn unknown_values_fall_back_rather_than_panicking() {
         assert_eq!(Lane::parse("archived"), Lane::Todo);
         assert_eq!(AgentState::parse("confused"), AgentState::Stopped);
@@ -481,6 +509,25 @@ mod tests {
         );
         assert!(cards.iter().all(|c| c.lane == Lane::Todo));
         assert_eq!(cards[0].agent_state, AgentState::Stopped);
+    }
+
+    #[test]
+    fn a_collected_card_leaves_the_board_but_not_the_database() {
+        let (db, project_id) = seeded();
+        let conn = db.lock();
+
+        let kept = add(&conn, project_id, "kept");
+        let collected = add(&conn, project_id, "collected");
+        Card::set_lane(&conn, collected, Lane::GarbageCollected);
+
+        // Gone from the board and from the project's card count...
+        let visible = Card::for_project(&conn, project_id);
+        assert_eq!(visible.iter().map(|c| c.id).collect::<Vec<_>>(), [kept]);
+
+        // ...but the row, and the lane it round-trips through, are still there.
+        let card = Card::find(&conn, collected).unwrap();
+        assert_eq!(card.lane, Lane::GarbageCollected);
+        assert_eq!(card.task, "collected");
     }
 
     #[test]

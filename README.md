@@ -256,6 +256,10 @@ scripts/migrate-data-dir.sh             # then, with the server stopped
 
 ## Cleaning up
 
+The garbage button in the Done lane does this for the cards it collects: their
+worktrees, scratch directories and `refs/<slug>/<card>/**` go, while the rows
+stay behind as the record. To clear a whole board by hand:
+
 ```sh
 rm -rf ~/.local/share/ledecky
 git -C <project> worktree prune

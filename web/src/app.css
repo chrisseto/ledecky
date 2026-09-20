@@ -330,6 +330,17 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   color: var(--fg-dim);
 }
 
+.lane-gc {
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: none;
+  color: var(--fg-dim);
+}
+.lane-gc .icon { width: 13px; height: 13px; }
+.lane-gc:hover { background: oklch(0.6 0.16 25 / 0.16); color: oklch(0.72 0.16 25); }
+
 .new-card {
   display: flex;
   align-items: center;

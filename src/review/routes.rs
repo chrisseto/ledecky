@@ -12,7 +12,7 @@ use crate::agent::{messaging, AgentManager};
 use crate::config::Settings;
 use crate::db::Db;
 use crate::git;
-use crate::project::{Card, Project};
+use crate::project::{Card, Lane, Project};
 use crate::review::comment::{format_review, Side};
 use crate::review::diff::{Line, ParsedFile};
 use crate::review::expand::Dir;
@@ -185,6 +185,14 @@ fn pane(
     let conn = db.lock();
     let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
     let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
+
+    // A collected card kept its rows but not its refs, so there is nothing left
+    // to diff against — and it is off the board on purpose. Answering here
+    // covers the drawer and every review route with it.
+    if card.lane == Lane::GarbageCollected {
+        return Err(Status::NotFound);
+    }
+
     let turns = Turn::for_card(&conn, id);
     let viewed = Viewed::for_card(&conn, id);
 

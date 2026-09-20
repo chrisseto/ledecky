@@ -141,6 +141,34 @@ pub fn teardown(
     changes.card(db, card_id, Kind::Board);
 }
 
+impl Card {
+    /// Reclaims everything this card still holds on disk, and parks it in
+    /// [`Lane::GarbageCollected`].
+    ///
+    /// The row and its turns, comments and events stay: they are the record of
+    /// what happened. What goes is the worktree, the scratch indexes, and every
+    /// ref the card owns — unlike [`teardown`], the turn refs go too, since
+    /// nothing will read them again and they pin a tree apiece forever.
+    pub fn collect_garbage(
+        &self,
+        manager: &AgentManager,
+        settings: &Settings,
+        cache: &DiffCache,
+        worktrees: &Worktrees,
+    ) {
+        teardown(manager, settings, cache, worktrees, self.id);
+
+        let db = manager.db();
+        let project = Project::find(&db.lock(), self.project_id);
+        if let Some(project) = project {
+            git::purge_refs(&project.repo(), &settings.card_refs(self.id));
+        }
+        let _ = std::fs::remove_dir_all(settings.card_dir(self.id));
+
+        Card::set_lane(&db.lock(), self.id, Lane::GarbageCollected);
+    }
+}
+
 /// Whether an outstanding merge actually landed.
 ///
 /// A moved branch is not enough on its own, and ancestry does not survive a

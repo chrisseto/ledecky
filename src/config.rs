@@ -134,6 +134,11 @@ impl Settings {
         self.data_dir().join("cards").join(card_id.to_string())
     }
 
+    /// `refs/<app_slug>/<card>/` — the prefix every ref below belongs to.
+    pub fn card_refs(&self, card_id: i64) -> String {
+        format!("refs/{}/{card_id}/", self.app_slug)
+    }
+
     /// `refs/<app_slug>/<card>/base` — where a card's diffs start from.
     pub fn base_ref(&self, card_id: i64) -> String {
         format!("refs/{}/{card_id}/base", self.app_slug)
@@ -201,6 +206,7 @@ mod tests {
         assert_eq!(s.db_path(), PathBuf::from("/srv/board/planner.db"));
         assert_eq!(s.worktree_path(7), PathBuf::from("/srv/board/worktrees/7"));
         assert_eq!(s.card_dir(7), PathBuf::from("/srv/board/cards/7"));
+        assert_eq!(s.card_refs(7), "refs/planner/7/");
         assert_eq!(s.base_ref(7), "refs/planner/7/base");
         assert_eq!(s.turn_ref(7, 3), "refs/planner/7/turn-3");
         assert_eq!(s.working_ref(7), "refs/planner/7/working");

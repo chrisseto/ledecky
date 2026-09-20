@@ -24,5 +24,6 @@ pub fn routes() -> Vec<rocket::Route> {
         board::move_card,
         board::move_card_to_lane,
         board::delete_card,
+        board::collect_garbage,
     ]
 }
