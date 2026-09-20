@@ -9,7 +9,7 @@
   outputs = { nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
         # Chromium only: webkit currently fails to build in unstable, and firefox
         # is a large download this suite never opens.
         browsers = pkgs.playwright-driver.browsers.override {
@@ -26,15 +26,18 @@
         devShells.default = pkgs.mkShell {
           # NB: no rust here on purpose — cargo/rustc come from the system profile.
           packages = [
-            pkgs.nodejs_22
-            pkgs.pnpm
-            pkgs.esbuild
+            pkgs.claude-code
             pkgs.delta # For generating diffs.
+            pkgs.esbuild
+            pkgs.nodejs_22
             pkgs.perl # Also used by agents
+            pkgs.pnpm
             pkgs.python3 # Used by agents
+            pkgs.sccache # Shared cache for rust
             pkgs.sqlite # For debugging, if need be.
           ];
 
+          RUSTC_WRAPPER="sccache";
           # Playwright's own browser download produces binaries that will not run
           # on NixOS, so take them from the store instead. The npm
           # `@playwright/test` version must match `playwright-driver`.
