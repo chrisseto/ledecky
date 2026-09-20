@@ -12,6 +12,8 @@
     "e2e:shots": "E2E_SHOTS=1 playwright test --grep @shots"
   },
   "dependencies": {
+    "@fontsource-variable/manrope": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "htmx.org": "4.0.0",
@@ -19,8 +21,6 @@
     "sortablejs": "^1.15.6"
   },
   "devDependencies": {
-    "@fontsource-variable/manrope": "^5.3.0",
-    "@fontsource/ibm-plex-mono": "^5.3.0",
     "@playwright/test": "1.63.0"
   }
 }

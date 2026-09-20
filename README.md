@@ -186,6 +186,21 @@ thing is what the agent is told. `bypassPermissions` shows a one-time consent
 dialog in the terminal — answer it there; the card reports `needs you` and waits
 in In Review until you do.
 
+## Running it as a user service
+
+The flake exposes the board as a package and as a home-manager module:
+
+```nix
+{
+  inputs.ledecky.url = "github:chrisseto/ledecky";
+
+  # …in the home-manager configuration:
+  imports = [ inputs.ledecky.homeManagerModules.default ];
+
+  services.ledecky.enable = true;
+}
+```
+
 ## Layout
 
 Code is grouped by domain rather than by kind, so a change usually lands in one

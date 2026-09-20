@@ -6,10 +6,11 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { nixpkgs, flake-utils, ... }:
+  outputs = { self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+        ledecky = pkgs.callPackage ./nix/package.nix { };
         # Chromium only: webkit currently fails to build in unstable, and firefox
         # is a large download this suite never opens.
         browsers = pkgs.playwright-driver.browsers.override {
@@ -23,15 +24,16 @@
           fontDirectories = [ pkgs.dejavu_fonts pkgs.liberation_ttf pkgs.jetbrains-mono ];
         };
       in {
+        packages.default = ledecky;
+
         devShells.default = pkgs.mkShell {
+          # What the package builds and runs with comes from the package, so the
+          # two cannot drift; the rest is what development adds on top.
+          #
           # NB: no rust here on purpose — cargo/rustc come from the system profile.
-          packages = [
+          packages = ledecky.assetInputs ++ ledecky.runtimeInputs ++ [
             pkgs.claude-code
-            pkgs.delta # For generating diffs.
-            pkgs.esbuild
-            pkgs.nodejs_22
             pkgs.perl # Also used by agents
-            pkgs.pnpm
             pkgs.python3 # Used by agents
             pkgs.sccache # Shared cache for rust
             pkgs.sqlite # For debugging, if need be.
@@ -47,5 +49,13 @@
           PLAYWRIGHT_VERSION = pkgs.playwright-driver.version;
           FONTCONFIG_FILE = fonts;
         };
-      });
+      })
+    # System-independent, so outside `eachDefaultSystem`.
+    // {
+      overlays.default = final: _prev: {
+        ledecky = final.callPackage ./nix/package.nix { };
+      };
+
+      homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };
+    };
 }
