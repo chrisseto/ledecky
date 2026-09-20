@@ -1,13 +1,13 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 
 use anyhow::{Context, Result};
 use minijinja::{Environment, Value};
 use rocket::http::{ContentType, Method, Status};
 use rocket::request::Request;
 use rocket::response::{self, Responder, Response};
+
+use crate::assets::{etag_of, if_none_match};
 
 pub struct Templates {
     icons: HashMap<String, String>,
@@ -78,19 +78,6 @@ fn normalize_svg(svg: &str, name: &str) -> String {
 
 /// Not a security boundary — a collision costs one redundant fragment swap.
 /// `DefaultHasher` is stable within a build, which is all an ETag needs.
-fn etag_of(body: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    body.hash(&mut hasher);
-    format!("\"{:016x}\"", hasher.finish())
-}
-
-fn if_none_match(req: &Request<'_>, etag: &str) -> bool {
-    req.headers()
-        .get("If-None-Match")
-        .flat_map(|value| value.split(','))
-        .any(|candidate| candidate.trim() == etag)
-}
-
 /// Renders a minijinja template, pulling `Templates` out of Rocket's state.
 pub struct Tmpl(pub &'static str, pub Value);
 
@@ -109,7 +96,7 @@ impl<'r> Responder<'r, 'static> for Tmpl {
             }
         };
 
-        let etag = etag_of(&body);
+        let etag = etag_of(body.as_bytes());
 
         // Conditional requests only mean anything for GET. `Tmpl` is also the
         // error arm of a couple of POSTs, where a 304 would be a lie.

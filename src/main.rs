@@ -2,6 +2,7 @@
 extern crate rocket;
 
 mod agent;
+mod assets;
 mod config;
 mod db;
 mod events;
@@ -15,7 +16,6 @@ mod watch;
 use anyhow::Context;
 use rocket::fairing::AdHoc;
 use rocket::figment::providers::Env;
-use rocket::fs::FileServer;
 
 use crate::config::Settings;
 
@@ -61,7 +61,7 @@ fn rocket() -> _ {
         .manage(hooks::HookAuth::new())
         .manage(changes)
         .manage(worktrees)
-        .mount("/static", FileServer::from("static"))
+        .mount("/static", assets::routes())
         .mount("/", rocket::routes![events::stream])
         .mount("/", project::routes())
         .mount("/", agent::routes())

@@ -61,5 +61,5 @@ It cannot pay for that footgun at this suite's size.
 
 ## Iterating on Rust only
 
-`LEDECKY_SKIP_ASSETS=1` skips the `pnpm build` in `build.rs` and serves
+`LEDECKY_SKIP_ASSETS=1` skips the `pnpm build` in `build.rs` and embeds
 `static/` as it stands.

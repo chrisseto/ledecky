@@ -29,13 +29,14 @@ cargo run             # http://127.0.0.1:8770
 The flake supplies node, pnpm, and esbuild. Rust comes from your system
 toolchain on purpose, so `cargo` stays whatever you already use.
 
-`build.rs` runs `pnpm build` into `static/`, so the bundle the server reads off
-disk cannot be older than the server itself. It rebuilds when `web/` or the
-package files change, and when `static/` has gone missing — git ignores it, so
-nothing else would put it back. `LEDECKY_SKIP_ASSETS=1` leaves it alone, for a
-build with no node toolchain to hand.
+`build.rs` runs `pnpm build` into `static/`, which the binary then embeds, so
+the bundle a server serves cannot be older than the server itself. It rebuilds
+when `web/` or the package files change, and when `static/` has gone missing —
+git ignores it, so nothing else would put it back. `LEDECKY_SKIP_ASSETS=1`
+leaves it alone, for a build with no node toolchain to hand.
 
-`pnpm watch` rebuilds assets on change. Templates reload without a restart.
+`pnpm watch` rebuilds assets on change, but a running server holds the copy it
+was built with: templates reload without a restart, assets need one.
 
 ## How it works
 
