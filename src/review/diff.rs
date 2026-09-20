@@ -1,5 +1,7 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use tokio::process::Command;
 
 use anyhow::{bail, Context, Result};
 use rocket::serde::Serialize;
@@ -192,7 +194,7 @@ fn ranges(lines: &[Line], context: usize) -> Vec<(usize, usize)> {
 ///
 /// git writes straight into delta through an OS pipe, so a large diff cannot
 /// deadlock the way it would if we buffered it ourselves.
-pub fn between(repo: &Path, from: &str, to: &str) -> Result<Vec<ParsedFile>> {
+pub async fn between(repo: &Path, from: &str, to: &str) -> Result<Vec<ParsedFile>> {
     let mut git = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -210,14 +212,20 @@ pub fn between(repo: &Path, from: &str, to: &str) -> Result<Vec<ParsedFile>> {
         .spawn()
         .context("running git diff")?;
 
+    // NB: git's stdout becomes delta's stdin as a raw descriptor, so the two
+    // talk through the kernel rather than through us. Nothing here holds a
+    // whole diff in memory, and neither can wedge on the other filling a pipe.
     let stdout = git.stdout.take().expect("stdout was piped");
+    let stdout: Stdio = stdout.try_into().context("handing git's output to delta")?;
+
     let delta = Command::new("delta")
         .args(delta_args())
         .stdin(stdout)
         .output()
+        .await
         .context("running delta — it is provided by the flake's dev shell")?;
 
-    let status = git.wait().context("waiting for git diff")?;
+    let status = git.wait().await.context("waiting for git diff")?;
     if !status.success() {
         bail!("git diff {from} {to} failed");
     }
@@ -582,8 +590,8 @@ index 7b16f1f..333b15b 100644
     /// This is the palette drift detector. Delta is pinned by `flake.lock`, so
     /// its colours can only move on a deliberate update — at which point this
     /// fails loudly instead of the diff quietly losing its highlighting.
-    #[test]
-    fn every_palette_colour_still_resolves_to_its_class() {
+    #[tokio::test]
+    async fn every_palette_colour_still_resolves_to_its_class() {
         let repo = scratch_repo(
             "palette",
             "sample.rs",
@@ -599,7 +607,9 @@ index 7b16f1f..333b15b 100644
             "let count = 43;",
         );
 
-        let files = between(&repo, "HEAD~1", "HEAD").expect("the pipeline ran");
+        let files = between(&repo, "HEAD~1", "HEAD")
+            .await
+            .expect("the pipeline ran");
         let html: String = files[0]
             .hunks(&FileExpansion::parse(FileExpansion::WHOLE_FILE))
             .hunks
@@ -624,8 +634,8 @@ index 7b16f1f..333b15b 100644
         }
     }
 
-    #[test]
-    fn a_changed_word_is_marked_inside_its_line() {
+    #[tokio::test]
+    async fn a_changed_word_is_marked_inside_its_line() {
         let repo = scratch_repo(
             "word",
             "sample.rs",
@@ -634,7 +644,9 @@ index 7b16f1f..333b15b 100644
             "hello world",
         );
 
-        let files = between(&repo, "HEAD~1", "HEAD").expect("the pipeline ran");
+        let files = between(&repo, "HEAD~1", "HEAD")
+            .await
+            .expect("the pipeline ran");
         let added = files[0]
             .hunks(&FileExpansion::default())
             .hunks
@@ -655,8 +667,8 @@ index 7b16f1f..333b15b 100644
 
     /// Highlighting is only correct when the construct's opening is visible, so
     /// this is the case full context exists for.
-    #[test]
-    fn a_change_inside_a_multi_line_comment_stays_a_comment() {
+    #[tokio::test]
+    async fn a_change_inside_a_multi_line_comment_stays_a_comment() {
         let mut body = String::from("fn main() {\n    /* opener far above\n");
         for i in 0..40 {
             body.push_str(&format!("    filler {i}\n"));
@@ -665,7 +677,9 @@ index 7b16f1f..333b15b 100644
 
         let repo = scratch_repo("comment", "sample.rs", &body, "target OLD", "target NEW");
 
-        let files = between(&repo, "HEAD~1", "HEAD").expect("the pipeline ran");
+        let files = between(&repo, "HEAD~1", "HEAD")
+            .await
+            .expect("the pipeline ran");
         let added = files[0]
             .hunks(&FileExpansion::default())
             .hunks
@@ -694,8 +708,11 @@ index 7b16f1f..333b15b 100644
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
+        // NB: `std`, not the `tokio` `Command` this module builds its pipeline
+        // with. Setting a scratch repository up is not what is under test, and
+        // a plain blocking call keeps the helper a closure.
         let git = |args: &[&str]| {
-            Command::new("git")
+            std::process::Command::new("git")
                 .arg("-C")
                 .arg(&dir)
                 .args(args)

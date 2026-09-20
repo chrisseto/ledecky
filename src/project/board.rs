@@ -58,63 +58,73 @@ pub struct Shell<'a> {
 }
 
 impl Shell<'_> {
-    pub fn render(&self, project: Option<Project>, overlay: &str, extra: minijinja::Value) -> Tmpl {
-        let conn = self.db.lock();
-        let projects = Project::all(&conn);
-        let counts: Vec<usize> = projects
-            .iter()
-            .map(|p| Card::for_project(&conn, p.id).len())
-            .collect();
+    pub async fn render(
+        &self,
+        project: Option<Project>,
+        overlay: &str,
+        extra: minijinja::Value,
+    ) -> Tmpl {
+        let projects = Project::all(self.db).await;
+
+        // NB: loops rather than iterator chains, here and below. Every one of
+        // these reads the database, and a closure cannot await.
+        let mut counts: Vec<usize> = Vec::with_capacity(projects.len());
+        for project in &projects {
+            counts.push(Card::for_project(self.db, project.id).await.len());
+        }
 
         let cards = match &project {
-            Some(project) => Card::for_project(&conn, project.id),
+            Some(project) => Card::for_project(self.db, project.id).await,
             None => Vec::new(),
         };
-        // The stats below shell out to git, so the turns come out of the
-        // database first and the lock goes back before any of that happens.
-        let turns: Vec<Vec<Turn>> = cards
-            .iter()
-            .map(|card| Turn::for_card(&conn, card.id))
-            .collect();
-        drop(conn);
 
         let repo = project.as_ref().map(|p| p.repo());
-        let rows: Vec<(Lane, minijinja::Value)> = cards
-            .iter()
-            .zip(turns)
-            .map(|(card, turns)| {
-                // The card counts what is in its worktree, not only what a turn
-                // has captured — otherwise a card reads `+0 −0` for as long as
-                // its agent is working. Cards without a worktree fall back to
-                // their last turn and cost nothing.
-                //
-                // NB: affordable on every render only because `live_head`
-                // memoises; `Shell::render` runs on every navigation, not just
-                // the board's poll.
-                let stat = repo.as_ref().and_then(|repo| {
-                    let worktree = card.worktree_path.as_ref().map(PathBuf::from);
-                    let head = review::turn::live_head(
-                        self.cache,
-                        self.settings,
-                        repo,
-                        worktree.as_deref(),
-                        card,
-                        &turns,
-                    )?;
-                    Some(
-                        self.cache
-                            .stat(repo, &self.settings.base_ref(card.id), &head),
-                    )
-                });
-                (
-                    card.lane,
-                    context! {
-                        stat => stat.filter(|s| s.additions + s.deletions > 0),
-                        ..minijinja::Value::from_serialize(card)
-                    },
+        let mut rows: Vec<(Lane, minijinja::Value)> = Vec::with_capacity(cards.len());
+        for card in &cards {
+            let turns = Turn::for_card(self.db, card.id).await;
+
+            // The card counts what is in its worktree, not only what a turn has
+            // captured — otherwise a card reads `+0 −0` for as long as its
+            // agent is working. Cards without a worktree fall back to their
+            // last turn and cost nothing.
+            //
+            // NB: `Cached`, so none of this shells out. `Shell::render` runs on
+            // every navigation and on every event that moves any card, once per
+            // card each time; staging here made a board render cost an
+            // `add -A` per card and put every one of them behind the slowest.
+            // The watcher stages and then announces, which is what keeps this
+            // current.
+            let mut stat = None;
+            if let Some(repo) = repo.as_ref() {
+                let worktree = card.worktree_path.as_ref().map(PathBuf::from);
+                let head = review::turn::live_head(
+                    self.cache,
+                    self.settings,
+                    repo,
+                    worktree.as_deref(),
+                    card,
+                    &turns,
+                    review::turn::Freshness::Cached,
                 )
-            })
-            .collect();
+                .await;
+
+                if let Some(head) = head {
+                    stat = Some(
+                        self.cache
+                            .stat(repo, &self.settings.base_ref(card.id), &head)
+                            .await,
+                    );
+                }
+            }
+
+            rows.push((
+                card.lane,
+                context! {
+                    stat => stat.filter(|s: &crate::review::cache::Stat| s.additions + s.deletions > 0),
+                    ..minijinja::Value::from_serialize(card)
+                },
+            ));
+        }
 
         let lanes: Vec<_> = Lane::VISIBLE
             .iter()
@@ -142,93 +152,98 @@ impl Shell<'_> {
 }
 
 #[get("/projects/<id>")]
-pub fn board(
+pub async fn board(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
 ) -> Result<Tmpl, Status> {
-    let project = Project::find(&db.lock(), id).ok_or(Status::NotFound)?;
+    let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
     Ok(Shell {
-        db,
-        settings,
-        cache,
+        db: &db,
+        settings: &settings,
+        cache: &cache,
     }
-    .render(Some(project), NOTHING, context! {}))
+    .render(Some(project), NOTHING, context! {})
+    .await)
 }
 
 /// The board with nothing selected — whichever project was added first, or an
 /// empty shell asking for one.
 #[get("/")]
-pub fn index(db: &State<Db>, settings: &State<Settings>, cache: &State<DiffCache>) -> Tmpl {
-    let project = Project::all(&db.lock()).into_iter().next();
+pub async fn index(db: &State<Db>, settings: &State<Settings>, cache: &State<DiffCache>) -> Tmpl {
+    let project = Project::all(db).await.into_iter().next();
     Shell {
-        db,
-        settings,
-        cache,
+        db: &db,
+        settings: &settings,
+        cache: &cache,
     }
     .render(project, NOTHING, context! {})
+    .await
 }
 
 /// The project switcher, over whichever board it was opened from.
 #[get("/projects?<board>")]
-pub fn switcher(
+pub async fn switcher(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     board: Option<i64>,
 ) -> Tmpl {
-    let project = current(db, board);
+    let project = current(&db, board).await;
     Shell {
-        db,
-        settings,
-        cache,
+        db: &db,
+        settings: &settings,
+        cache: &cache,
     }
     .render(project, PROJECTS, context! {})
+    .await
 }
 
 #[get("/projects/<id>/cards/new")]
-pub fn new_card(
+pub async fn new_card(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
 ) -> Result<Tmpl, Status> {
-    let project = Project::find(&db.lock(), id).ok_or(Status::NotFound)?;
-    let form = form_context(&project, None, Fields::default(), None);
+    let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
+    let form = form_context(&project, None, Fields::default(), None).await;
 
     Ok(Shell {
-        db,
-        settings,
-        cache,
+        db: &db,
+        settings: &settings,
+        cache: &cache,
     }
-    .render(Some(project), NEW_CARD, form))
+    .render(Some(project), NEW_CARD, form)
+    .await)
 }
 
 /// The card form, on a card that has not been started yet.
 #[get("/cards/<id>/edit")]
-pub fn edit_card(
+pub async fn edit_card(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
 ) -> Result<Tmpl, Status> {
-    let conn = db.lock();
-    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
-    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
-    drop(conn);
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let project = Project::find(db, card.project_id)
+        .await
+        .ok_or(Status::NotFound)?;
 
     if !card.editable() {
         return Err(Status::Conflict);
     }
 
-    let form = form_context(&project, Some(&card), Fields::of(&card), None);
+    let form = form_context(&project, Some(&card), Fields::of(&card), None).await;
     Ok(Shell {
-        db,
-        settings,
-        cache,
+        db: &db,
+        settings: &settings,
+        cache: &cache,
     }
-    .render(Some(project), EDIT_CARD, form))
+    .render(Some(project), EDIT_CARD, form)
+    .await)
 }
 
 #[derive(rocket::FromForm)]
@@ -274,13 +289,13 @@ impl Fields {
 
 /// Everything `_modal_card.html` renders from. `card` is what makes it an edit
 /// rather than a new card.
-fn form_context(
+async fn form_context(
     project: &Project,
     card: Option<&Card>,
     fields: Fields,
     error: Option<&str>,
 ) -> minijinja::Value {
-    let branches = git::branches(&project.repo());
+    let branches = git::branches(&project.repo()).await;
     let base_branch = match fields.base_branch.is_empty() {
         true => branches.first().cloned().unwrap_or_default(),
         false => fields.base_branch,
@@ -297,7 +312,7 @@ fn form_context(
 }
 
 #[post("/projects/<id>/cards", data = "<form>")]
-pub fn create_card(
+pub async fn create_card(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -305,24 +320,37 @@ pub fn create_card(
     id: i64,
     form: Form<CardForm>,
 ) -> Result<Redirect, Tmpl> {
-    let project = match Project::find(&db.lock(), id) {
+    create(db, settings, cache, changes, id, form.into_inner()).await
+}
+
+async fn create(
+    db: &Db,
+    settings: &Settings,
+    cache: &DiffCache,
+    changes: &Changes,
+    id: i64,
+    form: CardForm,
+) -> Result<Redirect, Tmpl> {
+    let project = match Project::find(db, id).await {
         Some(project) => project,
         None => return Ok(Redirect::to("/")),
     };
 
     let task = form.task.trim();
     if task.is_empty() {
-        let context = form_context(&project, None, Fields::submitted(&form), Some(EMPTY_TASK));
+        let context =
+            form_context(&project, None, Fields::submitted(&form), Some(EMPTY_TASK)).await;
         return Err(Shell {
             db,
             settings,
             cache,
         }
-        .render(Some(project), NEW_CARD, context));
+        .render(Some(project), NEW_CARD, context)
+        .await);
     }
 
     let created = Card::create(
-        &db.lock(),
+        db,
         NewCard {
             project_id: id,
             task,
@@ -330,7 +358,8 @@ pub fn create_card(
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
         },
-    );
+    )
+    .await;
 
     if created.is_err() {
         return Ok(Redirect::to(format!("/projects/{id}")));
@@ -347,7 +376,7 @@ pub fn create_card(
 /// Rewrites a card that has not been started. Everything the form sets is only
 /// read when the session opens, so until then it is all still a draft.
 #[post("/cards/<id>", data = "<form>")]
-pub fn update_card(
+pub async fn update_card(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -355,10 +384,21 @@ pub fn update_card(
     id: i64,
     form: Form<CardForm>,
 ) -> Result<Result<Redirect, Tmpl>, Status> {
-    let conn = db.lock();
-    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
-    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
-    drop(conn);
+    update(db, settings, cache, changes, id, form.into_inner()).await
+}
+
+async fn update(
+    db: &Db,
+    settings: &Settings,
+    cache: &DiffCache,
+    changes: &Changes,
+    id: i64,
+    form: CardForm,
+) -> Result<Result<Redirect, Tmpl>, Status> {
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let project = Project::find(db, card.project_id)
+        .await
+        .ok_or(Status::NotFound)?;
 
     let task = form.task.trim();
     if task.is_empty() {
@@ -367,17 +407,19 @@ pub fn update_card(
             Some(&card),
             Fields::submitted(&form),
             Some(EMPTY_TASK),
-        );
+        )
+        .await;
         return Ok(Err(Shell {
             db,
             settings,
             cache,
         }
-        .render(Some(project), EDIT_CARD, context)));
+        .render(Some(project), EDIT_CARD, context)
+        .await));
     }
 
     let edited = Card::update(
-        &db.lock(),
+        db,
         id,
         CardEdit {
             task,
@@ -385,7 +427,8 @@ pub fn update_card(
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
         },
-    );
+    )
+    .await;
 
     match edited {
         Ok(true) => {
@@ -410,10 +453,13 @@ fn permission_mode(requested: &str) -> &'static str {
 
 /// The project a URL names, falling back to the first one so an overlay always
 /// has a board behind it.
-pub fn current(db: &State<Db>, id: Option<i64>) -> Option<Project> {
-    let conn = db.lock();
-    id.and_then(|id| Project::find(&conn, id))
-        .or_else(|| Project::all(&conn).into_iter().next())
+pub async fn current(db: &Db, id: Option<i64>) -> Option<Project> {
+    if let Some(project) = id {
+        if let Some(found) = Project::find(db, project).await {
+            return Some(found);
+        }
+    }
+    Project::all(db).await.into_iter().next()
 }
 
 #[derive(rocket::FromForm)]
@@ -424,7 +470,7 @@ pub struct MoveForm {
 }
 
 #[post("/cards/<id>/move", data = "<form>")]
-pub fn move_card(
+pub async fn move_card(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -435,13 +481,14 @@ pub fn move_card(
 ) -> Result<Status, Status> {
     relane(
         db, manager, settings, changes, worktrees, id, &form.lane, form.index,
-    )?;
+    )
+    .await?;
     Ok(Status::NoContent)
 }
 
 /// The same move from the card drawer, which stays open around it.
 #[post("/cards/<id>/lane", data = "<form>")]
-pub fn move_card_to_lane(
+pub async fn move_card_to_lane(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -452,14 +499,23 @@ pub fn move_card_to_lane(
 ) -> Result<Redirect, Status> {
     relane(
         db, manager, settings, changes, worktrees, id, &form.lane, form.index,
-    )?;
+    )
+    .await?;
     Ok(Redirect::to(format!("/cards/{id}")))
 }
 
+/// Puts a card in a lane at an index, and starts its agent if that lane is
+/// In Progress.
+///
+/// Both movers land here: the board's drag handler, which answers 204, and the
+/// drawer's, which redirects back to the card. Entering In Progress is the one
+/// lane change that does more than reorder, which is why this takes everything
+/// a session needs rather than just a database.
+///
 /// NB: the arguments are its two callers' request guards, passed straight
 /// through; see the note on `webhooks::receive`.
 #[allow(clippy::too_many_arguments)]
-fn relane(
+async fn relane(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -477,19 +533,17 @@ fn relane(
         return Err(Status::BadRequest);
     }
 
-    let conn = db.lock();
-    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
-    Card::reorder(&conn, id, card.project_id, lane, index);
-    drop(conn);
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    Card::reorder(db, id, card.project_id, lane, index).await;
 
     changes.project(card.project_id, Kind::Board);
 
     // Entering In Progress is what creates the worktree and starts the agent.
     // Re-entering it with a live agent is a no-op.
     if lane == Lane::InProgress && card.lane != Lane::InProgress {
-        if let Err(err) = lifecycle::start(manager, settings, worktrees, id) {
+        if let Err(err) = lifecycle::start(manager, settings, worktrees, id).await {
             error!("card {id}: {err:#}");
-            manager.failed(id);
+            manager.failed(id).await;
         }
     }
 
@@ -497,7 +551,7 @@ fn relane(
 }
 
 #[post("/cards/<id>/delete")]
-pub fn delete_card(
+pub async fn delete_card(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -506,13 +560,24 @@ pub fn delete_card(
     worktrees: &State<Worktrees>,
     id: i64,
 ) -> Result<Redirect, Status> {
-    let project_id = {
-        let conn = db.lock();
-        Card::find(&conn, id).ok_or(Status::NotFound)?.project_id
-    };
+    remove(db, manager, settings, cache, changes, worktrees, id).await
+}
 
-    lifecycle::teardown(manager, settings, cache, worktrees, id);
-    Card::delete(&db.lock(), id).map_err(|_| Status::InternalServerError)?;
+async fn remove(
+    db: &Db,
+    manager: &Arc<AgentManager>,
+    settings: &Settings,
+    cache: &DiffCache,
+    changes: &Changes,
+    worktrees: &Worktrees,
+    id: i64,
+) -> Result<Redirect, Status> {
+    let project_id = Card::find(db, id).await.ok_or(Status::NotFound)?.project_id;
+
+    lifecycle::teardown(manager, settings, cache, worktrees, id).await;
+    Card::delete(db, id)
+        .await
+        .map_err(|_| Status::InternalServerError)?;
     changes.project(project_id, Kind::Board);
 
     Ok(Redirect::to(format!("/projects/{project_id}")))
@@ -523,7 +588,7 @@ pub fn delete_card(
 /// The rows stay and the cards leave the board: what they own on disk is gone,
 /// so there is nothing left to go back to.
 #[post("/projects/<id>/cards/garbage")]
-pub fn collect_garbage(
+pub async fn collect_garbage(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -532,15 +597,15 @@ pub fn collect_garbage(
     worktrees: &State<Worktrees>,
     id: i64,
 ) -> Result<Redirect, Status> {
-    // Read under the lock and acted on without it: each card shells out to git,
-    // and rendering takes the same lock.
-    let done: Vec<Card> = Card::for_project(&db.lock(), id)
+    let done: Vec<Card> = Card::for_project(db, id)
+        .await
         .into_iter()
         .filter(|card| card.lane == Lane::Done)
         .collect();
 
     for card in &done {
-        card.collect_garbage(manager, settings, cache, worktrees);
+        card.collect_garbage(manager, settings, cache, worktrees)
+            .await;
     }
 
     // One event for the batch: the board refetches once, however many went.

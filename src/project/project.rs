@@ -5,10 +5,11 @@ use rocket::form::Form;
 use rocket::response::Redirect;
 use rocket::serde::Serialize;
 use rocket::{get, post, State};
-use rusqlite::{Connection, Row};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{FromRow, Row};
 
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::{sql, Db};
 use crate::project::board::{self, Shell};
 use crate::review::DiffCache;
 use crate::tmpl::Tmpl;
@@ -26,46 +27,45 @@ pub struct Project {
 impl Project {
     const COLUMNS: &'static str = "id, name, path, created_at";
 
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get("id")?,
-            name: row.get("name")?,
-            path: row.get("path")?,
-            created_at: row.get("created_at")?,
-        })
-    }
-
     pub fn repo(&self) -> PathBuf {
         PathBuf::from(&self.path)
     }
 
-    pub fn find(conn: &Connection, id: i64) -> Option<Self> {
-        conn.query_row(
-            &format!("SELECT {} FROM projects WHERE id = ?1", Self::COLUMNS),
-            [id],
-            Self::from_row,
-        )
+    pub async fn find(db: &Db, id: i64) -> Option<Self> {
+        sqlx::query_as(sql(format!(
+            "SELECT {} FROM projects WHERE id = ?1",
+            Self::COLUMNS
+        )))
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await
         .ok()
+        .flatten()
     }
 
-    pub fn all(conn: &Connection) -> Vec<Self> {
-        conn.prepare(&format!(
+    pub async fn all(db: &Db) -> Vec<Self> {
+        sqlx::query_as(sql(format!(
             "SELECT {} FROM projects ORDER BY name",
             Self::COLUMNS
-        ))
-        .and_then(|mut stmt| {
-            stmt.query_map([], Self::from_row)
-                .map(|rows| rows.filter_map(Result::ok).collect())
-        })
+        )))
+        .fetch_all(db.pool())
+        .await
         .unwrap_or_default()
     }
 
     /// Registers `path`, or returns the id it already has.
-    pub fn upsert(conn: &Connection, path: &Path) -> rusqlite::Result<i64> {
+    pub async fn upsert(db: &Db, path: &Path) -> sqlx::Result<i64> {
         let path = path.to_string_lossy();
-        if let Ok(id) = conn.query_row("SELECT id FROM projects WHERE path = ?1", [&path], |r| {
-            r.get::<_, i64>(0)
-        }) {
+
+        // NB: in a transaction, because it looks before it inserts — two boards
+        // added at once would otherwise both miss and both insert.
+        let mut tx = db.pool().begin().await?;
+
+        let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM projects WHERE path = ?1")
+            .bind(path.as_ref())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(id) = existing {
             return Ok(id);
         }
 
@@ -74,42 +74,59 @@ impl Project {
             .and_then(|s| s.to_str())
             .unwrap_or("project");
 
-        conn.execute(
-            "INSERT INTO projects (name, path) VALUES (?1, ?2)",
-            rusqlite::params![name, path],
-        )?;
-        Ok(conn.last_insert_rowid())
+        let id = sqlx::query("INSERT INTO projects (name, path) VALUES (?1, ?2)")
+            .bind(name)
+            .bind(path.as_ref())
+            .execute(&mut *tx)
+            .await?
+            .last_insert_rowid();
+
+        tx.commit().await?;
+        Ok(id)
     }
 
     /// Overrides the name taken from the directory.
-    pub fn rename(conn: &Connection, id: i64, name: &str) {
-        let _ = conn.execute(
-            "UPDATE projects SET name = ?2 WHERE id = ?1",
-            rusqlite::params![id, name],
-        );
+    pub async fn rename(db: &Db, id: i64, name: &str) {
+        let _ = sqlx::query("UPDATE projects SET name = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(name)
+            .execute(db.pool())
+            .await;
+    }
+}
+
+impl<'r> FromRow<'r, SqliteRow> for Project {
+    fn from_row(row: &'r SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            path: row.try_get("path")?,
+            created_at: row.try_get("created_at")?,
+        })
     }
 }
 
 // ---- routes -----------------------------------------------------------------
 
 #[get("/projects/new?<board>")]
-pub fn new(
+pub async fn new(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     board: Option<i64>,
 ) -> Tmpl {
-    let project = board::current(db, board);
+    let project = board::current(&db, board).await;
     Shell {
-        db,
-        settings,
-        cache,
+        db: &db,
+        settings: &settings,
+        cache: &cache,
     }
     .render(
         project,
         board::ADD_PROJECT,
         context! { path => default_root(), error => Option::<String>::None },
     )
+    .await
 }
 
 #[derive(rocket::FromForm)]
@@ -122,68 +139,89 @@ pub struct ProjectForm {
 }
 
 #[post("/projects", data = "<form>")]
-pub fn create(
+pub async fn create(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     form: Form<ProjectForm>,
 ) -> Result<Redirect, Tmpl> {
+    save(db, settings, cache, form.into_inner()).await
+}
+
+async fn save(
+    db: &Db,
+    settings: &Settings,
+    cache: &DiffCache,
+    form: ProjectForm,
+) -> Result<Redirect, Tmpl> {
     let path = expand(form.path.trim());
 
-    let reject = |message: String| {
+    // NB: a helper rather than the closure this was. Putting the modal back up
+    // is a render, a render reads the board behind it, and that awaits.
+    async fn reject(
+        db: &Db,
+        settings: &Settings,
+        cache: &DiffCache,
+        board: Option<i64>,
+        path: &str,
+        message: String,
+    ) -> Tmpl {
         Shell {
             db,
             settings,
             cache,
         }
         .render(
-            board::current(db, form.board),
+            board::current(db, board).await,
             board::ADD_PROJECT,
-            context! { path => form.path.clone(), error => Some(message) },
+            context! { path => path.to_owned(), error => Some(message) },
         )
-    };
+        .await
+    }
 
+    let typed = form.path.clone();
     if !path.is_dir() {
-        return Err(reject(format!("{} is not a directory", path.display())));
+        let message = format!("{} is not a directory", path.display());
+        return Err(reject(db, settings, cache, form.board, &typed, message).await);
     }
     if !is_git_repo(&path) {
-        return Err(reject(format!(
-            "{} is not a git repository",
-            path.display()
-        )));
+        let message = format!("{} is not a git repository", path.display());
+        return Err(reject(db, settings, cache, form.board, &typed, message).await);
     }
 
     let path = path.canonicalize().unwrap_or(path);
 
-    // The lock goes back before `reject` runs: rendering the modal again takes
-    // it for itself.
-    let saved = {
-        let conn = db.lock();
-        let saved = Project::upsert(&conn, &path);
-        let name = form
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty());
+    let saved = Project::upsert(db, &path).await;
+    let name = form
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
 
-        if let (Ok(id), Some(name)) = (&saved, name) {
-            Project::rename(&conn, *id, name);
+    if let (Ok(id), Some(name)) = (&saved, name) {
+        Project::rename(db, *id, name).await;
+    }
+
+    match saved {
+        Ok(id) => Ok(Redirect::to(format!("/projects/{id}"))),
+        Err(err) => {
+            let message = format!("could not save project: {err}");
+            Err(reject(db, settings, cache, form.board, &typed, message).await)
         }
-        saved
-    };
-
-    let id = saved.map_err(|err| reject(format!("could not save project: {err}")))?;
-    Ok(Redirect::to(format!("/projects/{id}")))
+    }
 }
 
 /// Server-rendered directory autocomplete. Returns just the `<ul>` fragment;
 /// htmx swaps it in on every keystroke.
 #[get("/projects/complete?<q>")]
-pub fn complete(q: Option<String>) -> Tmpl {
+pub async fn complete(q: Option<String>) -> Tmpl {
+    // NB: a directory listing, on every keystroke. Small, but it is a syscall
+    // on a path the user is still typing — which can be a mount that is slow to
+    // answer, or one that is not answering at all.
     let q = q.unwrap_or_default();
     Tmpl(
         "_completions.html",
-        context! { entries => complete_path(&q) },
+        context! { entries => complete_path(&q).await },
     )
 }
 
@@ -197,7 +235,7 @@ pub struct Completion {
     pub is_repo: bool,
 }
 
-fn complete_path(query: &str) -> Vec<Completion> {
+async fn complete_path(query: &str) -> Vec<Completion> {
     let raw = if query.trim().is_empty() {
         default_root()
     } else {
@@ -205,14 +243,20 @@ fn complete_path(query: &str) -> Vec<Completion> {
     };
 
     let (dir, prefix) = split_query(&raw);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
         return Vec::new();
     };
 
     let wanted = prefix.to_lowercase();
-    let mut out: Vec<Completion> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+    let mut listed = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+            listed.push(entry);
+        }
+    }
+
+    let mut out: Vec<Completion> = listed
+        .into_iter()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             // Hidden directories only surface once the user types the dot.
@@ -308,15 +352,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn completion_finds_directories_and_flags_repositories() {
+    #[tokio::test]
+    async fn completion_finds_directories_and_flags_repositories() {
         let root = tempdir("completion-lists");
         std::fs::create_dir_all(root.join("alpha/.git")).unwrap();
         std::fs::create_dir_all(root.join("beta")).unwrap();
         std::fs::create_dir_all(root.join(".hidden")).unwrap();
         std::fs::write(root.join("a-file"), "").unwrap();
 
-        let found = complete_path(&format!("{}/", root.display()));
+        let found = complete_path(&format!("{}/", root.display())).await;
         let names: Vec<_> = found.iter().map(|c| c.name.as_str()).collect();
 
         // Files and dot-directories stay out; repositories are marked.
@@ -325,29 +369,28 @@ mod tests {
         assert!(!found[1].is_repo);
     }
 
-    #[test]
-    fn completion_respects_a_typed_prefix() {
+    #[tokio::test]
+    async fn completion_respects_a_typed_prefix() {
         let root = tempdir("completion-prefix");
         std::fs::create_dir_all(root.join("alpha")).unwrap();
         std::fs::create_dir_all(root.join("beta")).unwrap();
 
-        let found = complete_path(&format!("{}/al", root.display()));
+        let found = complete_path(&format!("{}/al", root.display())).await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "alpha");
     }
 
-    #[test]
-    fn upsert_is_idempotent() {
-        let db = memory_db();
-        let conn = db.lock();
+    #[tokio::test]
+    async fn upsert_is_idempotent() {
+        let db = memory_db().await;
 
-        let first = Project::upsert(&conn, Path::new("/srv/repo")).unwrap();
-        let second = Project::upsert(&conn, Path::new("/srv/repo")).unwrap();
+        let first = Project::upsert(&db, Path::new("/srv/repo")).await.unwrap();
+        let second = Project::upsert(&db, Path::new("/srv/repo")).await.unwrap();
         assert_eq!(first, second);
 
-        let project = Project::find(&conn, first).unwrap();
+        let project = Project::find(&db, first).await.unwrap();
         assert_eq!(project.name, "repo");
-        assert_eq!(Project::all(&conn).len(), 1);
+        assert_eq!(Project::all(&db).await.len(), 1);
     }
 
     /// Per-test directory; tests run concurrently, so the name has to be unique.

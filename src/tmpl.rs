@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use minijinja::{Environment, Value};
@@ -10,7 +11,11 @@ use rocket::response::{self, Responder, Response};
 use crate::assets::{etag_of, if_none_match};
 
 pub struct Templates {
-    icons: HashMap<String, String>,
+    /// NB: an `Arc` because the `icon` function below is built per render and
+    /// has to own what it looks up. Every fragment redraw is a render, so a
+    /// clone here was the whole icon set copied to answer a request that may
+    /// not draw one.
+    icons: Arc<HashMap<String, String>>,
 }
 
 impl Templates {
@@ -29,7 +34,9 @@ impl Templates {
             icons.insert(name.to_owned(), normalize_svg(&svg, name));
         }
 
-        Ok(Self { icons })
+        Ok(Self {
+            icons: Arc::new(icons),
+        })
     }
 
     fn env(&self) -> Environment<'static> {

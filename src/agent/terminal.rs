@@ -20,7 +20,7 @@ use crate::tmpl::Tmpl;
 use crate::watch::Worktrees;
 
 #[get("/cards/<id>?<scope>")]
-pub fn focus(
+pub async fn focus(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -28,13 +28,13 @@ pub fn focus(
     id: i64,
     scope: Option<&str>,
 ) -> Result<Tmpl, Status> {
-    let conn = db.lock();
-    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
-    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
-    drop(conn);
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let project = Project::find(db, card.project_id)
+        .await
+        .ok_or(Status::NotFound)?;
 
     let live = manager.running(id).is_some();
-    let review = review::routes::initial(db, settings, cache, id, scope)?;
+    let review = review::routes::initial(db, settings, cache, id, scope).await?;
 
     Ok(Shell {
         db,
@@ -45,25 +45,43 @@ pub fn focus(
         Some(project),
         board::CARD,
         context! { live, editable => card.editable(), ..review },
-    ))
+    )
+    .await)
 }
 
 /// Just the agent-state chip, so a state change redraws it without re-running a
 /// diff behind it.
 #[get("/cards/<id>/state")]
-pub fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
-    let card = Card::find(&db.lock(), id).ok_or(Status::NotFound)?;
+pub async fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
     Ok(Tmpl("_state.html", context! { card }))
 }
 
+/// Just the drawer's agent pane, for the same reason as [`state`].
+///
+/// Whether a terminal belongs on screen turns on the agent being up, which is
+/// not something the card records — so this is the one question the pane has,
+/// and the only one it asks. It used to be answered by rendering `/cards/<id>`
+/// and selecting out of it, which is a board and a review pane's worth of git.
+#[get("/cards/<id>/agent")]
+pub async fn agent_pane(
+    db: &State<Db>,
+    manager: &State<Arc<AgentManager>>,
+    id: i64,
+) -> Result<Tmpl, Status> {
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let live = manager.running(id).is_some();
+    Ok(Tmpl("_pane_agent.html", context! { card, live }))
+}
+
 #[post("/cards/<id>/start")]
-pub fn start(
+pub async fn start(
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     worktrees: &State<Worktrees>,
     id: i64,
 ) -> Result<Redirect, Status> {
-    match lifecycle::start(manager, settings, worktrees, id) {
+    match lifecycle::start(manager, settings, worktrees, id).await {
         // The drawer is what asked, and it has a terminal to put up now.
         Ok(_) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
@@ -74,14 +92,14 @@ pub fn start(
 }
 
 #[post("/cards/<id>/stop")]
-pub fn stop(manager: &State<Arc<AgentManager>>, id: i64) -> Redirect {
-    manager.stop(id);
+pub async fn stop(manager: &State<Arc<AgentManager>>, id: i64) -> Redirect {
+    manager.stop(id).await;
     Redirect::to(format!("/cards/{id}"))
 }
 
 #[post("/cards/<id>/merge")]
-pub fn merge(manager: &State<Arc<AgentManager>>, id: i64) -> Result<Redirect, Status> {
-    match manager.request_merge(id) {
+pub async fn merge(manager: &State<Arc<AgentManager>>, id: i64) -> Result<Redirect, Status> {
+    match manager.request_merge(id).await {
         Ok(()) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
             warn!("card {id}: merge request failed: {err:#}");

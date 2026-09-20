@@ -17,16 +17,18 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use notify::event::{CreateKind, EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::mpsc;
 
+use crate::config::Settings;
+use crate::db::Db;
 use crate::events::{Changes, Kind};
 use crate::git;
-use crate::review::DiffCache;
+use crate::review::{turn, DiffCache};
 
 /// How many distinct paths of a burst to look at before deciding what it was.
 /// A build writes far more than this; nobody edits that many by hand.
@@ -43,11 +45,15 @@ const BURST_SAMPLE: usize = 2048;
 pub struct Worktrees(Arc<Watched>);
 
 struct Watched {
-    /// NB: behind an `Arc<Mutex<_>>` because the worker thread has to add and
-    /// drop descriptors as directories appear and go, and `Watcher::watch`
-    /// takes `&mut self`. The worker holds only a [`Weak`] of it — see
+    /// NB: behind an `Arc<Mutex<_>>` because the worker has to add and drop
+    /// descriptors as directories appear and go, and `Watcher::watch` takes
+    /// `&mut self`. The worker holds only a [`Weak`] of it — see
     /// [`Worktrees::forget`].
     watches: Mutex<HashMap<i64, Arc<Mutex<RecommendedWatcher>>>>,
+    /// Both carried here because the burst task stages the worktree itself,
+    /// which means reading the card and the project it belongs to.
+    db: Db,
+    settings: Settings,
     cache: DiffCache,
     changes: Changes,
     /// How long a burst settles for before it is announced. Saving one file
@@ -56,9 +62,17 @@ struct Watched {
 }
 
 impl Worktrees {
-    pub fn new(cache: DiffCache, changes: Changes, debounce: Duration) -> Self {
+    pub fn new(
+        db: Db,
+        settings: Settings,
+        cache: DiffCache,
+        changes: Changes,
+        debounce: Duration,
+    ) -> Self {
         Self(Arc::new(Watched {
             watches: Mutex::new(HashMap::new()),
+            db,
+            settings,
             cache,
             changes,
             debounce,
@@ -70,28 +84,40 @@ impl Worktrees {
     /// Reports whether this call is what started watching it, so a caller can
     /// tell the difference between "already covered" and "covered from now on"
     /// — the latter leaves a window before it during which writes went unseen.
-    pub fn ensure(&self, card_id: i64, project_id: i64, worktree: &Path) -> bool {
+    pub async fn ensure(&self, card_id: i64, project_id: i64, worktree: &Path) -> bool {
+        if self.watching(card_id) {
+            return false;
+        }
+
+        // NB: not under the lock, which the recursive watch this replaced could
+        // afford to be. The walk asks git what to prune and so awaits, and a
+        // guard held across that would be a guard held across every other
+        // card's `ensure`. Two calls racing on one card is what the second
+        // check below is for: the loser drops its watcher, and dropping it is
+        // what gives the descriptors back.
+        let watcher = match self.spawn(card_id, project_id, worktree).await {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                warn!("card {card_id}: watching {}: {err}", worktree.display());
+                return false;
+            }
+        };
+
         let Ok(mut watches) = self.0.watches.lock() else {
             return false;
         };
         if watches.contains_key(&card_id) {
             return false;
         }
+        watches.insert(card_id, watcher);
+        true
+    }
 
-        // NB: the walk happens under this lock, as the recursive watch it
-        // replaced also did. It is one `git status` and a read of the tracked
-        // directories now, rather than a descriptor per directory of build
-        // output, so it holds the lock for less than it used to.
-        match self.spawn(card_id, project_id, worktree) {
-            Ok(watcher) => {
-                watches.insert(card_id, watcher);
-                true
-            }
-            Err(err) => {
-                warn!("card {card_id}: watching {}: {err}", worktree.display());
-                false
-            }
-        }
+    fn watching(&self, card_id: i64) -> bool {
+        self.0
+            .watches
+            .lock()
+            .is_ok_and(|watches| watches.contains_key(&card_id))
     }
 
     /// Stops watching, for a worktree that has gone.
@@ -105,13 +131,13 @@ impl Worktrees {
         }
     }
 
-    fn spawn(
+    async fn spawn(
         &self,
         card_id: i64,
         project_id: i64,
         worktree: &Path,
     ) -> notify::Result<Arc<Mutex<RecommendedWatcher>>> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -125,28 +151,35 @@ impl Worktrees {
         let mut watched = HashSet::from([worktree.to_path_buf()]);
         walk(worktree, &[worktree], &mut |level| {
             install(&mut watcher, &mut watched, level)
-        });
+        })
+        .await;
 
         let watcher = Arc::new(Mutex::new(watcher));
         let handle = Arc::downgrade(&watcher);
 
+        let db = self.0.db.clone();
+        let settings = self.0.settings.clone();
         let cache = self.0.cache.clone();
         let changes = self.0.changes.clone();
         let debounce = self.0.debounce;
         let worktree = worktree.to_path_buf();
 
-        std::thread::spawn(move || {
+        // NB: a task, not a thread. It stages the worktree, which is git and
+        // therefore awaited — and `notify` hands its events to a sync callback,
+        // which an unbounded sender can be fed from without blocking it.
+        rocket::tokio::spawn(async move {
             // Each pass waits for a first event, then swallows the rest of the
             // burst before saying anything.
-            while let Ok(first) = rx.recv() {
+            while let Some(first) = rx.recv().await {
                 let mut burst = Burst::default();
                 burst.absorb(first);
 
                 loop {
-                    match rx.recv_timeout(debounce) {
-                        Ok(seen) => burst.absorb(seen),
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => return,
+                    match tokio::time::timeout(debounce, rx.recv()).await {
+                        Ok(Some(seen)) => burst.absorb(seen),
+                        // The watcher was dropped, so the card is gone.
+                        Ok(None) => return,
+                        Err(_) => break,
                     }
                 }
 
@@ -154,19 +187,34 @@ impl Worktrees {
                 // burst that reads as a build can still have carried a
                 // directory that is not, and a directory missed here is missed
                 // for as long as the card lives.
-                if !burst.settle(&handle, &mut watched, &worktree) {
+                if !burst.settle(&handle, &mut watched, &worktree).await {
                     return;
                 }
 
                 let touched: Vec<PathBuf> = burst.touched.into_iter().collect();
-                if git::all_ignored(&worktree, &touched) {
+                if git::all_ignored(&worktree, &touched).await {
                     continue;
                 }
 
                 // The staged head is what went stale; the parsed diffs are
                 // keyed on content and stay valid.
-                cache.forget_head(card_id);
-                changes.project(project_id, Kind::Diff);
+                //
+                // NB: staged here rather than left for whoever asks next. This
+                // thread is the only one that knows the worktree moved, and a
+                // reader told so has no way to answer but to stage it — so
+                // announcing an empty memo set every fragment of every open
+                // board staging the same card at once, and made the reader
+                // wait for what it had just been told about. Skipped when
+                // nobody is connected, where there is no reader to be ahead of
+                // and the next `add -A` would be pure heat.
+                match changes.listening() {
+                    true => {
+                        turn::restage(&db, &cache, &settings, card_id).await;
+                    }
+                    false => cache.forget_head(card_id),
+                }
+
+                changes.card_in(project_id, card_id, Kind::Diff);
             }
         });
 
@@ -191,7 +239,7 @@ enum Seen {
 }
 
 /// Classifies one event and hands the worker what it needs, or nothing.
-fn report(tx: &Sender<Seen>, event: notify::Event) {
+fn report(tx: &mpsc::UnboundedSender<Seen>, event: notify::Event) {
     if event.need_rescan() {
         let _ = tx.send(Seen::Rescan);
         return;
@@ -252,7 +300,7 @@ impl Burst {
     ///
     /// Reports whether the watcher is still alive; it having gone is how a
     /// forgotten card's thread finds out.
-    fn settle(
+    async fn settle(
         &mut self,
         handle: &Weak<Mutex<RecommendedWatcher>>,
         watched: &mut HashSet<PathBuf>,
@@ -261,10 +309,11 @@ impl Burst {
         let Some(watcher) = handle.upgrade() else {
             return false;
         };
-        let Ok(mut watcher) = watcher.lock() else {
-            return false;
-        };
 
+        // NB: the guard is taken for each piece of work rather than held across
+        // the whole of this. `walk` awaits git, and a `MutexGuard` cannot be
+        // held across that. Nothing else touches this watcher, so the set it
+        // reads is still the set it wrote.
         // A watched directory that has gone takes its subtree with it, and the
         // subtree has to be pruned by prefix: notify drops the descendants of a
         // deleted watch for us, so an exact-match prune would leave ours
@@ -286,17 +335,22 @@ impl Burst {
             .chain(self.dirs.iter().filter(|dir| watched.contains(*dir)))
             .cloned()
             .collect();
-        for path in stale {
-            for dir in watched
-                .iter()
-                .filter(|dir| dir.starts_with(&path))
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                // An error is the ordinary case: the kernel drops the
-                // descriptor itself the moment the directory does.
-                let _ = watcher.unwatch(&dir);
-                watched.remove(&dir);
+        {
+            let Ok(mut guard) = watcher.lock() else {
+                return false;
+            };
+            for path in stale {
+                for dir in watched
+                    .iter()
+                    .filter(|dir| dir.starts_with(&path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    // An error is the ordinary case: the kernel drops the
+                    // descriptor itself the moment the directory does.
+                    let _ = guard.unwatch(&dir);
+                    watched.remove(&dir);
+                }
             }
         }
 
@@ -310,12 +364,21 @@ impl Burst {
             let mut fresh = HashSet::new();
             walk(worktree, &[worktree], &mut |level| {
                 fresh.extend(level.iter().cloned());
-                install(&mut watcher, watched, level);
-            });
-            for dir in watched.difference(&fresh).cloned().collect::<Vec<_>>() {
-                if dir != worktree {
-                    let _ = watcher.unwatch(&dir);
-                    watched.remove(&dir);
+                if let Ok(mut guard) = watcher.lock() {
+                    install(&mut guard, watched, level);
+                }
+            })
+            .await;
+
+            {
+                let Ok(mut guard) = watcher.lock() else {
+                    return false;
+                };
+                for dir in watched.difference(&fresh).cloned().collect::<Vec<_>>() {
+                    if dir != worktree {
+                        let _ = guard.unwatch(&dir);
+                        watched.remove(&dir);
+                    }
                 }
             }
             return true;
@@ -336,8 +399,11 @@ impl Burst {
                 // their watches landed is picked up by the staging that
                 // announcement asks for.
                 touched.extend(level.iter().cloned());
-                install(&mut watcher, watched, level);
-            });
+                if let Ok(mut guard) = watcher.lock() {
+                    install(&mut guard, watched, level);
+                }
+            })
+            .await;
         }
 
         true
@@ -365,11 +431,11 @@ impl Burst {
 /// worktree in one call, but it can only report a directory it has a file in —
 /// and `mkdir` ahead of the first write is exactly how a build arrives, so an
 /// empty `node_modules` would be walked into and watched.
-fn walk(worktree: &Path, roots: &[&Path], keep: &mut impl FnMut(&[PathBuf])) {
+async fn walk(worktree: &Path, roots: &[&Path], keep: &mut impl FnMut(&[PathBuf])) {
     let mut level: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
 
     while !level.is_empty() {
-        let ignored = git::ignored(worktree, &level);
+        let ignored = git::ignored(worktree, &level).await;
         level.retain(|dir| !ignored.contains(dir));
         keep(&level);
 
@@ -480,31 +546,35 @@ mod tests {
     use crate::git::run;
 
     /// A repository to walk, with the ignore rules already committed.
-    fn scratch(name: &str, ignore: &str, dirs: &[&str]) -> PathBuf {
+    async fn scratch(name: &str, ignore: &str, dirs: &[&str]) -> PathBuf {
         let repo =
             std::env::temp_dir().join(format!("ledecky-watch-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
 
-        run(&repo, &["init", "-q", "--initial-branch=main"]).unwrap();
-        run(&repo, &["config", "user.email", "t@example.com"]).unwrap();
-        run(&repo, &["config", "user.name", "t"]).unwrap();
+        run(&repo, &["init", "-q", "--initial-branch=main"])
+            .await
+            .unwrap();
+        run(&repo, &["config", "user.email", "t@example.com"])
+            .await
+            .unwrap();
+        run(&repo, &["config", "user.name", "t"]).await.unwrap();
 
         for dir in dirs {
             std::fs::create_dir_all(repo.join(dir)).unwrap();
             std::fs::write(repo.join(dir).join("f"), "").unwrap();
         }
         std::fs::write(repo.join(".gitignore"), ignore).unwrap();
-        run(&repo, &["add", "-A"]).unwrap();
-        run(&repo, &["commit", "-qm", "first"]).unwrap();
+        run(&repo, &["add", "-A"]).await.unwrap();
+        run(&repo, &["commit", "-qm", "first"]).await.unwrap();
 
         repo
     }
 
     /// What the watcher would end up holding descriptors for.
-    fn watched(worktree: &Path, roots: &[&Path]) -> Vec<PathBuf> {
+    async fn watched(worktree: &Path, roots: &[&Path]) -> Vec<PathBuf> {
         let mut found = Vec::new();
-        walk(worktree, roots, &mut |level| found.extend_from_slice(level));
+        walk(worktree, roots, &mut |level| found.extend_from_slice(level)).await;
         found.sort();
         found
     }
@@ -512,16 +582,17 @@ mod tests {
     /// The whole point: a build's directories cost nothing, however many of
     /// them there are, and `.git` — a 256-way fanout under `objects` alone —
     /// costs nothing either.
-    #[test]
-    fn the_walk_stops_at_what_git_ignores() {
+    #[tokio::test]
+    async fn the_walk_stops_at_what_git_ignores() {
         let repo = scratch(
             "ignored",
             "target/\n",
             &["src/inner", "target/debug/deps", "target/release"],
-        );
+        )
+        .await;
 
         assert_eq!(
-            watched(&repo, &[&repo]),
+            watched(&repo, &[&repo]).await,
             [repo.clone(), repo.join("src"), repo.join("src/inner")]
         );
     }
@@ -529,55 +600,69 @@ mod tests {
     /// Tracked work under an ignored path is still work, and git reads it that
     /// way — so the walk has to as well, or the pane would stop keeping up with
     /// a file its diff is showing.
-    #[test]
-    fn an_ignored_directory_holding_tracked_work_is_still_watched() {
-        let repo = scratch("tracked", "build/\n", &[]);
+    #[tokio::test]
+    async fn an_ignored_directory_holding_tracked_work_is_still_watched() {
+        let repo = scratch("tracked", "build/\n", &[]).await;
         std::fs::create_dir_all(repo.join("build")).unwrap();
         std::fs::write(repo.join("build/kept.txt"), "tracked anyway\n").unwrap();
-        run(&repo, &["add", "-Af"]).unwrap();
-        run(&repo, &["commit", "-qm", "tracked under an ignored path"]).unwrap();
+        run(&repo, &["add", "-Af"]).await.unwrap();
+        run(&repo, &["commit", "-qm", "tracked under an ignored path"])
+            .await
+            .unwrap();
 
-        assert_eq!(watched(&repo, &[&repo]), [repo.clone(), repo.join("build")]);
+        assert_eq!(
+            watched(&repo, &[&repo]).await,
+            [repo.clone(), repo.join("build")]
+        );
     }
 
     /// A new directory is walked from itself, which is what a watch established
     /// after the fact can be given without redoing the tree.
-    #[test]
-    fn a_new_directory_is_walked_from_where_it_starts() {
-        let repo = scratch("subtree", "target/\n", &["pkg/deep", "pkg/target/debug"]);
+    #[tokio::test]
+    async fn a_new_directory_is_walked_from_where_it_starts() {
+        let repo = scratch("subtree", "target/\n", &["pkg/deep", "pkg/target/debug"]).await;
 
         let pkg = repo.join("pkg");
-        assert_eq!(watched(&repo, &[&pkg]), [pkg.clone(), pkg.join("deep")]);
+        assert_eq!(
+            watched(&repo, &[&pkg]).await,
+            [pkg.clone(), pkg.join("deep")]
+        );
 
         // And a root that is itself ignored is not walked at all.
-        assert!(watched(&repo, &[&pkg.join("target")]).is_empty());
+        assert!(watched(&repo, &[&pkg.join("target")]).await.is_empty());
     }
 
     /// notify follows symlinks, so a recursive watch on a link to somewhere
     /// else watches somewhere else — and reports it under a path in here.
     #[cfg(unix)]
-    #[test]
-    fn a_symlinked_directory_is_not_followed() {
-        let repo = scratch("links", "\n", &["src"]);
+    #[tokio::test]
+    async fn a_symlinked_directory_is_not_followed() {
+        let repo = scratch("links", "\n", &["src"]).await;
         // Outside the repository, which is the whole hazard: following this
         // would watch a directory no card has anything to do with.
         let elsewhere = repo.with_extension("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, repo.join("link")).unwrap();
 
-        assert_eq!(watched(&repo, &[&repo]), [repo.clone(), repo.join("src")]);
+        assert_eq!(
+            watched(&repo, &[&repo]).await,
+            [repo.clone(), repo.join("src")]
+        );
     }
 
     /// A `mkdir` lands before the first write, and git has nothing to say about
     /// a directory it has no file in — so the walk has to read the rules rather
     /// than the tree, or a build's first directory would be watched and every
     /// directory under it with it.
-    #[test]
-    fn an_empty_directory_is_still_read_against_the_rules() {
-        let repo = scratch("empty", "target/\n", &[]);
+    #[tokio::test]
+    async fn an_empty_directory_is_still_read_against_the_rules() {
+        let repo = scratch("empty", "target/\n", &[]).await;
         std::fs::create_dir_all(repo.join("target")).unwrap();
         std::fs::create_dir_all(repo.join("src")).unwrap();
 
-        assert_eq!(watched(&repo, &[&repo]), [repo.clone(), repo.join("src")]);
+        assert_eq!(
+            watched(&repo, &[&repo]).await,
+            [repo.clone(), repo.join("src")]
+        );
     }
 }

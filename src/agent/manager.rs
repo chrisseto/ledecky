@@ -15,6 +15,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use portable_pty::CommandBuilder;
 use rocket::fairing::{self, Fairing, Info};
+use rocket::tokio::sync::mpsc;
+use rocket::tokio::task::spawn_blocking;
 use rocket::{Orbit, Rocket};
 
 use crate::agent::agent::{self, Watcher};
@@ -38,19 +40,56 @@ pub struct AgentManager {
     /// moment of a spawn, which happens in here.
     auth: HookAuth,
     settings: Settings,
+    /// Where the pump's reports go. See [`Report`].
+    reports: mpsc::UnboundedSender<Report>,
+}
+
+/// What the pump has to tell the manager.
+///
+/// NB: a channel rather than the call itself. The pump runs on a thread of
+/// `portable-pty`'s making, so it cannot await the writes these turn into — and
+/// blocking on the runtime from there panics outright once the runtime is
+/// shutting down, which is exactly when a pty closes and the pump reports. A
+/// send costs the pump nothing and cannot fail loudly: once the manager is
+/// gone, so is anything a report would have written.
+enum Report {
+    /// The dialog that was holding the keyboard has left the screen.
+    DialogCleared(i64),
+    /// The pty closed: the agent is gone, however it went.
+    Exited(i64),
 }
 
 impl AgentManager {
     /// NB: `Arc` from the start, because `spawn` hands the pump a `Weak` to
     /// this and there is nowhere else for that to come from.
     pub fn new(db: Db, changes: Changes, auth: HookAuth, settings: Settings) -> Arc<Self> {
-        Arc::new(Self {
+        let (reports, mut inbox) = mpsc::unbounded_channel();
+        let manager = Arc::new(Self {
             agents: RwLock::new(HashMap::new()),
             db,
             changes,
             auth,
             settings,
-        })
+            reports,
+        });
+
+        // NB: a `Weak`, so this task is not what keeps the manager alive. The
+        // manager owns the sender, so dropping it closes the channel and ends
+        // this — which is also what stops a report outliving the runtime.
+        let applying = Arc::downgrade(&manager);
+        rocket::tokio::spawn(async move {
+            while let Some(report) = inbox.recv().await {
+                let Some(manager) = applying.upgrade() else {
+                    return;
+                };
+                match report {
+                    Report::DialogCleared(card_id) => manager.resumed(card_id).await,
+                    Report::Exited(card_id) => manager.stopped(card_id).await,
+                }
+            }
+        });
+
+        manager
     }
 
     /// Whether a hook callback carries this server's token.
@@ -183,83 +222,102 @@ impl AgentManager {
     // announcing those separately would fetch the card twice.
 
     /// The card is starting an agent.
-    pub fn starting(&self, card_id: i64) {
-        self.write(card_id, AgentState::Starting);
+    pub async fn starting(&self, card_id: i64, worktree: &str) {
+        // NB: one write, so a reader never finds a card holding a worktree with
+        // nothing running in it — which is what the board draws a stopped card
+        // with a diff from.
+        let _ = Card::starting(&self.db, card_id, worktree).await;
+        self.announce(card_id).await;
     }
 
     /// Writes a state and moves the lane if that state calls for it, under one
     /// lock and one announcement.
-    fn settle(&self, card_id: i64, state: AgentState) {
-        let conn = self.db.lock();
-        Card::set_agent_state(&conn, card_id, state);
+    async fn settle(&self, card_id: i64, state: AgentState) {
+        Card::set_agent_state(&self.db, card_id, state).await;
 
-        let lane = Card::find(&conn, card_id)
+        let lane = Card::find(&self.db, card_id)
+            .await
             .and_then(|card| lane_for(state, card.lane, card.merge_requested));
         if let Some(lane) = lane {
-            Card::set_lane(&conn, card_id, lane);
+            Card::set_lane(&self.db, card_id, lane).await;
         }
-        drop(conn);
 
-        self.announce(card_id);
+        self.announce(card_id).await;
     }
 
     /// The user asked for the agent to stop.
-    pub fn stop(&self, card_id: i64) {
+    pub async fn stop(&self, card_id: i64) {
         self.evict(card_id);
-
-        let conn = self.db.lock();
-        Card::set_agent_pid(&conn, card_id, None);
-        Card::set_agent_state(&conn, card_id, AgentState::Stopped);
-        drop(conn);
-
-        self.announce(card_id);
+        self.stopped(card_id).await;
     }
 
     /// A turn began — `UserPromptSubmit`.
     ///
     /// NB: driven by the prompt rather than by anything dialog-shaped, so a
     /// review sent to an idle card moves it too.
-    pub fn turn_started(&self, card_id: i64) {
-        self.settle(card_id, AgentState::Running);
+    pub async fn turn_started(&self, card_id: i64) {
+        self.settle(card_id, AgentState::Running).await;
     }
 
     /// A turn ended — `Stop`. The work is there to look at, so the card goes to
     /// review.
-    pub fn turn_ended(&self, card_id: i64) {
-        self.settle(card_id, AgentState::Idle);
+    pub async fn turn_ended(&self, card_id: i64) {
+        self.settle(card_id, AgentState::Idle).await;
     }
 
     /// A dialog is up and is the user's to answer.
     ///
     /// Parks the card in In Review as well as saying so on the chip: a chip is
     /// easy to miss at board scale, a lane is not.
-    pub fn needs_user(&self, card_id: i64) {
-        self.settle(card_id, AgentState::AwaitingUser);
+    pub async fn needs_user(&self, card_id: i64) {
+        self.settle(card_id, AgentState::AwaitingUser).await;
     }
 
     /// No hook has reached us, so our callbacks are not arriving — most likely
     /// an `allowedHttpHookUrls` allowlist that does not name us.
-    pub fn hooks_silent(&self, card_id: i64) {
-        self.write(card_id, AgentState::Misconfigured);
+    pub async fn hooks_silent(&self, card_id: i64) {
+        self.write(card_id, AgentState::Misconfigured).await;
     }
 
     /// The agent could not be started at all.
-    pub fn failed(&self, card_id: i64) {
-        self.write(card_id, AgentState::Error);
+    pub async fn failed(&self, card_id: i64) {
+        self.write(card_id, AgentState::Error).await;
     }
 
     /// Claude Code reported its own session ending.
-    pub fn session_ended(&self, card_id: i64) {
-        self.write(card_id, AgentState::Stopped);
+    pub async fn session_ended(&self, card_id: i64) {
+        self.write(card_id, AgentState::Stopped).await;
     }
 
-    fn write(&self, card_id: i64, state: AgentState) {
-        Card::set_agent_state(&self.db.lock(), card_id, state);
-        self.announce(card_id);
+    async fn write(&self, card_id: i64, state: AgentState) {
+        Card::set_agent_state(&self.db, card_id, state).await;
+        self.announce(card_id).await;
     }
 
-    fn announce(&self, card_id: i64) {
-        self.changes.card(&self.db, card_id, Kind::State);
+    /// Work has resumed, for a card that was waiting on a dialog.
+    ///
+    /// NB: only overwrites the state we set ourselves. A turn can end — and its
+    /// `Stop` hook record `idle` — before the redraw that proves the dialog is
+    /// gone, and writing `running` over that would leave the card claiming to
+    /// work.
+    async fn resumed(&self, card_id: i64) {
+        let awaiting = Card::find(&self.db, card_id)
+            .await
+            .is_some_and(|card| card.agent_state == AgentState::AwaitingUser);
+
+        if awaiting {
+            self.turn_started(card_id).await;
+        }
+    }
+
+    /// The agent is gone: no pid, and stopped however it went.
+    async fn stopped(&self, card_id: i64) {
+        Card::set_agent_pid(&self.db, card_id, None).await;
+        self.write(card_id, AgentState::Stopped).await;
+    }
+
+    async fn announce(&self, card_id: i64) {
+        self.changes.card(&self.db, card_id, Kind::State).await;
     }
 
     /// Watches a session through its first moments.
@@ -270,7 +328,7 @@ impl AgentManager {
     /// anything, and the client holds the task behind them — so a session that never
     /// signals is one the user has to answer, and the card says so rather than
     /// sitting in `starting` with nobody told.
-    pub(crate) fn watch_startup(
+    pub(crate) async fn watch_startup(
         self: Arc<Self>,
         agent: Arc<Agent>,
         card_id: i64,
@@ -279,9 +337,9 @@ impl AgentManager {
         // NB: watched for as long as the misconfigured check would have waited
         // anyway. The trust prompt can sit there for as long as it takes somebody to
         // notice it, and a shorter look just races the client's first paint.
-        if settled(&agent, timings.hook_grace) == Startup::Blocked {
+        if settled(&agent, timings.hook_grace).await == Startup::Blocked {
             agent.saw_dialog();
-            self.needs_user(card_id);
+            self.needs_user(card_id).await;
             // Deliberately no misconfigured check behind this. A session
             // holding a dialog has not run a turn, so of course no hook has
             // fired — saying the hooks are broken would be the second wrong
@@ -292,22 +350,19 @@ impl AgentManager {
         // Silence past this point means our hook URLs are not reaching us —
         // most likely an `allowedHttpHookUrls` allowlist. Without hooks there
         // are no turn snapshots and no lane transitions, so say so on the card.
-        std::thread::sleep(timings.hook_grace);
-        if agent.is_running() && self.hook_events(card_id) == 0 {
+        rocket::tokio::time::sleep(timings.hook_grace).await;
+        if agent.is_running() && self.hook_events(card_id).await == 0 {
             let grace = timings.hook_grace;
             warn!("card {card_id}: no hooks received within {grace:?}");
-            self.hooks_silent(card_id);
+            self.hooks_silent(card_id).await;
         }
     }
 
-    fn hook_events(&self, card_id: i64) -> i64 {
-        self.db
-            .lock()
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE card_id = ?1",
-                [card_id],
-                |r| r.get(0),
-            )
+    async fn hook_events(&self, card_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE card_id = ?1")
+            .bind(card_id)
+            .fetch_one(self.db.pool())
+            .await
             .unwrap_or(0)
     }
 
@@ -316,11 +371,13 @@ impl AgentManager {
     /// The server never rewrites the user's branches itself — conflicts are exactly
     /// the situation an agent is good at, and a failed rebase run by the server
     /// would just leave a mess for someone else to unpick.
-    pub fn request_merge(&self, card_id: i64) -> Result<()> {
-        let conn = self.db.lock();
-        let card = Card::find(&conn, card_id).context("no such card")?;
-        let project = Project::find(&conn, card.project_id).context("no such project")?;
-        drop(conn);
+    pub async fn request_merge(&self, card_id: i64) -> Result<()> {
+        let card = Card::find(&self.db, card_id)
+            .await
+            .context("no such card")?;
+        let project = Project::find(&self.db, card.project_id)
+            .await
+            .context("no such project")?;
 
         let inbox = self
             .running(card_id)
@@ -330,19 +387,26 @@ impl AgentManager {
 
         let repo = project.repo();
         let base_sha = git::run(&repo, &["rev-parse", &card.base_branch])
+            .await
             .with_context(|| format!("resolving {}", card.base_branch))?;
 
         // Recorded before the message goes out: the agent can land the merge and
         // fire its `Stop` hook while we are still here, and a hook that arrives
         // without this reads the turn as ordinary work.
-        Card::request_merge(&self.db.lock(), card_id, &base_sha);
+        Card::request_merge(&self.db, card_id, &base_sha).await;
 
-        if let Err(err) = messaging::send(&inbox, &merge_prompt(&card.base_branch, &repo)) {
-            Card::clear_merge_request(&self.db.lock(), card_id);
+        // NB: on the blocking pool. The inbox is a unix socket written under a
+        // timeout, which blocks the thread it is on however short it is.
+        let prompt = merge_prompt(&card.base_branch, &repo);
+        let sent = spawn_blocking(move || messaging::send(&inbox, &prompt))
+            .await
+            .expect("asking for a merge panicked");
+        if let Err(err) = sent {
+            Card::clear_merge_request(&self.db, card_id).await;
             return Err(err).context("asking the agent to merge");
         }
 
-        self.changes.card(&self.db, card_id, Kind::Board);
+        self.changes.card(&self.db, card_id, Kind::Board).await;
         Ok(())
     }
 
@@ -351,26 +415,23 @@ impl AgentManager {
     /// Closing the pty master hangs up the session, so an agent normally dies with
     /// us even under `SIGKILL`. This covers what that misses: a child that ignores
     /// `SIGHUP`, or one that had already broken away from the terminal.
-    pub fn sweep_orphans(&self) {
-        let cards = Card::with_agent_pid(&self.db.lock());
-
-        for card in cards {
+    pub async fn sweep_orphans(&self) {
+        for card in Card::with_agent_pid(&self.db).await {
             let Some(pid) = card.agent_pid else { continue };
 
             if owns(pid, &self.settings.worktrees_dir()) {
                 warn!("card {}: killing orphaned agent {pid}", card.id);
                 kill_pid(pid);
             }
-            let conn = self.db.lock();
-            Card::set_agent_pid(&conn, card.id, None);
-            Card::set_agent_state(&conn, card.id, AgentState::Stopped);
+            Card::set_agent_pid(&self.db, card.id, None).await;
+            Card::set_agent_state(&self.db, card.id, AgentState::Stopped).await;
         }
     }
 
     /// Whether a `--resume` exited before it started, which is how the client
     /// reports a conversation it could not find.
-    pub fn resume_failed(&self, agent: &Agent, within: Duration) -> bool {
-        settled(agent, within) == Startup::Gone
+    pub async fn resume_failed(&self, agent: &Agent, within: Duration) -> bool {
+        settled(agent, within).await == Startup::Gone
     }
 
     pub fn db(&self) -> &Db {
@@ -407,7 +468,7 @@ enum Startup {
 /// NB: the screen is polled rather than read once at the end. The client takes
 /// seconds to paint, and where it lands in that window is not something to race:
 /// checking a single time picked up a blank screen and called it stalled.
-fn settled(agent: &Agent, within: Duration) -> Startup {
+async fn settled(agent: &Agent, within: Duration) -> Startup {
     let checks = within.as_millis() / STARTUP_POLL.as_millis().max(1);
     for _ in 0..checks {
         if agent.inbox().is_some() {
@@ -419,7 +480,7 @@ fn settled(agent: &Agent, within: Duration) -> Startup {
         if agent.is_blocked() {
             return Startup::Blocked;
         }
-        std::thread::sleep(STARTUP_POLL);
+        rocket::tokio::time::sleep(STARTUP_POLL).await;
     }
     Startup::Stalled
 }
@@ -493,34 +554,19 @@ impl Fairing for AgentManager {
 /// The pump's two reports. Neither has another caller, so the bodies live here
 /// rather than being inherent methods with a trait forwarding to them.
 impl Watcher for AgentManager {
-    /// NB: only overwrites the state we set ourselves. A turn can end — and its
-    /// `Stop` hook record `idle` — before the redraw that proves the dialog is
-    /// gone, and writing `running` over that would leave the card claiming to
-    /// work.
     fn dialog_cleared(&self, card_id: i64) {
-        let awaiting = Card::find(&self.db.lock(), card_id)
-            .is_some_and(|card| card.agent_state == AgentState::AwaitingUser);
-
-        if awaiting {
-            self.turn_started(card_id);
-        }
+        let _ = self.reports.send(Report::DialogCleared(card_id));
     }
 
-    /// The pty closed: the agent is gone, however it went.
-    ///
     /// NB: the only path that reports a crash, and the only one that clears a
     /// stale `AwaitingUser`. Without it a card whose agent dies while a dialog
     /// is up says "needs you" forever, because the redraw that would have
     /// cleared it can never come.
     fn exited(&self, card_id: i64) {
+        // Inline, unlike the write behind it: this reaps the child, and a
+        // report waiting its turn is a zombie waiting with it.
         self.evict(card_id);
-
-        let conn = self.db.lock();
-        Card::set_agent_pid(&conn, card_id, None);
-        Card::set_agent_state(&conn, card_id, AgentState::Stopped);
-        drop(conn);
-
-        self.announce(card_id);
+        let _ = self.reports.send(Report::Exited(card_id));
     }
 }
 
@@ -613,11 +659,10 @@ mod tests {
     // ---- the transitions ----
 
     /// A card in `lane`, with its agent in `state`.
-    fn card_in(db: &Db, lane: Lane, state: AgentState) -> i64 {
-        let conn = db.lock();
-        let project = Project::upsert(&conn, Path::new("/srv/repo")).unwrap();
+    async fn card_in(db: &Db, lane: Lane, state: AgentState) -> i64 {
+        let project = Project::upsert(db, Path::new("/srv/repo")).await.unwrap();
         let card = Card::create(
-            &conn,
+            db,
             NewCard {
                 project_id: project,
                 task: "waiting",
@@ -626,9 +671,10 @@ mod tests {
                 model: None,
             },
         )
+        .await
         .unwrap();
-        Card::set_lane(&conn, card, lane);
-        Card::set_agent_state(&conn, card, state);
+        Card::set_lane(db, card, lane).await;
+        Card::set_agent_state(db, card, state).await;
         card
     }
 
@@ -643,64 +689,78 @@ mod tests {
         )
     }
 
-    fn look(db: &Db, card_id: i64) -> (Lane, AgentState) {
-        let card = Card::find(&db.lock(), card_id).unwrap();
+    async fn look(db: &Db, card_id: i64) -> (Lane, AgentState) {
+        let card = Card::find(db, card_id).await.unwrap();
         (card.lane, card.agent_state)
     }
 
-    #[test]
-    fn a_card_waiting_on_a_dialog_steps_into_review_and_back() {
-        let db = memory_db();
-        let card = card_in(&db, Lane::InProgress, AgentState::Running);
+    #[tokio::test]
+    async fn a_card_waiting_on_a_dialog_steps_into_review_and_back() {
+        let db = memory_db().await;
+        let card = card_in(&db, Lane::InProgress, AgentState::Running).await;
 
-        manager(&db).needs_user(card);
-        assert_eq!(look(&db, card), (Lane::InReview, AgentState::AwaitingUser));
+        manager(&db).needs_user(card).await;
+        assert_eq!(
+            look(&db, card).await,
+            (Lane::InReview, AgentState::AwaitingUser)
+        );
 
-        manager(&db).dialog_cleared(card);
-        assert_eq!(look(&db, card), (Lane::InProgress, AgentState::Running));
+        // What the pump's report turns into, which is the half worth asserting
+        // on; the trait method itself only hands it over.
+        manager(&db).resumed(card).await;
+        assert_eq!(
+            look(&db, card).await,
+            (Lane::InProgress, AgentState::Running)
+        );
     }
 
-    #[test]
-    fn a_card_already_in_review_only_changes_state_on_the_way_in() {
-        let db = memory_db();
-        let card = card_in(&db, Lane::InReview, AgentState::Running);
+    #[tokio::test]
+    async fn a_card_already_in_review_only_changes_state_on_the_way_in() {
+        let db = memory_db().await;
+        let card = card_in(&db, Lane::InReview, AgentState::Running).await;
 
-        manager(&db).needs_user(card);
-        assert_eq!(look(&db, card), (Lane::InReview, AgentState::AwaitingUser));
+        manager(&db).needs_user(card).await;
+        assert_eq!(
+            look(&db, card).await,
+            (Lane::InReview, AgentState::AwaitingUser)
+        );
     }
 
-    #[test]
-    fn a_prompt_pulls_an_idle_card_out_of_review() {
+    #[tokio::test]
+    async fn a_prompt_pulls_an_idle_card_out_of_review() {
         // Sending a review to an idle card is the case the dialog watcher never
         // sees: there is no dialog, only a `UserPromptSubmit`.
-        let db = memory_db();
-        let card = card_in(&db, Lane::InReview, AgentState::Idle);
+        let db = memory_db().await;
+        let card = card_in(&db, Lane::InReview, AgentState::Idle).await;
 
-        manager(&db).turn_started(card);
-        assert_eq!(look(&db, card), (Lane::InProgress, AgentState::Running));
+        manager(&db).turn_started(card).await;
+        assert_eq!(
+            look(&db, card).await,
+            (Lane::InProgress, AgentState::Running)
+        );
     }
 
-    #[test]
-    fn an_outstanding_merge_keeps_the_card_in_review() {
+    #[tokio::test]
+    async fn an_outstanding_merge_keeps_the_card_in_review() {
         // The merge prompt fires `UserPromptSubmit` like any other, and In Review
         // is the only lane offering the button.
-        let db = memory_db();
-        let card = card_in(&db, Lane::InReview, AgentState::Idle);
-        Card::request_merge(&db.lock(), card, "abc123");
+        let db = memory_db().await;
+        let card = card_in(&db, Lane::InReview, AgentState::Idle).await;
+        Card::request_merge(&db, card, "abc123").await;
 
-        manager(&db).turn_started(card);
-        assert_eq!(look(&db, card), (Lane::InReview, AgentState::Running));
+        manager(&db).turn_started(card).await;
+        assert_eq!(look(&db, card).await, (Lane::InReview, AgentState::Running));
     }
 
-    #[test]
-    fn a_dialog_redraw_does_not_overwrite_a_finished_turn() {
+    #[tokio::test]
+    async fn a_dialog_redraw_does_not_overwrite_a_finished_turn() {
         // The `Stop` hook can land before the redraw that proves the dialog is
         // gone; `running` written over that `idle` would strand the card.
-        let db = memory_db();
-        let card = card_in(&db, Lane::InReview, AgentState::Idle);
+        let db = memory_db().await;
+        let card = card_in(&db, Lane::InReview, AgentState::Idle).await;
 
-        manager(&db).dialog_cleared(card);
-        assert_eq!(look(&db, card), (Lane::InReview, AgentState::Idle));
+        manager(&db).resumed(card).await;
+        assert_eq!(look(&db, card).await, (Lane::InReview, AgentState::Idle));
     }
 
     // ---- the sweep ----------------------------------------------------------
@@ -779,11 +839,10 @@ mod tests {
         path
     }
 
-    fn card_with_pid(db: &Db, pid: Option<i64>, worktree: &Path) -> i64 {
-        let conn = db.lock();
-        let project = Project::upsert(&conn, Path::new("/srv/repo")).unwrap();
+    async fn card_with_pid(db: &Db, pid: Option<i64>, worktree: &Path) -> i64 {
+        let project = Project::upsert(db, Path::new("/srv/repo")).await.unwrap();
         let card = Card::create(
-            &conn,
+            db,
             NewCard {
                 project_id: project,
                 task: "work",
@@ -792,13 +851,14 @@ mod tests {
                 model: None,
             },
         )
+        .await
         .unwrap();
-        Card::attach_worktree(&conn, card, &worktree.to_string_lossy(), pid);
+        Card::attach_worktree(db, card, &worktree.to_string_lossy(), pid).await;
         card
     }
 
-    #[test]
-    fn the_sweep_kills_an_agent_still_sitting_in_its_worktree() {
+    #[tokio::test]
+    async fn the_sweep_kills_an_agent_still_sitting_in_its_worktree() {
         let data_dir = scratch("kills");
         let settings = sweep_settings(&data_dir);
         let worktree = settings.worktree_path(1);
@@ -806,23 +866,22 @@ mod tests {
         let mut child = park(&worktree);
         let pid = i64::from(child.id());
 
-        let db = memory_db();
-        let card = card_with_pid(&db, Some(pid), &worktree);
+        let db = memory_db().await;
+        let card = card_with_pid(&db, Some(pid), &worktree).await;
 
-        sweeper(&db, settings.clone()).sweep_orphans();
+        sweeper(&db, settings.clone()).sweep_orphans().await;
 
         // The process is gone and the card no longer claims one.
         assert!(child.wait().is_ok());
         assert!(!owns(pid, &settings.worktrees_dir()));
 
-        let conn = db.lock();
-        let swept = Card::find(&conn, card).unwrap();
+        let swept = Card::find(&db, card).await.unwrap();
         assert_eq!(swept.agent_pid, None);
         assert_eq!(swept.agent_state, AgentState::Stopped);
     }
 
-    #[test]
-    fn the_sweep_spares_a_process_that_is_not_ours() {
+    #[tokio::test]
+    async fn the_sweep_spares_a_process_that_is_not_ours() {
         let data_dir = scratch("spares");
         let settings = sweep_settings(&data_dir);
 
@@ -831,27 +890,27 @@ mod tests {
         let mut child = park(&elsewhere);
         let pid = i64::from(child.id());
 
-        let db = memory_db();
-        let card = card_with_pid(&db, Some(pid), &elsewhere);
+        let db = memory_db().await;
+        let card = card_with_pid(&db, Some(pid), &elsewhere).await;
 
-        sweeper(&db, settings.clone()).sweep_orphans();
+        sweeper(&db, settings.clone()).sweep_orphans().await;
 
         assert!(owns(pid, &elsewhere), "an unrelated process was killed");
         // The stale record is still cleared, so it is not reconsidered.
-        assert_eq!(Card::find(&db.lock(), card).unwrap().agent_pid, None);
+        assert_eq!(Card::find(&db, card).await.unwrap().agent_pid, None);
 
         let _ = child.kill();
         let _ = child.wait();
     }
 
-    #[test]
-    fn the_sweep_ignores_cards_with_nothing_recorded() {
+    #[tokio::test]
+    async fn the_sweep_ignores_cards_with_nothing_recorded() {
         let settings = sweep_settings(&scratch("empty"));
-        let db = memory_db();
-        let card = card_with_pid(&db, None, Path::new("/srv/worktrees/1"));
+        let db = memory_db().await;
+        let card = card_with_pid(&db, None, Path::new("/srv/worktrees/1")).await;
 
-        sweeper(&db, settings.clone()).sweep_orphans();
+        sweeper(&db, settings.clone()).sweep_orphans().await;
 
-        assert_eq!(Card::find(&db.lock(), card).unwrap().agent_pid, None);
+        assert_eq!(Card::find(&db, card).await.unwrap().agent_pid, None);
     }
 }

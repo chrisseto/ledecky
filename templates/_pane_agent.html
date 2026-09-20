@@ -1,0 +1,28 @@
+{# Whether there is a terminal to show turns on the agent being up, which
+   happens on its own clock — a card opened mid-start would otherwise sit on
+   "No agent running" until it was reloaded. The same event that moves the chip
+   redraws this.
+
+   Its own route rather than a `hx-select` out of `/cards/<id>`: that answer is
+   a whole board and a whole review pane, both of which shell out to git per
+   card, rendered to pick one boolean out of. This asks the question it has.
+   The fragment is also stable across everything a `state` event does not
+   touch, so most of these redraws cost a bodyless 304. #}
+<section class="pane pane-agent"
+         hx-get="/cards/{{ card.id }}/agent"
+         hx-trigger="state-{{ card.id }} from:body, reload from:body"
+         hx-swap="outerMorph" hx-sync="replace">
+  {% if live %}
+    {# `hx-morph-skip` because xterm builds this subtree on the client and the
+       server knows nothing about it — a morph would reconcile it away. The id
+       names the card, so opening a different one replaces the element and its
+       socket outright rather than reusing this one. #}
+    <x-terminal class="terminal" id="terminal-{{ card.id }}" hx-morph-skip
+                data-terminal="/cards/{{ card.id }}/terminal"
+                data-resize-url="/cards/{{ card.id }}/resize"></x-terminal>
+  {% else %}
+    <p class="empty">
+      No agent running. Move this card to <strong>In Progress</strong>, or start one here.
+    </p>
+  {% endif %}
+</section>

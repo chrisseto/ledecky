@@ -15,6 +15,7 @@ pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
         terminal::focus,
         terminal::state,
+        terminal::agent_pane,
         terminal::start,
         terminal::stop,
         terminal::resize,

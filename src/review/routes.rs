@@ -6,6 +6,7 @@ use minijinja::context;
 use rocket::form::Form;
 use rocket::http::Status;
 use rocket::serde::Serialize;
+use rocket::tokio::task::spawn_blocking;
 use rocket::{get, post, State};
 
 use crate::agent::{messaging, AgentManager};
@@ -130,7 +131,7 @@ struct View<'a> {
 }
 
 #[get("/cards/<id>/diff?<scope>&<expand>&<comment>")]
-pub fn diff_pane(
+pub async fn diff_pane(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -140,15 +141,18 @@ pub fn diff_pane(
     comment: Option<&str>,
 ) -> Result<Tmpl, Status> {
     let view = View {
-        scope,
-        expand,
-        comment,
+        scope: scope.as_deref(),
+        expand: expand.as_deref(),
+        comment: comment.as_deref(),
     };
-    Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
+    Ok(Tmpl(
+        "_review.html",
+        pane(&db, &settings, &cache, id, view).await?,
+    ))
 }
 
 /// Everything `_review.html` needs, for the drawer's first render.
-pub fn initial(
+pub async fn initial(
     db: &Db,
     settings: &Settings,
     cache: &DiffCache,
@@ -168,11 +172,11 @@ pub fn initial(
                 scope,
                 ..View::default()
             },
-        )?
+        ).await?
     })
 }
 
-fn pane(
+async fn pane(
     db: &Db,
     settings: &Settings,
     cache: &DiffCache,
@@ -182,9 +186,10 @@ fn pane(
     let scope = Scope::parse(view.scope);
     let expansion = Expansion::parse(view.expand);
 
-    let conn = db.lock();
-    let card = Card::find(&conn, id).ok_or(Status::NotFound)?;
-    let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let project = Project::find(db, card.project_id)
+        .await
+        .ok_or(Status::NotFound)?;
 
     // A collected card kept its rows but not its refs, so there is nothing left
     // to diff against — and it is off the board on purpose. Answering here
@@ -193,30 +198,41 @@ fn pane(
         return Err(Status::NotFound);
     }
 
-    let turns = Turn::for_card(&conn, id);
-    let viewed = Viewed::for_card(&conn, id);
+    let turns = Turn::for_card(db, id).await;
+    let viewed = Viewed::for_card(db, id).await;
 
     // A comment belongs to the point in history it was written against, so only
     // the range that ends there asks for it.
     let here = Comment::find_in_range(
-        &conn,
+        db,
         id,
         viewing_turn(&scope, &turns),
         scope.snapshot_turn().is_some(),
     )
+    .await
     .map_err(|err| failed(id, "reading the comments", err))?;
     // The batch goes whole, so the count is card-wide even where the range is
     // not: a draft left on another one is never simply lost.
-    let pending =
-        Comment::draft_count(&conn, id).map_err(|err| failed(id, "counting the drafts", err))?;
-    drop(conn);
+    let pending = Comment::draft_count(db, id)
+        .await
+        .map_err(|err| failed(id, "counting the drafts", err))?;
 
-    // Everything below shells out to git, so the lock is already back.
     let repo = project.repo();
     let worktree = card.worktree_path.as_ref().map(PathBuf::from);
-    let head = turn::live_head(cache, settings, &repo, worktree.as_deref(), &card, &turns);
+    let head = turn::live_head(
+        cache,
+        settings,
+        &repo,
+        worktree.as_deref(),
+        &card,
+        &turns,
+        turn::Freshness::Fresh,
+    )
+    .await;
     let commits = match worktree.as_deref() {
-        Some(worktree) => git::commits(&repo, &settings.base_ref(id), &head_of(worktree)),
+        Some(worktree) => {
+            git::commits(&repo, &settings.base_ref(id), &head_of(worktree).await).await
+        }
         None => Vec::new(),
     };
 
@@ -250,7 +266,8 @@ fn pane(
             .last()
             .map(|turn| turn.commit_sha.as_str())
             .unwrap_or(&settings.base_ref(id)),
-    );
+    )
+    .await;
 
     let scopes: Vec<_> = Scope::menu(&turns, &commits, head.as_deref(), settled.as_deref())
         .into_iter()
@@ -310,7 +327,7 @@ fn pane(
     // hunk is a re-slice rather than another run of git and delta.
     let range = scope.revisions(settings, id, &turns, &commits, head.as_deref());
     let files = match &range {
-        Some((from, to)) => cache.get(&repo, from, to).map_err(|err| {
+        Some((from, to)) => cache.get(&repo, from, to).await.map_err(|err| {
             error!("card {id}: diffing {from}..{to}: {err:#}");
             Status::InternalServerError
         })?,
@@ -431,13 +448,14 @@ fn pane(
             scope = Some(&scope_key),
             expand = Some(&expand_key),
             comment = view.comment
-        )).to_string(),
+        ))
+        .to_string(),
     })
 }
 
 /// A query that did not answer. Nothing the pane reads is optional, so there is
 /// no half-rendered version of it worth serving.
-fn failed(card_id: i64, what: &str, err: rusqlite::Error) -> Status {
+fn failed(card_id: i64, what: &str, err: sqlx::Error) -> Status {
     error!("card {card_id}: {what}: {err:#}");
     Status::InternalServerError
 }
@@ -460,8 +478,10 @@ fn viewing_turn(scope: &Scope, turns: &[Turn]) -> Option<i64> {
 ///
 /// A detached worktree's `HEAD` is the only place its own commits are reachable
 /// from — the turn refs are a parallel chain and never contain them.
-fn head_of(worktree: &Path) -> String {
-    git::run(worktree, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "HEAD".into())
+async fn head_of(worktree: &Path) -> String {
+    git::run(worktree, &["rev-parse", "HEAD"])
+        .await
+        .unwrap_or_else(|_| "HEAD".into())
 }
 
 /// The expansion a button hands back, or nothing when that side is already open.
@@ -547,7 +567,7 @@ pub struct CommentForm {
 }
 
 #[post("/cards/<id>/comments", data = "<form>")]
-pub fn add_comment(
+pub async fn add_comment(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -556,10 +576,9 @@ pub fn add_comment(
 ) -> Result<Tmpl, Status> {
     let body = form.body.trim();
     if !body.is_empty() {
-        let conn = db.lock();
-        let turns = Turn::for_card(&conn, id);
+        let turns = Turn::for_card(db, id).await;
         Comment::create(
-            &conn,
+            db,
             id,
             viewing_turn(&Scope::parse(Some(&form.scope)), &turns),
             &form.file_path,
@@ -567,6 +586,7 @@ pub fn add_comment(
             Side::parse(&form.side),
             body,
         )
+        .await
         .map_err(|_| Status::InternalServerError)?;
     }
 
@@ -575,11 +595,14 @@ pub fn add_comment(
         expand: form.expand.as_deref(),
         comment: None,
     };
-    Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
+    Ok(Tmpl(
+        "_review.html",
+        pane(&db, &settings, &cache, id, view).await?,
+    ))
 }
 
 #[post("/cards/<id>/comments/<comment_id>/delete", data = "<form>")]
-pub fn delete_comment(
+pub async fn delete_comment(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -587,27 +610,27 @@ pub fn delete_comment(
     comment_id: i64,
     form: Form<ViewForm>,
 ) -> Result<Tmpl, Status> {
-    Comment::delete_draft(&db.lock(), id, comment_id);
+    Comment::delete_draft(db, id, comment_id).await;
     Ok(Tmpl(
         "_review.html",
-        pane(db, settings, cache, id, form.view())?,
+        pane(&db, &settings, &cache, id, form.view()).await?,
     ))
 }
 
 /// Throws away every comment not yet sent, for when a review is reconsidered
 /// wholesale.
 #[post("/cards/<id>/comments/discard", data = "<form>")]
-pub fn discard_comments(
+pub async fn discard_comments(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
     form: Form<ViewForm>,
 ) -> Result<Tmpl, Status> {
-    Comment::delete_drafts(&db.lock(), id);
+    Comment::delete_drafts(db, id).await;
     Ok(Tmpl(
         "_review.html",
-        pane(db, settings, cache, id, form.view())?,
+        pane(&db, &settings, &cache, id, form.view()).await?,
     ))
 }
 
@@ -621,26 +644,29 @@ pub struct ViewedForm {
 
 /// Ticks a file off, or puts it back.
 #[post("/cards/<id>/viewed", data = "<form>")]
-pub fn toggle_viewed(
+pub async fn toggle_viewed(
     db: &State<Db>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
     form: Form<ViewedForm>,
 ) -> Result<Tmpl, Status> {
-    Viewed::toggle(&db.lock(), id, &form.file_path);
+    Viewed::toggle(db, id, &form.file_path).await;
 
     let view = View {
         scope: Some(&form.scope),
         expand: form.expand.as_deref(),
         comment: None,
     };
-    Ok(Tmpl("_review.html", pane(db, settings, cache, id, view)?))
+    Ok(Tmpl(
+        "_review.html",
+        pane(&db, &settings, &cache, id, view).await?,
+    ))
 }
 
 /// Hands every draft comment to the agent as one message and marks them sent.
 #[post("/cards/<id>/review", data = "<form>")]
-pub fn submit_review(
+pub async fn submit_review(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -649,13 +675,11 @@ pub fn submit_review(
     form: Form<ViewForm>,
 ) -> Result<Tmpl, Status> {
     let scope = Scope::parse(Some(&form.scope));
-    let (drafts, turn) = {
-        let conn = db.lock();
-        let turns = Turn::for_card(&conn, id);
-        let drafts =
-            Comment::drafts(&conn, id).map_err(|err| failed(id, "reading the drafts", err))?;
-        (drafts, viewing_turn(&scope, &turns))
-    };
+    let turns = Turn::for_card(db, id).await;
+    let drafts = Comment::drafts(db, id)
+        .await
+        .map_err(|err| failed(id, "reading the drafts", err))?;
+    let turn = viewing_turn(&scope, &turns);
 
     if !drafts.is_empty() {
         let inbox = manager
@@ -666,17 +690,23 @@ pub fn submit_review(
         // NB: a dialog holding the terminal is no longer a reason this fails —
         // the session reads its inbox between tool calls. What is left is the
         // socket itself, so leave the drafts alone to be retried.
+        //
+        // NB: on the blocking pool. The inbox is a unix socket written under a
+        // timeout, which blocks the thread it is on however short it is.
         let message = format_review(&drafts, &scope.label());
-        if let Err(err) = messaging::send(&inbox, &message) {
+        let sent = spawn_blocking(move || messaging::send(&inbox, &message))
+            .await
+            .expect("sending a review panicked");
+        if let Err(err) = sent {
             warn!("card {id}: sending the review failed: {err:#}");
             return Err(Status::Conflict);
         }
 
-        Comment::mark_submitted(&db.lock(), id, turn);
+        Comment::mark_submitted(db, id, turn).await;
     }
 
     Ok(Tmpl(
         "_review.html",
-        pane(db, settings, cache, id, form.view())?,
+        pane(&db, &settings, &cache, id, form.view()).await?,
     ))
 }

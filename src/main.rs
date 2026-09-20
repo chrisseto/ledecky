@@ -44,30 +44,32 @@ async fn main() {
     // NB: reported and exited rather than returned. `rocket::Error` is large
     // enough that returning it from `main` is a lint of its own, and the
     // `Debug` rendering a returned `Err` gets is worse than this anyway.
-    if let Err(err) = rocket().launch().await {
+    if let Err(err) = launch().await {
         eprintln!("ledecky: {err}");
         std::process::exit(1);
     }
 }
 
-fn rocket() -> rocket::Rocket<rocket::Build> {
+async fn launch() -> anyhow::Result<()> {
+    rocket().await?.launch().await?;
+    Ok(())
+}
+
+/// NB: `async`, and so not `#[launch]`, which hands Rocket a synchronous
+/// builder and runs it for us. Opening the database awaits, and so does the
+/// orphan sweep behind it.
+async fn rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>> {
     // Rocket's own figment reads `Rocket.toml` and `ROCKET_*`; layering
     // `LEDECKY_*` on top gives this app's keys an override that reads naturally
     // and does not collide with Rocket's.
     let figment = rocket::Config::figment().merge(Env::prefixed("LEDECKY_").global());
     let rocket = rocket::custom(&figment);
 
-    let settings = Settings::from(&figment)
-        .context("reading settings")
-        .unwrap_or_else(|err| panic!("{err:#}"));
-
+    let settings = Settings::from(&figment).context("reading settings")?;
     let db = db::Db::open(&settings)
-        .context("opening the database")
-        .unwrap_or_else(|err| panic!("{err:#}"));
-
-    let templates = tmpl::Templates::load()
-        .context("loading templates")
-        .unwrap_or_else(|err| panic!("{err:#}"));
+        .await
+        .context("opening the database")?;
+    let templates = tmpl::Templates::load().context("loading templates")?;
 
     // The watcher and the manager need their own handles on these, so they are
     // built here rather than inline in `manage`.
@@ -82,14 +84,16 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     );
 
     // A previous run may have been killed without getting to its shutdown hook.
-    manager.sweep_orphans();
+    manager.sweep_orphans().await;
     let worktrees = watch::Worktrees::new(
+        db.clone(),
+        settings.clone(),
         cache.clone(),
         changes.clone(),
         std::time::Duration::from_millis(settings.watch_debounce),
     );
 
-    rocket
+    Ok(rocket
         .manage(settings)
         .manage(db)
         .manage(templates)
@@ -112,5 +116,5 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
                     config.address, config.port
                 );
             })
-        }))
+        })))
 }

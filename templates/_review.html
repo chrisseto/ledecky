@@ -14,7 +14,7 @@
      data-additions="{{ additions }}" data-deletions="{{ deletions }}"
      data-has-diff="{{ 1 if has_diff else 0 }}"
      hx-get="{{ source }}"
-     hx-trigger="diff from:body, reload from:body"
+     hx-trigger="diff-{{ card.id }} from:body, reload from:body"
      hx-swap="outerMorph" hx-sync="#review:drop">
   <nav class="tree">
     <div class="tree-head">

@@ -13,8 +13,10 @@ use rocket::{get, State};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::config::Settings;
 use crate::db::Db;
 use crate::project::Card;
+use crate::review::{turn, DiffCache};
 use crate::watch::Worktrees;
 
 /// How many changes may pile up behind a slow client before it is told to
@@ -77,6 +79,16 @@ impl Changes {
         self.0.tx.subscribe()
     }
 
+    /// Whether anything is listening.
+    ///
+    /// NB: process-wide rather than per project, and racy by nature — a board
+    /// can connect the instant after this says no. It gates work that is only
+    /// worth doing for a reader, so being wrong costs a restage that nobody
+    /// wanted or one that the connecting client's own resync covers.
+    pub fn listening(&self) -> bool {
+        self.0.tx.receiver_count() > 0
+    }
+
     /// Announces a change on a project. Nobody listening is the normal case.
     pub fn project(&self, project_id: i64, kind: Kind) {
         self.emit(project_id, None, kind);
@@ -84,13 +96,19 @@ impl Changes {
 
     /// Announces a change on a card, resolving which board it belongs to.
     ///
-    /// NB: takes the db lock to find the project. Every caller is a mutation
-    /// that just released it, and these are far rarer than reads.
-    pub fn card(&self, db: &Db, card_id: i64, kind: Kind) {
-        let project_id = Card::find(&db.lock(), card_id).map(|card| card.project_id);
+    /// NB: a query of its own to find the project. Every caller is a mutation
+    /// that has just written, and these are far rarer than reads.
+    pub async fn card(&self, db: &Db, card_id: i64, kind: Kind) {
+        let project_id = Card::find(db, card_id).await.map(|card| card.project_id);
         if let Some(project_id) = project_id {
             self.emit(project_id, Some(card_id), kind);
         }
+    }
+
+    /// The same, for a caller that already knows the board — the watcher, which
+    /// has both and no reason to go back to the database for one of them.
+    pub fn card_in(&self, project_id: i64, card_id: i64, kind: Kind) {
+        self.emit(project_id, Some(card_id), kind);
     }
 
     fn emit(&self, project_id: i64, card_id: Option<i64>, kind: Kind) {
@@ -119,6 +137,8 @@ impl Changes {
 #[get("/events?<project>")]
 pub fn stream(
     db: &State<Db>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
     changes: &State<Changes>,
     worktrees: &State<Worktrees>,
     project: i64,
@@ -129,32 +149,55 @@ pub fn stream(
     // watching. Doing it on connect rather than at worktree creation is what
     // carries the watches across a restart.
     //
-    // NB: off this thread. Establishing a watch walks the checkout, and this is
-    // a sync handler — so doing it inline would hold a Rocket worker and keep
-    // the stream from opening for as long as it took. The walk stops at every
-    // directory git ignores now, so that is the repo's size rather than its
-    // build output's, but it is still a walk per live card. Nothing below waits
-    // on it.
+    // NB: off to the side. Establishing a watch walks the checkout, so doing it
+    // inline would keep the stream from opening for as long as it took. The
+    // walk stops at every directory git ignores now, so that is the repo's size
+    // rather than its build output's, but it is still a walk per live card.
+    // Nothing below waits on it.
     let db = db.inner().clone();
+    let settings = settings.inner().clone();
+    let cache = cache.inner().clone();
     let worktrees = worktrees.inner().clone();
     let announce = changes.inner().clone();
-    std::thread::spawn(move || {
-        // Bound first: a `for` loop holds its head expression's temporaries for
-        // the whole loop, which would sit on the db lock for the walk.
-        let live = Card::live_worktrees(&db.lock(), project);
-        let started: Vec<i64> = live
-            .into_iter()
-            .filter(|(card_id, path)| worktrees.ensure(*card_id, project, Path::new(path)))
-            .map(|(card_id, _)| card_id)
-            .collect();
+    rocket::tokio::spawn(async move {
+        let live = Card::live_worktrees(&db, project).await;
 
-        // A watch that has only just been established missed anything written
-        // while it was being set up, so say the diff moved once rather than
-        // leave a reader on a worktree that has already changed. Nothing is
-        // said when everything was already covered, which is every connect
-        // after the first.
-        for card_id in started {
-            announce.card(&db, card_id, Kind::Diff);
+        // Two ways a card can arrive here needing staging. A watch that has
+        // only just been established missed anything written while it was being
+        // set up. And a card with nothing memoised was either never staged —
+        // the cold start, since watches are established on connect — or had its
+        // memo dropped by the watcher, which forgets rather than stages while
+        // nobody is listening. `ensure` cannot report the second: a watch
+        // outlives the connection that made it, so reconnecting to a worktree
+        // that went quiet while the board was closed says "already covered"
+        // over a head that is gone, and the board would sit on its cards' last
+        // turns until something wrote again.
+        let mut stale: Vec<i64> = Vec::new();
+        for (card_id, path) in live {
+            let fresh = worktrees.ensure(card_id, project, Path::new(&path)).await;
+
+            if fresh || cache.known_head(card_id).is_none() {
+                stale.push(card_id);
+            }
+        }
+
+        // Staged here for the same reason the watcher does it: a reader told
+        // the diff moved has no way to answer but to stage it.
+        for card_id in &stale {
+            turn::restage(&db, &cache, &settings, *card_id).await;
+        }
+
+        // NB: once, not once per card. Every fragment listening for a project's
+        // `diff` refetches on each of these, and a board coming up after a
+        // restart with five live cards used to fire five.
+        //
+        // NB: and so it names no card, which means an already-open review pane
+        // — listening for `diff-<id>` — does not hear it. Deliberate: that
+        // pane's own `reload` resync renders it `Fresh`, staging the worktree
+        // itself, so it is current either way. Naming a card here to reach it
+        // would be the fan-out the line above exists to avoid.
+        if !stale.is_empty() {
+            announce.project(project, Kind::Diff);
         }
     });
 
@@ -171,6 +214,18 @@ pub fn stream(
             match rx.recv().await {
                 Ok(change) if change.project_id == project => {
                     let data = change.card_id.map(|id| id.to_string()).unwrap_or_default();
+
+                    // Two names for one change. The board wants every card's,
+                    // so it listens for the kind; a drawer and a review pane
+                    // are open on one card and want only its, so they listen
+                    // for the kind and the id. Without the second, four agents
+                    // running means an open pane re-runs its diff four times
+                    // for every write, three of them about somebody else.
+                    if let Some(card_id) = change.card_id {
+                        yield Event::data(data.clone())
+                            .event(format!("{}-{card_id}", change.kind.as_str()));
+                    }
+
                     yield Event::data(data)
                         .event(change.kind.as_str())
                         .id(change.seq.to_string());

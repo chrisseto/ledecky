@@ -86,28 +86,7 @@
        hx-get="/projects/{{ project.id }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("x") }}</a>
   </div>
 
-  {# Whether there is a terminal to show turns on the agent being up, which
-     happens on its own clock — a card opened mid-start would otherwise sit on
-     "No agent running" until it was reloaded. The same event that moves the
-     chip redraws this. #}
-  <section class="pane pane-agent"
-           hx-get="/cards/{{ card.id }}" hx-select=".pane-agent"
-           hx-trigger="state from:body, reload from:body"
-           hx-swap="outerMorph" hx-sync="replace">
-    {% if live %}
-      {# `hx-morph-skip` because xterm builds this subtree on the client and the
-         server knows nothing about it — a morph would reconcile it away. The id
-         names the card, so opening a different one replaces the element and its
-         socket outright rather than reusing this one. #}
-      <x-terminal class="terminal" id="terminal-{{ card.id }}" hx-morph-skip
-                  data-terminal="/cards/{{ card.id }}/terminal"
-                  data-resize-url="/cards/{{ card.id }}/resize"></x-terminal>
-    {% else %}
-      <p class="empty">
-        No agent running. Move this card to <strong>In Progress</strong>, or start one here.
-      </p>
-    {% endif %}
-  </section>
+  {% include "_pane_agent.html" %}
 
   <section class="pane pane-review">{% include "_review.html" %}</section>
 </x-drawer-card>

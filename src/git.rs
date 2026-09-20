@@ -1,19 +1,21 @@
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{bail, Result};
+use tokio::io::AsyncWriteExt as _;
+use tokio::process::Command;
 
 use crate::config::Settings;
 
 /// Runs a git command in `repo` and returns trimmed stdout.
-pub fn run(repo: &Path, args: &[&str]) -> Result<String> {
+pub async fn run(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()?;
+        .output()
+        .await?;
 
     if !out.status.success() {
         bail!(
@@ -28,12 +30,16 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<String> {
 /// Which of `paths` — absolute, files or directories — the worktree's own rules
 /// ignore.
 ///
+/// What a build writes is not work anyone is reviewing, and it arrives in the
+/// thousands — so a burst that is entirely `target/` or `node_modules/` should
+/// not cost a restage, let alone one per reader.
+///
 /// NB: not `run`. `check-ignore` exits 1 for "nothing matched", which is an
 /// answer rather than a failure; anything else truncates the reply where git
 /// stopped, and is read here as "none of them". Both err towards announcing, as
 /// does its consulting the index, which keeps tracked work out of the answer
 /// however the rules read.
-pub fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
+pub async fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     if paths.is_empty() {
         return HashSet::new();
     }
@@ -58,12 +64,6 @@ pub fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
         return HashSet::new();
     };
 
-    // NB: fed from a thread of its own. check-ignore echoes the ignored paths
-    // back as it reads, so writing a batch from this thread deadlocks once both
-    // pipes are full — measured at 1024 paths of ~160 bytes against the usual
-    // 64 KiB, and a burst carries twice that. Asking once up front instead is
-    // not open: the rules change under a live watch, and the paths are whatever
-    // the burst touched.
     let feed: Vec<u8> = paths
         .iter()
         .flat_map(|path| {
@@ -72,12 +72,22 @@ pub fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
             line
         })
         .collect();
-    let writer = std::thread::spawn(move || stdin.write_all(&feed));
 
-    let Ok(out) = child.wait_with_output() else {
+    // NB: written and read at the same time. check-ignore echoes the ignored
+    // paths back as it reads, so feeding a batch in before collecting the answer
+    // deadlocks once both pipes are full — measured at 1024 paths of ~160 bytes
+    // against the usual 64 KiB, and a burst carries twice that. Asking once up
+    // front instead is not open: the rules change under a live watch, and the
+    // paths are whatever the burst touched.
+    let write = async move {
+        let _ = stdin.write_all(&feed).await;
+        let _ = stdin.shutdown().await;
+    };
+
+    let (_, collected) = tokio::join!(write, child.wait_with_output());
+    let Ok(out) = collected else {
         return HashSet::new();
     };
-    let _ = writer.join();
 
     if !matches!(out.status.code(), Some(0 | 1)) {
         warn!(
@@ -105,22 +115,23 @@ pub fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
 /// not cost a restage, let alone one per reader.
 ///
 /// Nothing at all is not a build, and answering "yes" would swallow the burst.
-pub fn all_ignored(worktree: &Path, paths: &[PathBuf]) -> bool {
+pub async fn all_ignored(worktree: &Path, paths: &[PathBuf]) -> bool {
     if paths.is_empty() {
         return false;
     }
 
-    let ignored = ignored(worktree, paths);
+    let ignored = ignored(worktree, paths).await;
     paths.iter().all(|path| ignored.contains(path))
 }
 
 /// Local branches, with the checked-out one first so it can be the form default.
-pub fn branches(repo: &Path) -> Vec<String> {
-    let head = head_branch(repo);
+pub async fn branches(repo: &Path) -> Vec<String> {
+    let head = head_branch(repo).await;
     let mut branches: Vec<String> = run(
         repo,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
     )
+    .await
     .map(|s| s.lines().map(str::to_owned).collect())
     .unwrap_or_default();
 
@@ -131,8 +142,9 @@ pub fn branches(repo: &Path) -> Vec<String> {
     branches
 }
 
-pub fn head_branch(repo: &Path) -> Option<String> {
+pub async fn head_branch(repo: &Path) -> Option<String> {
     run(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .await
         .ok()
         .filter(|s| !s.is_empty())
 }
@@ -140,7 +152,7 @@ pub fn head_branch(repo: &Path) -> Option<String> {
 /// Creates a detached worktree at `path` based on `base_branch`, and records the
 /// starting commit as `refs/{APP_SLUG}/<card>/base`, which is where the card's
 /// diffs are measured from until [`reconcile_base`] moves it.
-pub fn create_worktree(
+pub async fn create_worktree(
     settings: &Settings,
     repo: &Path,
     path: &Path,
@@ -161,7 +173,8 @@ pub fn create_worktree(
             "--verify",
             &format!("{base_branch}^{{commit}}"),
         ],
-    )?;
+    )
+    .await?;
 
     // NB: the ref first. Everything that reads a card's diff measures from it,
     // and the worktree appearing is what tells the rest of the app the card has
@@ -170,7 +183,8 @@ pub fn create_worktree(
     run(
         repo,
         &["update-ref", &settings.base_ref(card_id), &base_sha],
-    )?;
+    )
+    .await?;
     run(
         repo,
         &[
@@ -180,23 +194,25 @@ pub fn create_worktree(
             &path.to_string_lossy(),
             &base_sha,
         ],
-    )?;
+    )
+    .await?;
 
     Ok(base_sha)
 }
 
 /// Tears down a card's worktree. Best-effort: a missing worktree is not an error.
-pub fn remove_worktree(repo: &Path, path: &Path) {
+pub async fn remove_worktree(repo: &Path, path: &Path) {
     let _ = run(
         repo,
         &["worktree", "remove", "--force", &path.to_string_lossy()],
-    );
+    )
+    .await;
     let _ = std::fs::remove_dir_all(path);
-    let _ = run(repo, &["worktree", "prune"]);
+    let _ = run(repo, &["worktree", "prune"]).await;
 }
 
 /// Deletes every ref under `prefix`. Best-effort, like [`remove_worktree`].
-pub fn purge_refs(repo: &Path, prefix: &str) {
+pub async fn purge_refs(repo: &Path, prefix: &str) {
     let Ok(listed) = run(
         repo,
         &[
@@ -204,23 +220,25 @@ pub fn purge_refs(repo: &Path, prefix: &str) {
             "--format=%(refname)",
             &format!("{prefix}**"),
         ],
-    ) else {
+    )
+    .await
+    else {
         return;
     };
 
     for name in listed.lines() {
-        let _ = run(repo, &["update-ref", "-d", name]);
+        let _ = run(repo, &["update-ref", "-d", name]).await;
     }
 }
 
-fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+async fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
 
-    let out = cmd.output()?;
+    let out = cmd.output().await?;
     if !out.status.success() {
         bail!(
             "git {} failed: {}",
@@ -239,7 +257,7 @@ fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String> 
 /// status directly. A rev that does not resolve exits 128 and reads as "no" too,
 /// which is the right answer for the only caller: a guard that refuses to move
 /// anything it cannot prove.
-fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -247,6 +265,7 @@ fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
         // `output` rather than `status` so git's complaint about a bad rev is
         // captured instead of landing in the server's stderr among pty traffic.
         .output()
+        .await
         .is_ok_and(|out| out.status.success())
 }
 
@@ -265,7 +284,7 @@ fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
 /// Returns the new value when it moved, and `None` otherwise — which is both the
 /// ordinary case and what every failure reads as. Best-effort on purpose:
 /// callers poll this, and an unresolvable `base_branch` still has to render.
-pub fn reconcile_base(
+pub async fn reconcile_base(
     repo: &Path,
     worktree: &Path,
     base_ref: &str,
@@ -275,26 +294,32 @@ pub fn reconcile_base(
         repo,
         &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
     )
+    .await
     .ok()?;
 
     // NB: in the worktree, not the repo. `HEAD` is per-worktree, and its own
     // commits are reachable from nowhere else; the repo's is whatever happens to
     // be checked out there.
-    let head = run(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).ok()?;
+    let head = run(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .await
+        .ok()?;
 
     // Back in the repo, where the base branch lives. The object database and
     // `refs/heads` are shared, so this resolves either way.
     let candidate = run(repo, &["merge-base", base_branch, &head])
+        .await
         .ok()
         .filter(|sha| !sha.is_empty())?;
 
-    if candidate == current || !is_ancestor(repo, &current, &candidate) {
+    if candidate == current || !is_ancestor(repo, &current, &candidate).await {
         return None;
     }
 
     // The third argument is the expected old value, so two polls racing cannot
     // interleave into a lost update.
-    run(repo, &["update-ref", base_ref, &candidate, &current]).ok()?;
+    run(repo, &["update-ref", base_ref, &candidate, &current])
+        .await
+        .ok()?;
     Some(candidate)
 }
 
@@ -306,12 +331,12 @@ pub fn reconcile_base(
 /// `index.lock`, and leave our staging behind for its next `git status` to
 /// report. An index kept *inside* the tree would additionally be swept up by
 /// its own `add -A`.
-fn stage_tree(worktree: &Path, index: &Path) -> Result<String> {
+async fn stage_tree(worktree: &Path, index: &Path) -> Result<String> {
     std::fs::create_dir_all(index.parent().unwrap())?;
 
     let index_env: &[(&str, &str)] = &[("GIT_INDEX_FILE", &index.to_string_lossy())];
-    run_env(worktree, &["add", "-A"], index_env)?;
-    run_env(worktree, &["write-tree"], index_env)
+    run_env(worktree, &["add", "-A"], index_env).await?;
+    run_env(worktree, &["write-tree"], index_env).await
 }
 
 /// The worktree exactly as it stands, as a tree object the diff can use as a
@@ -324,7 +349,7 @@ fn stage_tree(worktree: &Path, index: &Path) -> Result<String> {
 ///
 /// `refs/{APP_SLUG}/<card>/working` holds the result so `gc` cannot prune it
 /// out from under a reader mid-diff.
-pub fn working_tree(
+pub async fn working_tree(
     settings: &Settings,
     repo: &Path,
     worktree: &Path,
@@ -334,9 +359,9 @@ pub fn working_tree(
     // snapshot's. It is rewritten on every poll, and git's stat cache is the
     // only thing keeping `add -A` off a full re-hash of the tree each time.
     let index = settings.card_dir(card_id).join("working.index");
-    let tree = stage_tree(worktree, &index)?;
+    let tree = stage_tree(worktree, &index).await?;
 
-    run(repo, &["update-ref", &settings.working_ref(card_id), &tree])?;
+    run(repo, &["update-ref", &settings.working_ref(card_id), &tree]).await?;
     Ok(tree)
 }
 
@@ -344,8 +369,10 @@ pub fn working_tree(
 ///
 /// NB: `working_tree` hands back a tree, so anything asking "has the worktree
 /// moved since?" has to compare trees — a commit id never equals one.
-pub fn tree_of(repo: &Path, rev: &str) -> Option<String> {
-    run(repo, &["rev-parse", &format!("{rev}^{{tree}}")]).ok()
+pub async fn tree_of(repo: &Path, rev: &str) -> Option<String> {
+    run(repo, &["rev-parse", &format!("{rev}^{{tree}}")])
+        .await
+        .ok()
 }
 
 /// One of the agent's own commits, for the review pane's anchor list.
@@ -365,7 +392,7 @@ const MAX_COMMITS: usize = 50;
 /// The agent's own commits on top of the card's base, newest first.
 ///
 /// Best-effort: a worktree that has gone away simply has no commits to offer.
-pub fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
+pub async fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
     let range = format!("{base}..{head}");
     let Ok(out) = run(
         repo,
@@ -375,7 +402,9 @@ pub fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
             "--format=%H%x00%P%x00%ct%x00%s",
             &range,
         ],
-    ) else {
+    )
+    .await
+    else {
         return Vec::new();
     };
 
@@ -404,7 +433,7 @@ pub fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
 ///
 /// Returns `None` when the tree is identical to `parent`, which is how chat-only
 /// turns avoid piling up empty snapshots.
-pub fn snapshot_turn(
+pub async fn snapshot_turn(
     settings: &Settings,
     repo: &Path,
     worktree: &Path,
@@ -414,10 +443,12 @@ pub fn snapshot_turn(
 ) -> Result<Option<String>> {
     let index = settings.card_dir(card_id).join("snapshot.index");
     let _ = std::fs::remove_file(&index);
-    let tree = stage_tree(worktree, &index)?;
+    let tree = stage_tree(worktree, &index).await?;
     let _ = std::fs::remove_file(&index);
 
-    let parent_tree = run(worktree, &["rev-parse", &format!("{parent}^{{tree}}")]).ok();
+    let parent_tree = run(worktree, &["rev-parse", &format!("{parent}^{{tree}}")])
+        .await
+        .ok();
     if parent_tree.as_deref() == Some(tree.as_str()) {
         return Ok(None);
     }
@@ -439,9 +470,10 @@ pub fn snapshot_turn(
             &format!("turn {n}"),
         ],
         identity,
-    )?;
+    )
+    .await?;
 
-    run(repo, &["update-ref", &settings.turn_ref(card_id, n), &sha])?;
+    run(repo, &["update-ref", &settings.turn_ref(card_id, n), &sha]).await?;
     Ok(Some(sha))
 }
 
@@ -450,8 +482,10 @@ pub fn snapshot_turn(
 /// `--numstat` is one cheap git call with no highlighting behind it, which is
 /// what makes it usable for every card on the board rather than only the one
 /// being reviewed.
-pub fn diff_stat(repo: &Path, from: &str, to: &str) -> Option<(u32, u32)> {
-    let out = run(repo, &["diff", "--numstat", "--no-ext-diff", from, to]).ok()?;
+pub async fn diff_stat(repo: &Path, from: &str, to: &str) -> Option<(u32, u32)> {
+    let out = run(repo, &["diff", "--numstat", "--no-ext-diff", from, to])
+        .await
+        .ok()?;
 
     Some(out.lines().fold((0, 0), |(added, removed), line| {
         let mut fields = line.split_whitespace();
@@ -469,18 +503,22 @@ mod tests {
 
     /// A real repository with one commit, and settings pointed somewhere its
     /// scratch index can live.
-    fn scratch(name: &str) -> (Settings, PathBuf) {
+    async fn scratch(name: &str) -> (Settings, PathBuf) {
         let root = std::env::temp_dir().join(format!("ledecky-git-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q", "--initial-branch=main"]).unwrap();
-        run(&repo, &["config", "user.email", "t@example.com"]).unwrap();
-        run(&repo, &["config", "user.name", "t"]).unwrap();
+        run(&repo, &["init", "-q", "--initial-branch=main"])
+            .await
+            .unwrap();
+        run(&repo, &["config", "user.email", "t@example.com"])
+            .await
+            .unwrap();
+        run(&repo, &["config", "user.name", "t"]).await.unwrap();
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
-        run(&repo, &["add", "-A"]).unwrap();
-        run(&repo, &["commit", "-qm", "first"]).unwrap();
+        run(&repo, &["add", "-A"]).await.unwrap();
+        run(&repo, &["commit", "-qm", "first"]).await.unwrap();
 
         let settings = Settings::from(
             &rocket::figment::Figment::new()
@@ -497,130 +535,145 @@ mod tests {
 
     /// What a build writes must not read as work to review, and one real edit
     /// among it must not be lost either.
-    #[test]
-    fn a_burst_counts_as_a_build_only_when_every_path_is_ignored() {
-        let (_settings, repo) = scratch("ignored");
+    #[tokio::test]
+    async fn a_burst_counts_as_a_build_only_when_every_path_is_ignored() {
+        let (_settings, repo) = scratch("ignored").await;
         std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
-        run(&repo, &["add", "-A"]).unwrap();
-        run(&repo, &["commit", "-qm", "ignore build output"]).unwrap();
+        run(&repo, &["add", "-A"]).await.unwrap();
+        run(&repo, &["commit", "-qm", "ignore build output"])
+            .await
+            .unwrap();
 
         let artefact = repo.join("target/debug/out.o");
         std::fs::create_dir_all(artefact.parent().unwrap()).unwrap();
         std::fs::write(&artefact, "").unwrap();
 
-        assert!(all_ignored(&repo, std::slice::from_ref(&artefact)));
+        assert!(ignored(&repo, std::slice::from_ref(&artefact))
+            .await
+            .contains(&artefact));
 
         // One tracked file in the burst is enough to make it real.
-        assert!(!all_ignored(&repo, &[artefact, repo.join("a.txt")]));
+        assert!(!all_ignored(&repo, &[artefact, repo.join("a.txt")]).await);
 
         // Nothing at all is not a build; saying so would swallow the burst.
-        assert!(!all_ignored(&repo, &[]));
+        assert!(!all_ignored(&repo, &[]).await);
     }
 
     /// What keeps a walk from pruning a directory the diff is showing: git
     /// reads tracked work under an ignored path as work, so nothing built on
     /// this can drop it.
-    #[test]
-    fn an_ignored_directory_holding_tracked_work_is_not_ignored() {
-        let (_settings, repo) = scratch("tracked-under-ignored");
+    #[tokio::test]
+    async fn an_ignored_directory_holding_tracked_work_is_not_ignored() {
+        let (_settings, repo) = scratch("tracked-under-ignored").await;
         std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
         std::fs::create_dir_all(repo.join("target")).unwrap();
         std::fs::write(repo.join("target/kept.txt"), "tracked anyway\n").unwrap();
-        run(&repo, &["add", "-A", "-f"]).unwrap();
+        run(&repo, &["add", "-A", "-f"]).await.unwrap();
         run(
             &repo,
             &["commit", "-qm", "a tracked file under an ignored path"],
         )
+        .await
         .unwrap();
 
-        assert!(ignored(&repo, &[repo.join("target")]).is_empty());
-        assert!(!all_ignored(&repo, &[repo.join("target/kept.txt")]));
+        assert!(ignored(&repo, &[repo.join("target")]).await.is_empty());
+        assert!(!all_ignored(&repo, &[repo.join("target/kept.txt")]).await);
     }
 
-    #[test]
-    fn the_ignored_subset_comes_back_and_the_rest_does_not() {
-        let (_settings, repo) = scratch("subset");
+    #[tokio::test]
+    async fn the_ignored_subset_comes_back_and_the_rest_does_not() {
+        let (_settings, repo) = scratch("subset").await;
         std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
-        run(&repo, &["add", "-A"]).unwrap();
-        run(&repo, &["commit", "-qm", "ignore build output"]).unwrap();
+        run(&repo, &["add", "-A"]).await.unwrap();
+        run(&repo, &["commit", "-qm", "ignore build output"])
+            .await
+            .unwrap();
 
         let artefact = repo.join("target/debug/out.o");
         let paths = [artefact.clone(), repo.join("a.txt")];
-        assert_eq!(ignored(&repo, &paths), HashSet::from([artefact.clone()]));
-        assert!(ignored(&repo, &[]).is_empty());
+        assert_eq!(
+            ignored(&repo, &paths).await,
+            HashSet::from([artefact.clone()])
+        );
+        assert!(ignored(&repo, &[]).await.is_empty());
 
         // A path outside the repository stops check-ignore where it stands.
         // Whatever is left unanswered has to read as work rather than as build
         // output, or a burst carrying one would be swallowed whole.
-        assert!(!all_ignored(
-            &repo,
-            &[PathBuf::from("/etc/hosts"), artefact]
-        ));
+        assert!(!all_ignored(&repo, &[PathBuf::from("/etc/hosts"), artefact]).await);
     }
 
     /// The premise the diff cache and every `304` rest on: an unchanged
     /// worktree has to produce the same object id every time.
-    #[test]
-    fn staging_an_unchanged_worktree_is_the_same_tree_twice() {
-        let (settings, repo) = scratch("stable");
+    #[tokio::test]
+    async fn staging_an_unchanged_worktree_is_the_same_tree_twice() {
+        let (settings, repo) = scratch("stable").await;
 
-        let once = working_tree(&settings, &repo, &repo, 1).unwrap();
-        let twice = working_tree(&settings, &repo, &repo, 1).unwrap();
+        let once = working_tree(&settings, &repo, &repo, 1).await.unwrap();
+        let twice = working_tree(&settings, &repo, &repo, 1).await.unwrap();
         assert_eq!(once, twice);
 
         // And the ref is reachable, so `gc` cannot take it mid-read.
         assert_eq!(
-            run(&repo, &["rev-parse", &settings.working_ref(1)]).unwrap(),
+            run(&repo, &["rev-parse", &settings.working_ref(1)])
+                .await
+                .unwrap(),
             once
         );
     }
 
-    #[test]
-    fn staging_picks_up_work_the_agent_has_not_committed() {
-        let (settings, repo) = scratch("dirty");
+    #[tokio::test]
+    async fn staging_picks_up_work_the_agent_has_not_committed() {
+        let (settings, repo) = scratch("dirty").await;
 
-        let clean = working_tree(&settings, &repo, &repo, 1).unwrap();
+        let clean = working_tree(&settings, &repo, &repo, 1).await.unwrap();
 
         // Both an edit and a wholly new file, which `git diff HEAD` alone would
         // miss — this is what the review pane could not show before.
         std::fs::write(repo.join("a.txt"), "two\n").unwrap();
         std::fs::write(repo.join("b.txt"), "new\n").unwrap();
-        let dirty = working_tree(&settings, &repo, &repo, 1).unwrap();
+        let dirty = working_tree(&settings, &repo, &repo, 1).await.unwrap();
 
         assert_ne!(clean, dirty);
 
-        let (added, removed) = diff_stat(&repo, "HEAD", &dirty).unwrap();
+        let (added, removed) = diff_stat(&repo, "HEAD", &dirty).await.unwrap();
         assert_eq!((added, removed), (2, 1));
     }
 
-    #[test]
-    fn the_scratch_index_stays_out_of_the_worktree() {
-        let (settings, repo) = scratch("index");
+    #[tokio::test]
+    async fn the_scratch_index_stays_out_of_the_worktree() {
+        let (settings, repo) = scratch("index").await;
 
-        let tree = working_tree(&settings, &repo, &repo, 1).unwrap();
+        let tree = working_tree(&settings, &repo, &repo, 1).await.unwrap();
 
         // An index kept inside the tree would be staged by its own `add -A`.
-        let listed = run(&repo, &["ls-tree", "-r", "--name-only", &tree]).unwrap();
+        let listed = run(&repo, &["ls-tree", "-r", "--name-only", &tree])
+            .await
+            .unwrap();
         assert_eq!(listed, "a.txt");
         // And the agent's own index is untouched: nothing is staged.
         assert_eq!(
-            run(&repo, &["diff", "--cached", "--name-only"]).unwrap(),
+            run(&repo, &["diff", "--cached", "--name-only"])
+                .await
+                .unwrap(),
             ""
         );
     }
 
-    #[test]
-    fn commits_are_the_agents_own_work_newest_first() {
-        let (_, repo) = scratch("commits");
-        let base = run(&repo, &["rev-parse", "HEAD"]).unwrap();
+    #[tokio::test]
+    async fn commits_are_the_agents_own_work_newest_first() {
+        let (_, repo) = scratch("commits").await;
+        let base = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
 
         for n in 1..=2 {
             std::fs::write(repo.join("a.txt"), format!("{n}\n")).unwrap();
-            run(&repo, &["add", "-A"]).unwrap();
-            run(&repo, &["commit", "-qm", &format!("work {n}")]).unwrap();
+            run(&repo, &["add", "-A"]).await.unwrap();
+            run(&repo, &["commit", "-qm", &format!("work {n}")])
+                .await
+                .unwrap();
         }
 
-        let listed = commits(&repo, &base, "HEAD");
+        let listed = commits(&repo, &base, "HEAD").await;
         let subjects: Vec<_> = listed.iter().map(|c| c.subject.as_str()).collect();
         assert_eq!(subjects, ["work 2", "work 1"]);
 
@@ -630,103 +683,116 @@ mod tests {
 
         // Nothing past the base, and a range that cannot resolve is empty
         // rather than an error.
-        assert!(commits(&repo, "HEAD", "HEAD").is_empty());
-        assert!(commits(&repo, &base, "no-such-ref").is_empty());
+        assert!(commits(&repo, "HEAD", "HEAD").await.is_empty());
+        assert!(commits(&repo, &base, "no-such-ref").await.is_empty());
     }
 
     /// Commits `body` to `file` in whichever tree `at` is, and returns the sha.
-    fn commit(at: &Path, file: &str, body: &str, subject: &str) -> String {
+    async fn commit(at: &Path, file: &str, body: &str, subject: &str) -> String {
         std::fs::write(at.join(file), body).unwrap();
-        run(at, &["add", "-A"]).unwrap();
-        run(at, &["commit", "-qm", subject]).unwrap();
-        run(at, &["rev-parse", "HEAD"]).unwrap()
+        run(at, &["add", "-A"]).await.unwrap();
+        run(at, &["commit", "-qm", subject]).await.unwrap();
+        run(at, &["rev-parse", "HEAD"]).await.unwrap()
     }
 
-    /// The whole point of [`is_ancestor`] existing rather than `run(...).is_ok()`.
-    #[test]
-    fn asking_whether_one_commit_is_behind_another_is_an_answer_not_an_error() {
-        let (_settings, repo) = scratch("ancestor");
-        let first = run(&repo, &["rev-parse", "HEAD"]).unwrap();
-        let second = commit(&repo, "a.txt", "two\n", "second");
+    /// The whole point of [`is_ancestor`] existing rather than `run(...).await.is_ok()`.
+    #[tokio::test]
+    async fn asking_whether_one_commit_is_behind_another_is_an_answer_not_an_error() {
+        let (_settings, repo) = scratch("ancestor").await;
+        let first = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let second = commit(&repo, "a.txt", "two\n", "second").await;
 
-        assert!(is_ancestor(&repo, &first, &second));
-        assert!(!is_ancestor(&repo, &second, &first));
+        assert!(is_ancestor(&repo, &first, &second).await);
+        assert!(!is_ancestor(&repo, &second, &first).await);
         // A rev that does not resolve is "no", not a panic and not a hang.
-        assert!(!is_ancestor(&repo, "no-such-ref", &first));
+        assert!(!is_ancestor(&repo, "no-such-ref", &first).await);
     }
 
-    #[test]
-    fn a_rebase_moves_the_base_up_to_where_the_worktree_now_branches() {
-        let (settings, repo) = scratch("rebase");
+    #[tokio::test]
+    async fn a_rebase_moves_the_base_up_to_where_the_worktree_now_branches() {
+        let (settings, repo) = scratch("rebase").await;
         let worktree = settings.worktree_path(1);
 
-        let started = create_worktree(&settings, &repo, &worktree, "main", 1).unwrap();
-        commit(&worktree, "agent.txt", "work\n", "agent work");
-        let upstream = commit(&repo, "upstream.txt", "theirs\n", "upstream work");
+        let started = create_worktree(&settings, &repo, &worktree, "main", 1)
+            .await
+            .unwrap();
+        commit(&worktree, "agent.txt", "work\n", "agent work").await;
+        let upstream = commit(&repo, "upstream.txt", "theirs\n", "upstream work").await;
 
         // Drift on its own is not a rebase: the worktree is detached and does
         // not contain the upstream commit, so there is nothing to correct.
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
             None
         );
         assert_eq!(
-            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            run(&repo, &["rev-parse", &settings.base_ref(1)])
+                .await
+                .unwrap(),
             started
         );
 
-        run(&worktree, &["rebase", "main"]).unwrap();
+        run(&worktree, &["rebase", "main"]).await.unwrap();
 
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
             Some(upstream.clone())
         );
         assert_eq!(
-            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            run(&repo, &["rev-parse", &settings.base_ref(1)])
+                .await
+                .unwrap(),
             upstream
         );
 
         // Idempotent: nothing has moved since, so there is nothing to write.
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
             None
         );
 
         // What the whole change is for — the upstream commit is out of the range.
-        let head = run(&worktree, &["rev-parse", "HEAD"]).unwrap();
-        let listed = commits(&repo, &settings.base_ref(1), &head);
+        let head = run(&worktree, &["rev-parse", "HEAD"]).await.unwrap();
+        let listed = commits(&repo, &settings.base_ref(1), &head).await;
         let subjects: Vec<_> = listed.iter().map(|c| c.subject.as_str()).collect();
         assert_eq!(subjects, ["agent work"]);
     }
 
     /// `--fork-point` would not cover this; plain `merge-base` does.
-    #[test]
-    fn an_agent_that_merges_instead_of_rebasing_also_moves_the_base() {
-        let (settings, repo) = scratch("merged");
+    #[tokio::test]
+    async fn an_agent_that_merges_instead_of_rebasing_also_moves_the_base() {
+        let (settings, repo) = scratch("merged").await;
         let worktree = settings.worktree_path(1);
 
-        create_worktree(&settings, &repo, &worktree, "main", 1).unwrap();
-        commit(&worktree, "agent.txt", "work\n", "agent work");
-        let upstream = commit(&repo, "upstream.txt", "theirs\n", "upstream work");
+        create_worktree(&settings, &repo, &worktree, "main", 1)
+            .await
+            .unwrap();
+        commit(&worktree, "agent.txt", "work\n", "agent work").await;
+        let upstream = commit(&repo, "upstream.txt", "theirs\n", "upstream work").await;
 
-        run(&worktree, &["merge", "main", "-m", "merge main"]).unwrap();
+        run(&worktree, &["merge", "main", "-m", "merge main"])
+            .await
+            .unwrap();
 
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main"),
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
             Some(upstream)
         );
     }
 
-    #[test]
-    fn a_base_branch_that_was_rewound_does_not_drag_the_base_back() {
-        let (settings, repo) = scratch("rewound");
-        let first = run(&repo, &["rev-parse", "HEAD"]).unwrap();
-        commit(&repo, "a.txt", "two\n", "second");
+    #[tokio::test]
+    async fn a_base_branch_that_was_rewound_does_not_drag_the_base_back() {
+        let (settings, repo) = scratch("rewound").await;
+        let first = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        commit(&repo, "a.txt", "two\n", "second").await;
 
-        let started =
-            create_worktree(&settings, &repo, &worktree_of(&settings), "main", 1).unwrap();
-        commit(&worktree_of(&settings), "agent.txt", "work\n", "agent work");
-        run(&repo, &["reset", "--hard", "-q", &first]).unwrap();
+        let started = create_worktree(&settings, &repo, &worktree_of(&settings), "main", 1)
+            .await
+            .unwrap();
+        commit(&worktree_of(&settings), "agent.txt", "work\n", "agent work").await;
+        run(&repo, &["reset", "--hard", "-q", &first])
+            .await
+            .unwrap();
 
         assert_eq!(
             reconcile_base(
@@ -734,24 +800,28 @@ mod tests {
                 &worktree_of(&settings),
                 &settings.base_ref(1),
                 "main"
-            ),
+            )
+            .await,
             None
         );
         assert_eq!(
-            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            run(&repo, &["rev-parse", &settings.base_ref(1)])
+                .await
+                .unwrap(),
             started
         );
     }
 
-    #[test]
-    fn a_card_whose_base_branch_has_gone_keeps_the_base_it_started_from() {
-        let (settings, repo) = scratch("branch-gone");
-        run(&repo, &["branch", "feature"]).unwrap();
+    #[tokio::test]
+    async fn a_card_whose_base_branch_has_gone_keeps_the_base_it_started_from() {
+        let (settings, repo) = scratch("branch-gone").await;
+        run(&repo, &["branch", "feature"]).await.unwrap();
 
-        let started =
-            create_worktree(&settings, &repo, &worktree_of(&settings), "feature", 1).unwrap();
+        let started = create_worktree(&settings, &repo, &worktree_of(&settings), "feature", 1)
+            .await
+            .unwrap();
         // Safe to delete: `main` is what the repo has checked out.
-        run(&repo, &["branch", "-D", "feature"]).unwrap();
+        run(&repo, &["branch", "-D", "feature"]).await.unwrap();
 
         assert_eq!(
             reconcile_base(
@@ -759,11 +829,14 @@ mod tests {
                 &worktree_of(&settings),
                 &settings.base_ref(1),
                 "feature"
-            ),
+            )
+            .await,
             None
         );
         assert_eq!(
-            run(&repo, &["rev-parse", &settings.base_ref(1)]).unwrap(),
+            run(&repo, &["rev-parse", &settings.base_ref(1)])
+                .await
+                .unwrap(),
             started
         );
     }

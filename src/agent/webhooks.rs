@@ -64,7 +64,7 @@ pub fn session_start(
 // mean a hand-written `FromRequest` whose only purpose is a smaller signature.
 #[allow(clippy::too_many_arguments)]
 #[post("/hooks/<token>/<card_id>/<event>", data = "<payload>")]
-pub fn receive(
+pub async fn receive(
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
@@ -79,7 +79,47 @@ pub fn receive(
         return Err(Status::Forbidden);
     }
 
-    record_event(db, card_id, event, &payload);
+    let server = Server {
+        db,
+        manager,
+        settings,
+        cache,
+        worktrees,
+    };
+
+    answer(&server, card_id, event, payload).await
+}
+
+/// Everything a hook can reach.
+///
+/// A struct because answering one takes all five, and a call listing them reads
+/// as nothing at all.
+struct Server<'a> {
+    db: &'a Db,
+    manager: &'a Arc<AgentManager>,
+    settings: &'a Settings,
+    cache: &'a DiffCache,
+    worktrees: &'a Worktrees,
+}
+
+/// What a hook actually does, once it has proved who it is.
+///
+/// Separate so the token check reads as the one thing standing in front of it.
+async fn answer(
+    server: &Server<'_>,
+    card_id: i64,
+    event: &str,
+    payload: Json<Value>,
+) -> Result<Json<Value>, Status> {
+    let Server {
+        db,
+        manager,
+        settings,
+        cache,
+        worktrees,
+    } = server;
+
+    record_event(db, card_id, event, &payload).await;
 
     // NB: only counts if the transcript is on disk. With transcript saving off
     // the client still reports an id, but `--resume` will never find it — and a
@@ -96,35 +136,39 @@ pub fn receive(
         payload.get("session_id").and_then(Value::as_str),
         transcript,
     ) {
-        Card::set_session_id(&db.lock(), card_id, session_id);
+        Card::set_session_id(db, card_id, session_id).await;
     }
 
-    if let Some(title) = transcript.and_then(session_title) {
-        Card::set_title(&db.lock(), card_id, &title);
+    let title = match transcript {
+        Some(path) => session_title(path).await,
+        None => None,
+    };
+    if let Some(title) = title {
+        Card::set_title(db, card_id, &title).await;
     }
 
     match event {
-        "prompt" => manager.turn_started(card_id),
+        "prompt" => manager.turn_started(card_id).await,
         // NB: a tool permission, a question, a plan to approve and an MCP
         // elicitation all arrive here — which is why the card says "needs you"
         // rather than naming one of them. Nothing reports the answer, so the
         // terminal watcher is armed here and clears the card once the dialog
         // leaves the screen.
         "needs-user" => {
-            manager.needs_user(card_id);
+            manager.needs_user(card_id).await;
             if let Some(agent) = manager.running(card_id) {
                 agent.expect_dialog();
             }
         }
-        "stop" => on_stop(db, manager, settings, cache, worktrees, card_id, &payload),
-        "end" => manager.session_ended(card_id),
+        "stop" => on_stop(db, manager, settings, cache, worktrees, card_id, &payload).await,
+        "end" => manager.session_ended(card_id).await,
         _ => {}
     }
 
     Ok(Json(json!({})))
 }
 
-fn on_stop(
+async fn on_stop(
     db: &Db,
     manager: &Arc<AgentManager>,
     settings: &Settings,
@@ -139,11 +183,11 @@ fn on_stop(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    match snapshot(db, settings, card_id, last_message) {
+    match snapshot(db, settings, card_id, last_message).await {
         // The turn is a new point in the picker, and its message is what the
         // pane's footer shows. Nothing else announces it: a commit the agent
         // made touches only `.git`, which the worktree watcher filters out.
-        Ok(()) => changes.card(db, card_id, Kind::Diff),
+        Ok(()) => changes.card(db, card_id, Kind::Diff).await,
         Err(err) => error!("card {card_id}: snapshotting the turn failed: {err:#}"),
     }
 
@@ -152,11 +196,11 @@ fn on_stop(
     }
 
     // The state and the lane it implies, under one lock.
-    manager.turn_ended(card_id);
+    manager.turn_ended(card_id).await;
 
     // Last, so that a merge landing this turn overrides the lane and state set
     // above with Done and a torn-down worktree.
-    lifecycle::check_merge(manager, settings, cache, worktrees, card_id);
+    lifecycle::check_merge(manager, settings, cache, worktrees, card_id).await;
 }
 
 /// A non-empty `background_tasks` means the turn ended but work is still in
@@ -168,12 +212,16 @@ fn is_paused(payload: &Value) -> bool {
         .is_some_and(|tasks| !tasks.is_empty())
 }
 
-fn snapshot(db: &Db, settings: &Settings, card_id: i64, last_message: &str) -> anyhow::Result<()> {
-    let conn = db.lock();
-    let Some(card) = Card::find(&conn, card_id) else {
+async fn snapshot(
+    db: &Db,
+    settings: &Settings,
+    card_id: i64,
+    last_message: &str,
+) -> anyhow::Result<()> {
+    let Some(card) = Card::find(db, card_id).await else {
         return Ok(());
     };
-    let Some(project) = Project::find(&conn, card.project_id) else {
+    let Some(project) = Project::find(db, card.project_id).await else {
         return Ok(());
     };
     let Some(worktree) = card.worktree_path.clone().map(PathBuf::from) else {
@@ -181,13 +229,14 @@ fn snapshot(db: &Db, settings: &Settings, card_id: i64, last_message: &str) -> a
     };
 
     Turn::snapshot(
-        &conn,
+        db,
         settings,
         card_id,
         &project.repo(),
         &worktree,
         last_message,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -195,8 +244,8 @@ fn snapshot(db: &Db, settings: &Settings, card_id: i64, last_message: &str) -> a
 ///
 /// NB: `session_title` on a hook payload only carries a name given with
 /// `--name`; a generated one can only be had from the transcript.
-fn session_title(transcript: &Path) -> Option<String> {
-    title_in(&std::fs::read_to_string(transcript).ok()?)
+async fn session_title(transcript: &Path) -> Option<String> {
+    title_in(&tokio::fs::read_to_string(transcript).await.ok()?)
 }
 
 /// A session's own name, preferred over the one it generated for itself.
@@ -243,11 +292,13 @@ fn title_in(transcript: &str) -> Option<String> {
     given.flatten().or_else(|| generated.flatten())
 }
 
-fn record_event(db: &Db, card_id: i64, kind: &str, payload: &Value) {
-    let _ = db.lock().execute(
-        "INSERT INTO events (card_id, kind, payload_json) VALUES (?1, ?2, ?3)",
-        rusqlite::params![card_id, kind, payload.to_string()],
-    );
+async fn record_event(db: &Db, card_id: i64, kind: &str, payload: &Value) {
+    let _ = sqlx::query("INSERT INTO events (card_id, kind, payload_json) VALUES (?1, ?2, ?3)")
+        .bind(card_id)
+        .bind(kind)
+        .bind(payload.to_string())
+        .execute(db.pool())
+        .await;
 }
 
 #[cfg(test)]
