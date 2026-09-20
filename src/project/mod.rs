@@ -2,6 +2,7 @@
 
 pub mod board;
 pub mod card;
+pub mod lifecycle;
 pub mod project;
 
 pub use card::{AgentState, Card, CardEdit, Lane, NewCard};

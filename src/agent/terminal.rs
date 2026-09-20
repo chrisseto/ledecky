@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use minijinja::context;
 use rocket::form::Form;
 use rocket::futures::{SinkExt, StreamExt};
@@ -7,12 +9,11 @@ use rocket::{get, post, State};
 use rocket_ws as ws;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::agent::{session, Agents};
+use crate::agent::AgentManager;
 use crate::config::Settings;
 use crate::db::Db;
-use crate::events::Changes;
-use crate::hooks::HookAuth;
 use crate::project::board::{self, Shell};
+use crate::project::lifecycle;
 use crate::project::{Card, Project};
 use crate::review::{self, DiffCache};
 use crate::tmpl::Tmpl;
@@ -21,7 +22,7 @@ use crate::watch::Worktrees;
 #[get("/cards/<id>?<scope>")]
 pub fn focus(
     db: &State<Db>,
-    agents: &State<Agents>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -32,7 +33,7 @@ pub fn focus(
     let project = Project::find(&conn, card.project_id).ok_or(Status::NotFound)?;
     drop(conn);
 
-    let live = agents.get(id).is_some_and(|a| a.is_running());
+    let live = manager.running(id).is_some();
     let review = review::routes::initial(db, settings, cache, id, scope)?;
 
     Ok(Shell {
@@ -57,15 +58,12 @@ pub fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
 
 #[post("/cards/<id>/start")]
 pub fn start(
-    db: &State<Db>,
-    agents: &State<Agents>,
-    auth: &State<HookAuth>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
-    changes: &State<Changes>,
     worktrees: &State<Worktrees>,
     id: i64,
 ) -> Result<Redirect, Status> {
-    match session::start(db, agents, auth, settings, changes, worktrees, id) {
+    match lifecycle::start(manager, settings, worktrees, id) {
         // The drawer is what asked, and it has a terminal to put up now.
         Ok(_) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
@@ -76,24 +74,14 @@ pub fn start(
 }
 
 #[post("/cards/<id>/stop")]
-pub fn stop(
-    db: &State<Db>,
-    agents: &State<Agents>,
-    changes: &State<Changes>,
-    id: i64,
-) -> Redirect {
-    session::stop(db, agents, changes, id);
+pub fn stop(manager: &State<Arc<AgentManager>>, id: i64) -> Redirect {
+    manager.stop(id);
     Redirect::to(format!("/cards/{id}"))
 }
 
 #[post("/cards/<id>/merge")]
-pub fn merge(
-    db: &State<Db>,
-    agents: &State<Agents>,
-    changes: &State<Changes>,
-    id: i64,
-) -> Result<Redirect, Status> {
-    match session::request_merge(db, agents, changes, id) {
+pub fn merge(manager: &State<Arc<AgentManager>>, id: i64) -> Result<Redirect, Status> {
+    match manager.request_merge(id) {
         Ok(()) => Ok(Redirect::to(format!("/cards/{id}"))),
         Err(err) => {
             warn!("card {id}: merge request failed: {err:#}");
@@ -109,8 +97,8 @@ pub struct ResizeForm {
 }
 
 #[post("/cards/<id>/resize", data = "<form>")]
-pub fn resize(agents: &State<Agents>, id: i64, form: Form<ResizeForm>) -> Status {
-    match agents.get(id) {
+pub fn resize(manager: &State<Arc<AgentManager>>, id: i64, form: Form<ResizeForm>) -> Status {
+    match manager.running(id) {
         Some(agent) => {
             agent.resize(form.rows.max(1), form.cols.max(1));
             Status::NoContent
@@ -119,19 +107,21 @@ pub fn resize(agents: &State<Agents>, id: i64, form: Form<ResizeForm>) -> Status
     }
 }
 
-/// Raw pty bytes in both directions. Everything else — resize, injection, merge —
-/// goes over ordinary HTTP so this socket stays a dumb pipe. The screen's size is
-/// the one exception: the replay ahead of the stream is rendered at the pty's
-/// width, so it has to be the client's before the first byte goes out.
+/// Raw pty bytes in both directions, and the only thing that writes to the pty
+/// at all — a keystroke here is the user's. Everything else — resize, merge, a
+/// review — goes over ordinary HTTP so this socket stays a dumb pipe. The
+/// screen's size is the one exception: the replay ahead of the stream is
+/// rendered at the pty's width, so it has to be the client's before the first
+/// byte goes out.
 #[get("/cards/<id>/terminal?<rows>&<cols>")]
 pub fn socket(
-    agents: &State<Agents>,
+    manager: &State<Arc<AgentManager>>,
     id: i64,
     rows: u16,
     cols: u16,
     socket: ws::WebSocket,
 ) -> ws::Channel<'static> {
-    let agent = agents.get(id);
+    let agent = manager.get(id);
 
     socket.channel(move |mut stream| {
         Box::pin(async move {

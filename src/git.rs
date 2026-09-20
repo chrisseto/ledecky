@@ -490,7 +490,7 @@ mod tests {
         std::fs::create_dir_all(artefact.parent().unwrap()).unwrap();
         std::fs::write(&artefact, "").unwrap();
 
-        assert!(all_ignored(&repo, &[artefact.clone()]));
+        assert!(all_ignored(&repo, std::slice::from_ref(&artefact)));
 
         // One tracked file in the burst is enough to make it real.
         assert!(!all_ignored(&repo, &[artefact, repo.join("a.txt")]));

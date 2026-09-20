@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -9,24 +7,30 @@ use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
 
-use crate::agent::session;
-use crate::config::{Settings, Timings};
-use crate::db::Db;
-use crate::events::Changes;
-use crate::project::Card;
+use crate::agent::messaging::Inbox;
+use crate::config::Timings;
 
 const DEFAULT_ROWS: u16 = 40;
 const DEFAULT_COLS: u16 = 120;
 const SCROLLBACK: usize = 5000;
 
-/// Paste delivery: up to PASTE_ATTEMPTS sends, each polled PASTE_CHECKS times.
-// NB: the paste poll interval and the dialog grace live in `Settings`, so the
-// end-to-end suite does not have to wait in real time.
-const PASTE_CHECKS: u32 = 8;
-const PASTE_ATTEMPTS: u32 = 4;
-
 /// Rows at the bottom of the screen treated as the input box.
 const COMPOSER_ROWS: usize = 15;
+
+/// What the pty pump has seen.
+///
+/// Implemented by the manager; nothing in here knows or cares who is listening.
+/// The pump holds a `Weak` to one of these, which is what keeps this module from
+/// needing a database, an event bus, or a way back into the registry.
+pub trait Watcher: Send + Sync {
+    /// A dialog has left the screen. Nothing else reports this — no hook fires
+    /// when a permission prompt is answered — so the redraw is the only signal.
+    fn dialog_cleared(&self, card_id: i64);
+
+    /// The pty reached EOF. The child is gone, or has stopped writing to a
+    /// terminal nobody else holds open.
+    fn exited(&self, card_id: i64);
+}
 
 // The dialog grace is `Timings::dialog_grace`: our own hook returns no
 // decision, but the settings merge with the user's (`hooks.rs`) — one of theirs
@@ -55,16 +59,65 @@ pub struct Agent {
     child: Mutex<Box<dyn Child + Send + Sync>>,
     screen: Arc<Mutex<vt100::Parser>>,
     output: broadcast::Sender<Bytes>,
-    /// The opening task, held until the session is actually up. Flushed by the
-    /// `SessionStart` hook, or by a timer if hooks never reach us.
-    pending_prompt: Mutex<Option<String>>,
     /// What the pump believes about a dialog, and when it started believing it.
     dialog: Mutex<(Dialog, Instant)>,
+    /// Where to send this session messages, once its `SessionStart` hook has
+    /// said. `None` until then, which is also how the manager tells a session
+    /// that is up from one still held by a dialog.
+    inbox: Mutex<Option<Inbox>>,
     /// The real-time waits this agent makes, from `Settings`.
     timings: Timings,
 }
 
 impl Agent {
+    /// Opens a pty, attaches `cmd` to it, and hands back the agent together with
+    /// the reader its pump will own.
+    ///
+    /// NB: takes a prepared command rather than a card. Turning a card into a
+    /// command line is the manager's job; this side knows about a process and a
+    /// terminal and nothing else.
+    pub(crate) fn attach(
+        cmd: CommandBuilder,
+        timings: Timings,
+    ) -> Result<(Arc<Self>, Box<dyn Read + Send>)> {
+        let pty = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: DEFAULT_ROWS,
+                cols: DEFAULT_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("opening a pty")?;
+
+        let child = pty.slave.spawn_command(cmd).context("spawning claude")?;
+        drop(pty.slave);
+
+        let pid = child.process_id().map(i64::from);
+        let reader = pty.master.try_clone_reader()?;
+        let writer = pty.master.take_writer()?;
+
+        let (output, _) = broadcast::channel(1024);
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+            SCROLLBACK,
+        )));
+
+        let agent = Arc::new(Agent {
+            pid,
+            master: Mutex::new(pty.master),
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+            screen,
+            output,
+            dialog: Mutex::new((Dialog::None, Instant::now())),
+            inbox: Mutex::new(None),
+            timings,
+        });
+
+        Ok((agent, reader))
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
         self.output.subscribe()
     }
@@ -88,85 +141,21 @@ impl Agent {
         let _ = writer.flush();
     }
 
-    /// Sends `text` as one message and returns whether it was actually submitted.
-    ///
-    /// Claude Code's TUI treats a bare newline as submit, so the text goes in as
-    /// a bracketed paste. Nothing is sent until the input box is on screen, and
-    /// the submit key is not sent until the paste is visibly in it: a client
-    /// that is still starting up *queues* what it is sent, out of the box and
-    /// out of reach, and a dialog — the workspace-trust prompt, the
-    /// bypass-permissions consent — swallows it, where a blind Enter would
-    /// answer the dialog instead.
-    #[must_use]
-    pub fn inject(&self, text: &str) -> bool {
-        let text = text.trim_end();
-        if text.is_empty() {
-            return true;
-        }
-
-        let needle = paste_needle(text);
-
-        let mut payload = Vec::with_capacity(text.len() + 16);
-        payload.extend_from_slice(b"\x1b[200~");
-        payload.extend_from_slice(text.as_bytes());
-        payload.extend_from_slice(b"\x1b[201~");
-
-        for _ in 0..PASTE_ATTEMPTS {
-            if !self.is_composing() {
-                std::thread::sleep(self.timings.paste_poll);
-                continue;
-            }
-
-            // A paste written while the TUI is mid-redraw is simply dropped, so
-            // re-send rather than waiting longer on one that never arrived. The
-            // in-box check before each retry keeps it from landing twice.
-            if !self.holds(&needle) {
-                self.write_input(&payload);
-            }
-
-            for _ in 0..PASTE_CHECKS {
-                std::thread::sleep(self.timings.paste_poll);
-                if !self.holds(&needle) {
-                    continue;
-                }
-
-                self.write_input(b"\r");
-                if self.cleared(&needle) {
-                    return true;
-                }
-                break; // the key went nowhere; the text is still sitting there
-            }
-        }
-        false
+    /// Records where this session takes messages.
+    pub fn set_inbox(&self, inbox: Inbox) {
+        *self.inbox.lock().unwrap() = Some(inbox);
     }
 
-    /// The input box, or the dialog standing in for it.
-    fn composer(&self) -> Vec<String> {
-        let screen = self.screen.lock().unwrap();
-        let contents = screen.screen().contents();
-
-        let lines: Vec<&str> = contents.lines().collect();
-        composer_block(&lines)
-            .iter()
-            .map(|line| (*line).to_owned())
-            .collect()
-    }
-
-    /// Whether there is an input box to paste into at all.
-    ///
-    /// A client that has not drawn one yet is still starting up, and a dialog
-    /// over it leaves only its own highlighted options behind.
-    pub fn is_composing(&self) -> bool {
-        self.composer()
-            .first()
-            .is_some_and(|line| !is_menu_option(line))
+    /// Where this session takes messages, if it has reported in yet.
+    pub fn inbox(&self) -> Option<Inbox> {
+        self.inbox.lock().unwrap().clone()
     }
 
     /// Whether a dialog is holding the keyboard, which is the user's to answer.
     pub fn is_blocked(&self) -> bool {
-        self.composer()
-            .first()
-            .is_some_and(|line| is_menu_option(line))
+        let screen = self.screen.lock().unwrap();
+        let contents = screen.screen().contents();
+        is_dialog(&contents.lines().collect::<Vec<&str>>())
     }
 
     /// Arms the watcher: a dialog has been asked for.
@@ -214,41 +203,6 @@ impl Agent {
         resumed
     }
 
-    /// True once `needle`, or the placeholder the TUI collapses a long paste to,
-    /// is in the input box.
-    fn holds(&self, needle: &str) -> bool {
-        self.composer()
-            .iter()
-            .any(|line| line.contains(needle) || line.contains("Pasted text"))
-    }
-
-    /// Waits for the input box to let go of the text, which is the only proof
-    /// the submit key did anything.
-    fn cleared(&self, needle: &str) -> bool {
-        for _ in 0..PASTE_CHECKS {
-            std::thread::sleep(self.timings.paste_poll);
-            if !self.holds(needle) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Sends the opening task, keeping it queued if it could not be delivered.
-    /// Returns false while the terminal is still busy with something else.
-    pub fn flush_pending_prompt(&self) -> bool {
-        let Some(prompt) = self.pending_prompt.lock().unwrap().take() else {
-            return true; // already sent
-        };
-
-        if self.inject(&prompt) {
-            return true;
-        }
-
-        *self.pending_prompt.lock().unwrap() = Some(prompt);
-        false
-    }
-
     pub fn resize(&self, rows: u16, cols: u16) {
         let size = PtySize {
             rows,
@@ -275,136 +229,6 @@ impl Agent {
 
     pub fn is_running(&self) -> bool {
         matches!(self.child.lock().unwrap().try_wait(), Ok(None))
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct Agents(Arc<RwLock<HashMap<i64, Arc<Agent>>>>);
-
-impl Agents {
-    pub fn get(&self, card_id: i64) -> Option<Arc<Agent>> {
-        self.0.read().unwrap().get(&card_id).cloned()
-    }
-
-    pub fn remove(&self, card_id: i64) -> Option<Arc<Agent>> {
-        self.0.write().unwrap().remove(&card_id)
-    }
-
-    pub fn shutdown(&self) {
-        for agent in self.0.write().unwrap().drain().map(|(_, a)| a) {
-            agent.kill();
-        }
-    }
-
-    /// Spawns `claude` in `worktree` and registers it under `card.id`.
-    ///
-    /// `repo` is the project's main checkout, added as a second allowed directory
-    /// so the agent can land its work on the base branch — which lives there, not
-    /// in the worktree.
-    pub fn spawn(
-        &self,
-        db: &Db,
-        changes: &Changes,
-        settings: &Settings,
-        card: &Card,
-        worktree: &Path,
-        repo: &Path,
-        hook_settings: &str,
-    ) -> Result<Arc<Agent>> {
-        if let Some(existing) = self.get(card.id) {
-            if existing.is_running() {
-                return Ok(existing);
-            }
-            self.remove(card.id);
-        }
-
-        let pty = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: DEFAULT_ROWS,
-                cols: DEFAULT_COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("opening a pty")?;
-
-        let mut cmd = CommandBuilder::new(&settings.agent_bin);
-        cmd.arg("--permission-mode");
-        cmd.arg(&card.permission_mode);
-        // Restarting a card picks the conversation back up rather than starting
-        // over with no memory of the work already done.
-        if let Some(session_id) = &card.session_id {
-            cmd.arg("--resume");
-            cmd.arg(session_id);
-        }
-        if let Some(model) = &card.model {
-            cmd.arg("--model");
-            cmd.arg(model);
-        }
-        cmd.arg("--settings");
-        cmd.arg(hook_settings);
-        cmd.arg("--add-dir");
-        cmd.arg(repo);
-        // NB: no `--name`. Naming the session suppresses the name it would
-        // give itself, which is the one the card takes.
-        cmd.cwd(worktree);
-        // Match what xterm.js renders; the inherited TERM may be anything.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        // Applied last so a deployment can override the above if it must.
-        for (key, value) in &settings.agent_env {
-            cmd.env(key, value);
-        }
-        // If this server was itself launched from a Claude Code session, these
-        // markers make the child think it is a nested agent and disable session
-        // persistence. Auth vars are deliberately left alone.
-        for marker in [
-            "CLAUDECODE",
-            "CLAUDE_CODE_CHILD_SESSION",
-            "CLAUDE_CODE_ENTRYPOINT",
-            "CLAUDE_CODE_SSE_PORT",
-            "CLAUDE_SESSION_ID",
-        ] {
-            cmd.env_remove(marker);
-        }
-
-        let child = pty.slave.spawn_command(cmd).context("spawning claude")?;
-        drop(pty.slave);
-
-        let pid = child.process_id().map(i64::from);
-        let reader = pty.master.try_clone_reader()?;
-        let writer = pty.master.take_writer()?;
-
-        let (output, _) = broadcast::channel(1024);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(
-            DEFAULT_ROWS,
-            DEFAULT_COLS,
-            SCROLLBACK,
-        )));
-
-        let agent = Arc::new(Agent {
-            pid,
-            master: Mutex::new(pty.master),
-            writer: Mutex::new(writer),
-            child: Mutex::new(child),
-            screen,
-            output,
-            pending_prompt: Mutex::new(card.opening_prompt()),
-            dialog: Mutex::new((Dialog::None, Instant::now())),
-            timings: settings.timings(),
-        });
-
-        self.0.write().unwrap().insert(card.id, agent.clone());
-
-        // portable-pty hands back a blocking reader, so it gets its own thread.
-        // Its handle on the agent is not a cycle: the reader hits EOF when the
-        // pty closes, and the loop drops it on the way out.
-        let pumped = agent.clone();
-        let db = db.clone();
-        let card_id = card.id;
-        let changes = changes.clone();
-        std::thread::spawn(move || pump(reader, pumped, db, changes, card_id));
-
-        Ok(agent)
     }
 }
 
@@ -457,17 +281,21 @@ fn history_bytes(screen: &mut vt100::Screen, client_rows: Option<u16>) -> Vec<u8
     out
 }
 
-/// Feeds pty output into the screen and out to the websocket, and watches for a
-/// dialog leaving that screen.
+/// Feeds pty output into the screen and out to the websocket, watches for a
+/// dialog leaving that screen, and reports the pty closing.
 ///
-/// The watcher lives here because there is no hook for a permission being
+/// The dialog watch lives here because there is no hook for a permission being
 /// answered: the redraw that takes the dialog away is the only signal, and this
-/// is the only place it is seen.
-fn pump(
+/// is the only place it is seen. The same is true of the child going away.
+///
+/// NB: both are reported through a `Weak`, not called directly. That is what
+/// keeps this module clear of the database and the event bus, and it makes a
+/// cycle between the pump and the registry that owns this agent impossible
+/// rather than merely absent.
+pub(crate) fn pump(
     mut reader: Box<dyn Read + Send>,
     agent: Arc<Agent>,
-    db: Db,
-    changes: Changes,
+    watcher: Weak<dyn Watcher>,
     card_id: i64,
 ) {
     let mut buf = [0u8; 8192];
@@ -479,13 +307,21 @@ fn pump(
                 agent.screen.lock().unwrap().process(&chunk);
 
                 if agent.watch_dialog() {
-                    session::resume_after_dialog(&db, &changes, card_id);
+                    if let Some(watcher) = watcher.upgrade() {
+                        watcher.dialog_cleared(card_id);
+                    }
                 }
 
                 // No subscribers is the normal case when nobody has the card open.
                 let _ = agent.output.send(chunk);
             }
         }
+    }
+
+    // EOF. A failed upgrade means the server is going down, which is the one
+    // case where nobody needs telling.
+    if let Some(watcher) = watcher.upgrade() {
+        watcher.exited(card_id);
     }
 }
 
@@ -528,6 +364,44 @@ fn is_prompt_line(line: &str) -> bool {
     matches!(line.trim_start().chars().next(), Some('❯' | '>'))
 }
 
+/// Whether a dialog is holding the keyboard, given the whole screen.
+///
+/// Two tests, because the dialogs that matter are drawn two different ways.
+///
+/// A mid-turn dialog — a tool permission, an MCP elicitation — replaces the
+/// input box at the bottom of the screen, so it is found where the input box
+/// would be, and it numbers its choices.
+///
+/// The two that hold a session at startup do neither. The workspace-trust
+/// prompt and the `bypassPermissions` consent are drawn from the top of an
+/// otherwise empty screen, nowhere near the last rows, and neither numbers
+/// anything:
+///
+/// ```text
+/// ❯ No, exit
+///   Yes, I trust this folder
+///
+///   Enter to confirm · Esc to cancel
+/// ```
+///
+/// So they are found by their footer instead, anywhere on screen. NB: matched
+/// at the start of a line rather than anywhere in one, or an agent quoting the
+/// words back into its transcript would read as a dialog. Every new worktree is
+/// an unfamiliar directory, so the trust prompt is not an edge case — it is what
+/// greets every card on its first start.
+fn is_dialog(lines: &[&str]) -> bool {
+    if lines.iter().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("Enter to confirm") || line.starts_with("Esc to cancel")
+    }) {
+        return true;
+    }
+
+    composer_block(lines)
+        .first()
+        .is_some_and(|line| is_menu_option(line))
+}
+
 /// Whether that line is a numbered choice rather than the input box.
 fn is_menu_option(line: &str) -> bool {
     let rest = line
@@ -539,25 +413,32 @@ fn is_menu_option(line: &str) -> bool {
     number > 0 && rest[number..].starts_with('.')
 }
 
-/// Picks a substring of a pasted message to look for on screen.
-///
-/// A long word survives the input box's line wrapping, which a fixed-length
-/// prefix would not.
-fn paste_needle(text: &str) -> String {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 6 && w.len() <= 20)
-        .max_by_key(|w| w.len())
-        .map(str::to_owned)
-        .unwrap_or_else(|| text.chars().take(8).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        composer_block, history_bytes, is_menu_option, is_prompt_line, paste_needle, settle,
-        Dialog, COMPOSER_ROWS,
+        composer_block, history_bytes, is_dialog, is_menu_option, is_prompt_line, settle, Dialog,
+        COMPOSER_ROWS,
     };
     use std::time::Duration;
+
+    fn dialog(lines: &[&str]) -> bool {
+        is_dialog(lines)
+    }
+
+    /// The same, but through a real screen: the rows are painted where the
+    /// client paints them and read back the way `Agent::is_blocked` reads them.
+    /// Anchoring at the bottom of the screen is exactly what a plain slice of
+    /// lines cannot catch, so the startup dialogs need this.
+    fn dialog_on_screen(rows: &[&str]) -> bool {
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(b"\x1b[2J\x1b[H");
+        for row in rows {
+            parser.process(format!("{row}\r\n").as_bytes());
+        }
+
+        let contents = parser.screen().contents();
+        is_dialog(&contents.lines().collect::<Vec<&str>>())
+    }
 
     /// The walk steps through the scrollback a screenful at a time, and the
     /// last step is a partial one whenever the history is not a multiple of the
@@ -583,7 +464,7 @@ mod tests {
         let expected: Vec<String> = (0..28).map(|i| format!("line-{i}")).collect();
         assert_eq!(seen, expected);
 
-        // The live view must be back, or `inject` reads the wrong rows.
+        // The live view must be back, or the dialog watcher reads the wrong rows.
         assert_eq!(parser.screen().scrollback(), 0);
     }
 
@@ -646,54 +527,47 @@ mod tests {
         assert_eq!(blanks, 30);
     }
 
-    /// The composer holding a pasted message, as the client actually draws it:
-    /// the marker on the first line only, the rest plain.
-    const PASTED: &[&str] = &[
-        "  ⏺ an earlier turn that also said Investigate",
-        "────────────────────────────────────────────",
-        "❯ The board flashes whenever the poll returns",
-        "",
-        "  Investigate the unpoly fragment swapping.",
-        "────────────────────────────────────────────",
-        "  -- INSERT -- ⏸ plan mode on (shift+tab to cycle)",
-    ];
-
-    /// The same message a moment later: submitted, so it has moved up into the
-    /// transcript and the box is empty again.
-    const SUBMITTED: &[&str] = &[
+    /// An empty input box, as the client draws it: the marker inside a bordered
+    /// box with the session name on the border.
+    const COMPOSING: &[&str] = &[
         "  The board flashes whenever the poll returns",
-        "  Investigate the unpoly fragment swapping.",
         "  ⏺ Worked for 1s",
-        "────────────────────────────────────────────",
+        "─────────────────────────────────── spike-a ─",
         "❯ ",
         "────────────────────────────────────────────",
         "  -- INSERT -- ⏸ plan mode on (shift+tab to cycle)",
     ];
 
-    fn holds(lines: &[&str], needle: &str) -> bool {
-        composer_block(lines).iter().any(|l| l.contains(needle))
-    }
+    /// The workspace-trust prompt, verbatim from claude 2.1.272. Its options
+    /// carry no numbers, which is the case the old check missed.
+    const TRUST: &[&str] = &[
+        "  Quick safety check: Is this a project you created or one you trust?",
+        "  Security guide",
+        "❯ No, exit",
+        "  Yes, I trust this folder",
+        "",
+        "  Enter to confirm · Esc to cancel",
+    ];
 
-    #[test]
-    fn a_pasted_message_is_found_on_its_continuation_line() {
-        // `paste_needle` picks the longest word, which lands below the marker.
-        assert_eq!(paste_needle("The board flashes whenever the poll returns\n\nInvestigate the unpoly fragment swapping."), "Investigate");
-        assert!(holds(PASTED, "Investigate"));
-    }
-
-    #[test]
-    fn the_transcript_above_the_box_is_not_the_box() {
-        // The words are still on screen, but they have been sent. Reading them
-        // as unsent is what re-pastes a message that already went in.
-        assert!(!holds(SUBMITTED, "Investigate"));
-        assert!(composer_block(SUBMITTED)
-            .first()
-            .is_some_and(|l| l.trim() == "❯"));
-    }
+    /// The `bypassPermissions` consent, also unnumbered.
+    const CONSENT: &[&str] = &[
+        "  WARNING: Claude Code running in Bypass Permissions mode",
+        "  https://code.claude.com/docs/en/security",
+        "❯ No, exit",
+        "  Yes, I accept",
+        "",
+        "  Enter to confirm · Esc to cancel",
+    ];
 
     #[test]
     fn an_echo_of_an_earlier_turn_is_left_above_the_anchor() {
-        assert!(!composer_block(PASTED)
+        let pasted = &[
+            "  ⏺ an earlier turn that also said Investigate",
+            "────────────────────────────────────────────",
+            "❯ Investigate the unpoly fragment swapping.",
+            "────────────────────────────────────────────",
+        ];
+        assert!(!composer_block(pasted)
             .iter()
             .any(|l| l.contains("an earlier turn")));
     }
@@ -705,15 +579,46 @@ mod tests {
     }
 
     #[test]
-    fn a_dialog_is_the_composer_while_it_is_up() {
-        let dialog = &[
-            "  Do you trust the files in this folder?",
-            "❯ 1. Yes, I trust this folder",
-            "  2. No, exit",
-            "  Enter to confirm · Esc to cancel",
-        ];
-        let block = composer_block(dialog);
-        assert!(block.first().is_some_and(|l| is_menu_option(l)));
+    fn an_input_box_is_not_a_dialog() {
+        assert!(!dialog(COMPOSING));
+    }
+
+    /// Both dialogs that strand a card at startup, and neither numbers its
+    /// options. Reading them as an input box is what left the card in
+    /// `starting` with nobody told there was anything to answer.
+    #[test]
+    fn the_unnumbered_startup_dialogs_are_dialogs() {
+        assert!(dialog(TRUST));
+        assert!(dialog(CONSENT));
+    }
+
+    /// The case a slice of lines hides: the client draws these from the *top* of
+    /// an otherwise empty 40-row screen, so on the real screen they sit twenty
+    /// rows above where the input box would be. Looking only at the last rows
+    /// found nothing, and a card meeting the trust prompt — which is every card
+    /// on its first start, the worktree being a directory nobody has seen
+    /// before — went to `misconfigured` instead of `needs you`.
+    #[test]
+    fn a_startup_dialog_is_found_though_it_is_nowhere_near_the_input_box() {
+        assert!(dialog_on_screen(TRUST));
+        assert!(dialog_on_screen(CONSENT));
+    }
+
+    #[test]
+    fn an_input_box_on_a_real_screen_is_still_not_a_dialog() {
+        assert!(!dialog_on_screen(COMPOSING));
+    }
+
+    /// A client that has painted nothing yet is starting up, not waiting.
+    #[test]
+    fn a_blank_screen_is_not_a_dialog() {
+        assert!(!dialog_on_screen(&["", "  Loading…", ""]));
+    }
+
+    #[test]
+    fn a_numbered_dialog_is_still_a_dialog() {
+        let numbered = &["  Bash command needs approval", "❯ 1. Yes", "  2. No"];
+        assert!(dialog(numbered));
     }
 
     #[test]
@@ -749,15 +654,17 @@ mod tests {
         assert!(!is_menu_option("❯ 1 is not a choice without its dot"));
     }
 
+    /// A message quoting the footer is transcript, not a dialog: the anchor
+    /// leaves it above the block.
     #[test]
-    fn needle_prefers_a_long_word() {
-        assert_eq!(paste_needle("Add a --verbose flag to main.rs"), "verbose");
-    }
-
-    #[test]
-    fn needle_falls_back_to_a_prefix() {
-        assert_eq!(paste_needle("go go go"), "go go go");
-        assert_eq!(paste_needle(""), "");
+    fn the_words_in_a_message_above_the_box_do_not_make_a_dialog() {
+        let quoting = &[
+            "  ⏺ It said Enter to confirm · Esc to cancel, so I pressed Enter.",
+            "────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────",
+        ];
+        assert!(!dialog(quoting));
     }
 
     // ---- the dialog watcher -------------------------------------------------

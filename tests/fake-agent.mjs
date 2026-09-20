@@ -2,20 +2,23 @@
 //
 // A scripted stand-in for `claude`, used by the end-to-end suite.
 //
-// It imitates only the parts of the real TUI that ledecky actually couples to:
+// It imitates only the parts of the real client that ledecky actually couples
+// to:
 //
+//   * an opening task taken as a positional argument, held while a modal is up
+//     and submitted on its own once the modal is answered;
+//   * a per-session inbox socket, whose path it reports by running the
+//     SessionStart command hook out of its own --settings — which is both how
+//     the server sends it anything and how the server knows it has started;
+//   * a startup window where it has drawn nothing yet and the SessionStart hook
+//     has not run, which the server must not mistake for being ready;
+//   * a modal that owns the keyboard and treats a bare Enter as "exit", which is
+//     how the trust and bypass-permissions dialogs behave. Neither numbers its
+//     options, so neither is matched by looking for a leading "1.";
+//   * dying on "k" without a SessionEnd hook, the way a crash or an outside
+//     kill does — the case where the pty reaching EOF is the only notice;
 //   * a full-height screen with the input box pinned near the bottom, because
-//     the server looks for its pasted text in the last rows of the terminal;
-//   * a startup window with no input box at all, where anything sent is queued
-//     on the box's border rather than typed — text on screen that no Enter will
-//     submit, which the server must not mistake for a delivered prompt;
-//   * a composer that marks only the first line of a pasted message, leaving
-//     the rest plain — the server's needle usually lands on one of those;
-//   * bracketed-paste handling, collapsing long pastes to "Pasted text" exactly
-//     as the real client does;
-//   * a modal that swallows pastes and treats a bare Enter as "exit", which is
-//     how the bypass-permissions consent dialog behaves — blind-Entering into
-//     one used to kill agents outright;
+//     the server reads the last rows to tell a dialog from an input box;
 //   * the HTTP hooks named in its own --settings argument;
 //   * naming itself after its first prompt, as a metadata line in its
 //     transcript — which is where the server reads the card's title from.
@@ -24,9 +27,19 @@
 // something to capture, and the merge prompt is understood well enough to move
 // the base branch for real.
 
-import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { createServer } from "node:net";
+import { createInterface } from "node:readline";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const ESC = "\u001b";
 const PASTE_START = `${ESC}[200~`;
@@ -40,6 +53,11 @@ const flag = (name) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 };
+
+// The opening task arrives as a positional argument after `--`, the way the
+// real client takes one. Everything before it is flag/value pairs.
+const separator = argv.indexOf("--");
+const openingTask = separator >= 0 ? argv[separator + 1] : undefined;
 
 const settings = JSON.parse(flag("--settings") ?? "{}");
 const hookUrl = (event) => settings.hooks?.[event]?.[0]?.hooks?.[0]?.url;
@@ -61,6 +79,10 @@ if (resuming && !existsSync(transcriptPath)) {
 mkdirSync(SESSIONS, { recursive: true });
 appendFileSync(transcriptPath, `${JSON.stringify({ session: sessionId })}\n`);
 
+// NB: in the system temp dir rather than under the card, because a unix socket
+// path is capped near 100 bytes and the suite's data directories are long.
+const socketPath = join(tmpdir(), `fake-agent-${process.pid}.sock`);
+
 const out = (s) => process.stdout.write(s);
 const transcript = [
   `fake-agent - ${sessionId}`,
@@ -80,51 +102,110 @@ let working = null;
 let buffer = "";
 /** What the composer displays, which collapses for a long paste. */
 let shown = "";
-/** Text sent before there was anywhere to put it. */
-let queued = "";
 let turn = 0;
 
 // The real client spends several seconds drawing itself before it has an input
-// box, and anything sent in that window is queued on the box's border instead of
-// typed into it — where a bare Enter will not submit it either.
+// box. Nothing it is handed in that window goes anywhere, and the SessionStart
+// hook has not run, so the server has nothing to mistake for readiness.
 let booting = true;
 setTimeout(() => {
   booting = false;
   render();
+  // Only now: SessionStart fires once the client is up and past any dialog,
+  // which is exactly what makes it worth anything as a signal to the server.
+  ready();
 }, Number(process.env.FAKE_AGENT_BOOT_MS ?? 4000));
+
+/**
+ * Opens the inbox socket and runs the SessionStart command hook, which is how
+ * the server learns where to send messages — and, because this only happens
+ * once no modal is left holding the keyboard, how it learns the session is up.
+ */
+function ready() {
+  if (modal) return; // still the user's to answer; the task waits with it
+
+  const server = createServer((connection) => {
+    const lines = createInterface({ input: connection });
+    lines.on("line", (line) => {
+      let frame;
+      try {
+        frame = JSON.parse(line);
+      } catch {
+        return;
+      }
+      // The auth line opens the connection; the message follows it.
+      if (frame.type === "user") submit(frame.message.content);
+    });
+  });
+
+  // NB: everything below waits on the listen callback. Reporting the path
+  // before the socket accepts leaves the server a live path to connect to and
+  // nothing behind it, which is a flake rather than a failure.
+  server.listen(socketPath, () => {
+    const command = settings.hooks?.SessionStart?.[0]?.hooks?.[0]?.command;
+    if (command) {
+      try {
+        execSync(command, {
+          env: {
+            ...process.env,
+            CLAUDE_CODE_MESSAGING_SOCKET: socketPath,
+            CLAUDE_CODE_MESSAGING_TOKEN: `token-${process.pid}`,
+          },
+        });
+      } catch {
+        // A server that has gone away is not the fake agent's problem.
+      }
+    }
+
+    // The opening task was handed over on the command line and has been waiting
+    // for the client to be able to take it.
+    if (openingTask) submit(openingTask);
+  });
+}
 
 function render() {
   out(`${ESC}[2J${ESC}[H`);
   out(transcript.slice(-20).join("\r\n"));
 
   // A modal replaces the input box with its own choices, marking the
-  // highlighted one the way the real client does — that marker is how the
-  // server tells a dialog holding the keyboard from a client that has not drawn
-  // a box yet.
+  // highlighted one the way the real client does.
+  //
+  // NB: the consent dialog's options carry no numbers, because the real one's
+  // do not — that is how it tells a dialog from an input box, and numbering
+  // them here is what hid the bug where neither startup dialog was recognised.
+  // The mid-turn permission prompt does number its options, so one of each is
+  // on the screen the server reads.
   let block;
   if (booting) {
     block = [border(), "starting…"];
   } else if (modal === "consent") {
-    block = ["WARNING: Bypass Permissions mode", "❯ 1. No, exit", "  2. Yes, I accept", "Enter to confirm"];
+    block = [
+      "WARNING: Bypass Permissions mode",
+      "❯ No, exit",
+      "  Yes, I accept",
+      "Enter to confirm · Esc to cancel",
+    ];
   } else if (modal === "permission") {
     block = ["Bash command needs approval", "❯ 1. Yes", "  2. No", "Enter to confirm"];
   } else {
     block = composer();
   }
 
-  // Pin it to the bottom; the server only searches the last rows.
-  out(`${ESC}[${ROWS - block.length};1H`);
+  // The consent dialog is drawn from the *top* of an otherwise empty screen, as
+  // the real one is — twenty rows above where the input box would be. Pinning it
+  // to the bottom like everything else is what hid the startup dialogs from a
+  // server that only read the last rows.
+  out(modal === "consent" ? `${ESC}[2;1H` : `${ESC}[${ROWS - block.length};1H`);
   out(block.join("\r\n"));
 }
 
-const border = () => `${"─".repeat(20)} ${queued} ──`;
+const border = () => "─".repeat(20);
 
 /**
  * The input box.
  *
- * A pasted message keeps the prompt marker on its first line only and runs
- * plain from there, exactly as the real client draws it — so the word the
- * server looks for is usually *not* on the marked line.
+ * A typed message keeps the prompt marker on its first line only and runs plain
+ * from there, exactly as the real client draws it.
  */
 function composer() {
   const [first = "", ...rest] = shown.split("\n");
@@ -251,6 +332,9 @@ function answerModal(key) {
       modal = null;
       transcript.push("* bypass permissions accepted");
       render();
+      // The client has the keyboard back, so it can start and take the task it
+      // was launched with.
+      ready();
       return true;
     }
     if (key === "1" || key === "\r" || key === "\n") {
@@ -288,6 +372,18 @@ function answerModal(key) {
     return true;
   }
 
+  // Dies where the real client would crash or be killed from outside: no
+  // SessionEnd, no warning, just a pty that stops. The only thing that notices
+  // is the server's pump reaching EOF.
+  if (key === "k") {
+    try {
+      unlinkSync(socketPath);
+    } catch {
+      // Never opened.
+    }
+    process.exit(1);
+  }
+
   return false;
 }
 
@@ -309,12 +405,10 @@ process.stdin.on("data", (chunk) => {
       pasting += text.slice(0, end);
       text = text.slice(end + PASTE_END.length);
 
-      // A client still drawing itself queues the paste out of the input box; a
-      // modal owns the keyboard and drops it. Both are the real client's
-      // behaviour, and neither puts the text anywhere Enter can submit it.
-      if (booting) {
-        queued = pasting.replace(/\n/g, " ").slice(0, 60);
-      } else if (!modal) {
+      // Nothing the server sends arrives this way any more — this is a person
+      // pasting into the terminal pane. A client still drawing itself, or one
+      // with a modal up, has nowhere to put it.
+      if (!booting && !modal) {
         buffer = pasting;
         shown =
           pasting.length > 200
@@ -355,6 +449,11 @@ process.stdin.on("data", (chunk) => {
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(signal, () => {
+    try {
+      unlinkSync(socketPath);
+    } catch {
+      // Never opened, or already gone.
+    }
     hook("SessionEnd", { reason: signal }).finally(() => process.exit(0));
   });
 }

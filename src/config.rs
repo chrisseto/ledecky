@@ -44,27 +44,19 @@ pub struct Settings {
     /// the watcher saying otherwise. A backstop, not the mechanism.
     pub head_ttl: u64,
 
-    /// How long the TUI needs, in milliseconds, before it will accept pasted
-    /// input.
-    pub ready_delay: u64,
-
     /// How long to wait, in milliseconds, for any hook to come back before
     /// concluding our hook URLs are not reaching us — which is what the card's
     /// "misconfigured" state reports, most often an `allowedHttpHookUrls`
     /// allowlist that does not name us.
     pub hook_grace: u64,
 
-    /// How long, in milliseconds, a resumed session has to prove itself one way
-    /// or the other.
-    pub resume_timeout: u64,
+    /// How long, in milliseconds, a starting session has to report its inbox
+    /// socket before it is taken to be blocked on a dialog.
+    pub startup_timeout: u64,
 
     /// How long, in milliseconds, a requested dialog has to paint before the
     /// watcher gives up on it.
     pub dialog_grace: u64,
-
-    /// How often, in milliseconds, to re-check the input box while landing a
-    /// paste.
-    pub paste_poll: u64,
 }
 
 impl Default for Settings {
@@ -76,33 +68,33 @@ impl Default for Settings {
             agent_env: HashMap::new(),
             watch_debounce: 250,
             head_ttl: 30_000,
-            ready_delay: 2500,
             hook_grace: 15_000,
-            resume_timeout: 5000,
+            startup_timeout: 5000,
             dialog_grace: 5000,
-            paste_poll: 150,
         }
     }
 }
 
 /// The waits the agent plumbing makes in real time.
 ///
-/// Bundled and `Copy` because `deliver_opening_prompt` runs on a detached
-/// thread and `Settings` is neither. Every one of these is overridable for the
-/// same reason every other wait here is: so the end-to-end suite does not have
-/// to wait in real time.
+/// Bundled and `Copy` because `watch_startup` runs on a detached thread and
+/// `Settings` is neither. Every one of these is overridable for the same reason
+/// every other wait here is: so the end-to-end suite does not have to wait in
+/// real time.
 #[derive(Debug, Clone, Copy)]
 pub struct Timings {
-    pub ready_delay: Duration,
     pub hook_grace: Duration,
-    pub resume_timeout: Duration,
+    pub startup_timeout: Duration,
     pub dialog_grace: Duration,
-    pub paste_poll: Duration,
 }
 
 impl Settings {
     /// Reads the settings, filling in the one default that depends on another.
-    pub fn from(figment: &Figment) -> Result<Self, rocket::figment::Error> {
+    ///
+    /// NB: the error is boxed. `figment::Error` carries its whole profile and
+    /// metadata chain, which makes it several hundred bytes wide in a `Result`
+    /// that is almost always `Ok`.
+    pub fn from(figment: &Figment) -> Result<Self, Box<rocket::figment::Error>> {
         let mut settings: Self = figment.extract()?;
         settings
             .data_dir
@@ -120,11 +112,9 @@ impl Settings {
     /// The real-time waits, as durations.
     pub fn timings(&self) -> Timings {
         Timings {
-            ready_delay: Duration::from_millis(self.ready_delay),
             hook_grace: Duration::from_millis(self.hook_grace),
-            resume_timeout: Duration::from_millis(self.resume_timeout),
+            startup_timeout: Duration::from_millis(self.startup_timeout),
             dialog_grace: Duration::from_millis(self.dialog_grace),
-            paste_poll: Duration::from_millis(self.paste_poll),
         }
     }
 
@@ -199,11 +189,9 @@ mod tests {
         // The defaults are the constants these replaced, so an unconfigured
         // server behaves exactly as it did before they were overridable.
         let t = s.timings();
-        assert_eq!(t.ready_delay, Duration::from_millis(2500));
         assert_eq!(t.hook_grace, Duration::from_secs(15));
-        assert_eq!(t.resume_timeout, Duration::from_secs(5));
+        assert_eq!(t.startup_timeout, Duration::from_secs(5));
         assert_eq!(t.dialog_grace, Duration::from_secs(5));
-        assert_eq!(t.paste_poll, Duration::from_millis(150));
     }
 
     #[test]

@@ -33,13 +33,9 @@ head_ttl = 30000
 # so deleting any of these changes nothing. The end-to-end suite overrides them
 # with `LEDECKY_*` so it does not have to wait in real time.
 #
-#   ready_delay    how long to hold off before offering the TUI a paste
-#   hook_grace     how long to wait for any hook before reporting misconfigured
-#   resume_timeout how long a resumed session has to prove itself
-#   dialog_grace   how long a requested dialog has to paint
-#   paste_poll     how often to re-check the input box while landing a paste
-ready_delay = 2500
+#   hook_grace      how long to wait for any hook before reporting misconfigured
+#   startup_timeout how long a starting session has to report its inbox socket
+#   dialog_grace    how long a requested dialog has to paint
 hook_grace = 15000
-resume_timeout = 5000
+startup_timeout = 5000
 dialog_grace = 5000
-paste_poll = 150

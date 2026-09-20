@@ -296,7 +296,7 @@ impl Scope {
 
         // Newest first. Ties keep the order above, which puts a turn ahead of
         // the commit it captured.
-        points.sort_by(|a, b| b.0.cmp(&a.0));
+        points.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
         out.extend(points.into_iter().map(|(_, entry)| entry));
 
         out.push(Entry {
@@ -317,7 +317,7 @@ fn truncate(subject: &str) -> String {
     const MAX: usize = 42;
 
     match subject.char_indices().nth(MAX) {
-        Some((cut, _)) => format!("{}…", &subject[..cut].trim_end()),
+        Some((cut, _)) => format!("{}…", subject[..cut].trim_end()),
         None => subject.to_owned(),
     }
 }

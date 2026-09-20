@@ -1,12 +1,14 @@
-//! Running `claude` against a card: the pty, the session lifecycle, and the
-//! hooks it calls back on.
+//! Running `claude` against a card: the pty, the registry that owns the live
+//! agents and their state, and the hooks they call back on.
 
 pub mod agent;
-pub mod session;
+pub mod manager;
+pub mod messaging;
 pub mod terminal;
 pub mod webhooks;
 
-pub use agent::{Agent, Agents};
+pub use agent::Agent;
+pub use manager::AgentManager;
 
 /// Every route this domain serves.
 pub fn routes() -> Vec<rocket::Route> {
@@ -19,5 +21,6 @@ pub fn routes() -> Vec<rocket::Route> {
         terminal::merge,
         terminal::socket,
         webhooks::receive,
+        webhooks::session_start,
     ]
 }

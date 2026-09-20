@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use minijinja::context;
 use rocket::form::Form;
@@ -7,7 +8,7 @@ use rocket::http::Status;
 use rocket::serde::Serialize;
 use rocket::{get, post, State};
 
-use crate::agent::Agents;
+use crate::agent::{messaging, AgentManager};
 use crate::config::Settings;
 use crate::db::Db;
 use crate::git;
@@ -633,7 +634,7 @@ pub fn toggle_viewed(
 #[post("/cards/<id>/review", data = "<form>")]
 pub fn submit_review(
     db: &State<Db>,
-    agents: &State<Agents>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -649,13 +650,17 @@ pub fn submit_review(
     };
 
     if !drafts.is_empty() {
-        let agent = agents
-            .get(id)
-            .filter(|a| a.is_running())
+        let inbox = manager
+            .running(id)
+            .and_then(|agent| agent.inbox())
             .ok_or(Status::Conflict)?;
 
-        // A busy terminal means a modal is up; leave the drafts alone to retry.
-        if !agent.inject(&format_review(&drafts, &scope.label())) {
+        // NB: a dialog holding the terminal is no longer a reason this fails —
+        // the session reads its inbox between tool calls. What is left is the
+        // socket itself, so leave the drafts alone to be retried.
+        let message = format_review(&drafts, &scope.label());
+        if let Err(err) = messaging::send(&inbox, &message) {
+            warn!("card {id}: sending the review failed: {err:#}");
             return Err(Status::Conflict);
         }
 

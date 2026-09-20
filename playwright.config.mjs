@@ -28,9 +28,10 @@ export const AGENT_TIMINGS = {
   // The stand-in's own knob, handed to it through the server's `agent_env`
   // rather than left to leak in by process inheritance.
   LEDECKY_AGENT_ENV: '{FAKE_AGENT_BOOT_MS="250"}',
-  LEDECKY_READY_DELAY: "150",
-  LEDECKY_PASTE_POLL: "25",
-  LEDECKY_RESUME_TIMEOUT: "2000",
+  // How long a starting session has to report its inbox socket. Comfortably
+  // past the stand-in's boot window, because a card that has merely not
+  // finished starting must not be reported as waiting on a dialog.
+  LEDECKY_STARTUP_TIMEOUT: "2000",
   // Left near its default: nothing asserts the misconfigured state, it sleeps
   // on a background thread so it costs no wall clock, and shrinking it would
   // invent a new flake where a slow first hook trips it mid-assertion.

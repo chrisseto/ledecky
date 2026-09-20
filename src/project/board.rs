@@ -1,18 +1,20 @@
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use minijinja::context;
 use rocket::form::Form;
 use rocket::http::Status;
 use rocket::response::Redirect;
 use rocket::{get, post, State};
 
-use crate::agent::{session, Agents};
+use crate::agent::AgentManager;
 use crate::config::Settings;
 use crate::db::Db;
 use crate::events::{Changes, Kind};
 use crate::git;
-use crate::hooks::HookAuth;
-use crate::project::{AgentState, Card, CardEdit, Lane, NewCard, Project};
+use crate::project::lifecycle;
+use crate::project::{Card, CardEdit, Lane, NewCard, Project};
 use crate::review::{self, DiffCache, Turn};
 use crate::tmpl::Tmpl;
 use crate::watch::Worktrees;
@@ -424,15 +426,16 @@ pub struct MoveForm {
 #[post("/cards/<id>/move", data = "<form>")]
 pub fn move_card(
     db: &State<Db>,
-    agents: &State<Agents>,
-    auth: &State<HookAuth>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     changes: &State<Changes>,
     worktrees: &State<Worktrees>,
     id: i64,
     form: Form<MoveForm>,
 ) -> Result<Status, Status> {
-    relane(db, agents, auth, settings, changes, worktrees, id, &form.lane, form.index)?;
+    relane(
+        db, manager, settings, changes, worktrees, id, &form.lane, form.index,
+    )?;
     Ok(Status::NoContent)
 }
 
@@ -440,22 +443,25 @@ pub fn move_card(
 #[post("/cards/<id>/lane", data = "<form>")]
 pub fn move_card_to_lane(
     db: &State<Db>,
-    agents: &State<Agents>,
-    auth: &State<HookAuth>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     changes: &State<Changes>,
     worktrees: &State<Worktrees>,
     id: i64,
     form: Form<MoveForm>,
 ) -> Result<Redirect, Status> {
-    relane(db, agents, auth, settings, changes, worktrees, id, &form.lane, form.index)?;
+    relane(
+        db, manager, settings, changes, worktrees, id, &form.lane, form.index,
+    )?;
     Ok(Redirect::to(format!("/cards/{id}")))
 }
 
+/// NB: the arguments are its two callers' request guards, passed straight
+/// through; see the note on `webhooks::receive`.
+#[allow(clippy::too_many_arguments)]
 fn relane(
     db: &State<Db>,
-    agents: &State<Agents>,
-    auth: &State<HookAuth>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     changes: &State<Changes>,
     worktrees: &State<Worktrees>,
@@ -475,9 +481,9 @@ fn relane(
     // Entering In Progress is what creates the worktree and starts the agent.
     // Re-entering it with a live agent is a no-op.
     if lane == Lane::InProgress && card.lane != Lane::InProgress {
-        if let Err(err) = session::start(db, agents, auth, settings, changes, worktrees, id) {
+        if let Err(err) = lifecycle::start(manager, settings, worktrees, id) {
             error!("card {id}: {err:#}");
-            session::set_state(db, changes, id, AgentState::Error);
+            manager.failed(id);
         }
     }
 
@@ -487,7 +493,7 @@ fn relane(
 #[post("/cards/<id>/delete")]
 pub fn delete_card(
     db: &State<Db>,
-    agents: &State<Agents>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     changes: &State<Changes>,
@@ -499,7 +505,7 @@ pub fn delete_card(
         Card::find(&conn, id).ok_or(Status::NotFound)?.project_id
     };
 
-    session::teardown(db, agents, settings, cache, changes, worktrees, id);
+    lifecycle::teardown(manager, settings, cache, worktrees, id);
     Card::delete(&db.lock(), id).map_err(|_| Status::InternalServerError)?;
     changes.project(project_id, Kind::Board);
 

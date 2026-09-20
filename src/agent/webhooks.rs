@@ -1,37 +1,81 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{post, State};
 use serde_json::{json, Value};
 
-use crate::agent::{session, Agents};
+use crate::agent::messaging::Inbox;
+use crate::agent::AgentManager;
 use crate::config::Settings;
 use crate::db::Db;
-use crate::events::{Changes, Kind};
-use crate::hooks::HookAuth;
-use crate::project::{AgentState, Card, Lane, Project};
+use crate::events::Kind;
+use crate::project::lifecycle;
+use crate::project::{Card, Project};
 use crate::review::{DiffCache, Turn};
 use crate::watch::Worktrees;
+
+/// Receives a session's inbox socket, reported by the `SessionStart` hook.
+///
+/// NB: off `/hooks` on purpose. This is posted by a re-execution of this binary
+/// (`hooks::dispatch`), not by Claude Code, so it carries none of the turn
+/// payload the others share — and it must not be recorded as a hook event,
+/// because its arrival proves only that *we* can reach ourselves. Whether Claude
+/// Code's own HTTP hooks land is the separate question `watch_startup` asks.
+#[post("/inbox/<token>/<card_id>", data = "<payload>")]
+pub fn session_start(
+    manager: &State<Arc<AgentManager>>,
+    token: &str,
+    card_id: i64,
+    payload: Json<Value>,
+) -> Result<Json<Value>, Status> {
+    if !manager.verify(token) {
+        return Err(Status::Forbidden);
+    }
+
+    let socket = payload
+        .get("socket")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if socket.is_empty() {
+        return Err(Status::BadRequest);
+    }
+
+    if let Some(agent) = manager.running(card_id) {
+        agent.set_inbox(Inbox {
+            socket: socket.to_owned(),
+            token: payload
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+
+    Ok(Json(json!({})))
+}
 
 /// Receives Claude Code's HTTP hooks. Always answers 200 with an empty decision:
 /// a hook that blocks or errors would stall the agent, and nothing here is worth
 /// interrupting a turn for.
+// NB: every parameter below the token is a Rocket request guard, which is how
+// the framework injects managed state. Grouping them to please the lint would
+// mean a hand-written `FromRequest` whose only purpose is a smaller signature.
+#[allow(clippy::too_many_arguments)]
 #[post("/hooks/<token>/<card_id>/<event>", data = "<payload>")]
 pub fn receive(
     db: &State<Db>,
-    agents: &State<Agents>,
-    auth: &State<HookAuth>,
+    manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
-    changes: &State<Changes>,
     worktrees: &State<Worktrees>,
     token: &str,
     card_id: i64,
     event: &str,
     payload: Json<Value>,
 ) -> Result<Json<Value>, Status> {
-    if !auth.matches(token) {
+    if !manager.verify(token) {
         return Err(Status::Forbidden);
     }
 
@@ -60,20 +104,20 @@ pub fn receive(
     }
 
     match event {
-        "prompt" => session::resume(db, changes, card_id),
+        "prompt" => manager.turn_started(card_id),
         // NB: a tool permission, a question, a plan to approve and an MCP
         // elicitation all arrive here — which is why the card says "needs you"
         // rather than naming one of them. Nothing reports the answer, so the
         // terminal watcher is armed here and clears the card once the dialog
         // leaves the screen.
         "needs-user" => {
-            session::await_user(db, changes, card_id);
-            if let Some(agent) = agents.get(card_id) {
+            manager.needs_user(card_id);
+            if let Some(agent) = manager.running(card_id) {
                 agent.expect_dialog();
             }
         }
-        "stop" => on_stop(db, agents, settings, cache, changes, worktrees, card_id, &payload),
-        "end" => session::set_state(db, changes, card_id, AgentState::Stopped),
+        "stop" => on_stop(db, manager, settings, cache, worktrees, card_id, &payload),
+        "end" => manager.session_ended(card_id),
         _ => {}
     }
 
@@ -82,14 +126,14 @@ pub fn receive(
 
 fn on_stop(
     db: &Db,
-    agents: &Agents,
+    manager: &Arc<AgentManager>,
     settings: &Settings,
     cache: &DiffCache,
-    changes: &Changes,
     worktrees: &Worktrees,
     card_id: i64,
     payload: &Value,
 ) {
+    let changes = manager.changes();
     let last_message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
@@ -107,21 +151,12 @@ fn on_stop(
         return;
     }
 
-    session::set_state(db, changes, card_id, AgentState::Idle);
-
-    let conn = db.lock();
-    let lane = Card::find(&conn, card_id).map(|c| c.lane);
-    if lane == Some(Lane::InProgress) {
-        Card::set_lane(&conn, card_id, Lane::InReview);
-        drop(conn);
-        changes.card(db, card_id, Kind::Board);
-    } else {
-        drop(conn);
-    }
+    // The state and the lane it implies, under one lock.
+    manager.turn_ended(card_id);
 
     // Last, so that a merge landing this turn overrides the lane and state set
     // above with Done and a torn-down worktree.
-    session::check_merge(db, agents, settings, cache, changes, worktrees, card_id);
+    lifecycle::check_merge(manager, settings, cache, worktrees, card_id);
 }
 
 /// A non-empty `background_tasks` means the turn ended but work is still in

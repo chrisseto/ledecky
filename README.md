@@ -103,18 +103,26 @@ Clicking away saves it as a draft. *Send N to
 agent* formats the batch into one message and pastes it into the agent's
 terminal.
 
-**Talking to the terminal.** Every message the server sends the agent — the
-opening task, a review — goes in as a bracketed paste, because the TUI reads a
-bare newline as *submit*. Nothing is sent until the input box is actually on
-screen, and the submit key is not sent until the paste is visibly in it: a
-client still starting up *queues* what it is handed, somewhere the box is not
-and Enter cannot reach, and a dialog — the workspace-trust prompt, the
-`bypassPermissions` consent — swallows it, where a blind Enter would answer the
-dialog instead. Delivery is confirmed by watching the box let go of the text,
-so "sent" means sent.
+**Talking to the agent.** Nothing the server sends is typed at the terminal.
+The opening task is a command-line argument, so it is the user's own prompt and
+the session names itself from it; the client holds it behind the workspace-trust
+and `bypassPermissions` dialogs and submits it once they are answered. Anything
+later — a review batch, a merge request — goes to the session's inbox socket,
+whose path it reports through a `SessionStart` hook. That event is the only
+place `CLAUDE_CODE_MESSAGING_SOCKET` is exported, and only to a `command`
+handler, so the hook runs `ledecky hook session-start <url>` — this same binary,
+re-executed, posting the socket back to `/inbox` and exiting. Running ourselves
+rather than `curl` keeps the hook free of anything that has to be installed
+where the agent runs. It needs claude 2.1.224 or newer.
 
-The same screen answers a question the hooks cannot. `Notification` says a dialog
-is coming — a tool permission, a question, a plan to approve, an MCP server
+A message that arrives this way is framed to the agent as coming from another
+session rather than from the user — right for relayed review comments, which is
+why the opening task does not take the same road. The session reads its inbox
+between tool calls, so a dialog holding the keyboard no longer blocks a review
+from landing.
+
+The screen still answers one question the hooks cannot. `Notification` says a
+dialog is coming — a tool permission, a question, a plan to approve, an MCP server
 asking for input — which is why the card says `needs you` rather than naming one
 of them. It is matched down to those types: `idle_prompt` is the same event and
 would light up every idle card a minute after it went quiet. `PermissionRequest`
@@ -171,7 +179,7 @@ variable:
 | --- | --- | --- |
 | `app_slug` | `ledecky` | Names the data directory and the `refs/<slug>/` namespace |
 | `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
-| `agent_bin` | `claude` | The executable spawned for an agent |
+| `agent_bin` | `claude` | The executable spawned for an agent. 2.1.224 or newer, for the inbox socket |
 | `watch_debounce` | `250` | How long a burst of worktree writes settles before the diff is announced, in ms |
 | `head_ttl` | `30000` | How long a staged worktree head stands without the watcher, in ms |
 
@@ -207,12 +215,24 @@ Code is grouped by domain rather than by kind, so a change usually lands in one
 folder:
 
 ```
-src/project/   project.rs card.rs board.rs   models, their SQL, their routes
-src/agent/     agent.rs session.rs terminal.rs webhooks.rs
+src/project/   project.rs card.rs board.rs lifecycle.rs
+src/agent/     agent.rs manager.rs messaging.rs terminal.rs webhooks.rs
 src/review/    turn.rs comment.rs scope.rs expand.rs viewed.rs
                diff.rs ansi.rs cache.rs routes.rs
 src/           config.rs db.rs git.rs hooks.rs tmpl.rs
 ```
+
+Within `agent/` the split is mechanism from ownership. `agent.rs` knows about a
+pty, a screen and a process, and imports neither the database nor the event bus:
+the pump reports what it sees — a dialog leaving the screen, the pty closing —
+through a `Watcher` it holds a `Weak` to, rather than calling anything. The
+manager on the other end owns the registry of live agents and is the only writer
+of a card's `agent_state`.
+
+`project/lifecycle.rs` is the card's arc — giving it a worktree and an agent,
+and retiring it once its work lands. Those cross git, the diff cache and the
+worktree watcher at once, which is why they sit above the manager rather than
+inside it; `teardown`'s other caller deletes a card and involves no agent at all.
 
 `board.rs` owns the shell every page is: `Shell::render` draws the board and
 whatever overlay a route asked for, so there is one template for the whole app
@@ -246,7 +266,7 @@ git -C <project> for-each-ref --format='%(refname)' 'refs/ledecky/**' |
 ## Tests
 
 ```sh
-cargo test     # diff parsing, paste-needle selection, scope round-tripping
+cargo test     # diff parsing, dialog detection, scope round-tripping
 pnpm e2e       # end-to-end, in a real browser
 pnpm e2e:ui    # the same, in Playwright's interactive runner
 pnpm e2e:trace # the same, retried once with a trace and an HTML report
@@ -257,7 +277,7 @@ The suite runs four workers, each with a server, a database and a scratch
 repository of its own, so no spec depends on another's state or on file order.
 `tests/support/fixtures.mjs` owns that; `tests/support/server.mjs` builds and
 starts the binary. The waits the agent plumbing makes in real time are settings
-(`ready_delay`, `dialog_grace` and friends in `Rocket.toml`), which is what
+(`startup_timeout`, `dialog_grace` and friends in `Rocket.toml`), which is what
 keeps a run in seconds rather than minutes — see `AGENT_TIMINGS` in
 `playwright.config.mjs`.
 
@@ -276,17 +296,28 @@ puts it somewhere you choose (and leaves it to you to delete).
 ### The fake agent
 
 `tests/fake-agent.mjs` stands in for `claude`, selected through
-`LEDECKY_AGENT_BIN`. It imitates only what the app couples to: an input box at
-the bottom of the screen, a startup window with no box at all where anything
-sent is queued out of its reach, bracketed-paste handling that collapses long
-pastes, a modal that swallows pastes and reads a bare Enter as "exit", and the
-HTTP hooks named in its own `--settings`. That makes worktrees, turn snapshots,
-lane transitions, review submission and merge deterministic and free to run.
+`LEDECKY_AGENT_BIN`. It imitates only what the app couples to: an opening task
+taken as a positional argument and held while a modal is up, an inbox socket
+whose path it reports by running the `SessionStart` command hook out of its own
+`--settings` — whatever that command is, which is how the real handshake gets
+covered without the stand-in knowing anything about it — a startup window where it has drawn nothing and reported nothing,
+an input box at the bottom of the screen, a modal that owns the keyboard and
+reads a bare Enter as "exit", and the HTTP hooks named in that same
+`--settings`. That makes worktrees, turn snapshots, lane transitions, review
+submission and merge deterministic and free to run.
 
-`tests/modals.spec.mjs` is the regression guard worth knowing about: injection
-must verify its own paste landed before sending Enter, because a modal would
-otherwise be answered by it. Both it and the JS-boot coverage were checked by
-reintroducing the original bugs and confirming the suite goes red.
+Its dialogs are deliberately drawn the way the real client draws them, which
+means the startup ones do **not** number their options. Numbering them is what
+hid a bug where the workspace-trust prompt read as an input box and the card sat
+in `starting` with nobody told there was anything to answer.
+
+Two regression guards are worth knowing about. `tests/modals.spec.mjs`: a card
+behind a consent dialog has to report `needs you` and stay untouched, and the
+task has to arrive on its own once the dialog is answered.
+`tests/death.spec.mjs`: an agent killed without a `SessionEnd` — the stand-in
+dies on `k` for this — still has to stop its card, because the pty reaching EOF
+is the only notice anyone gets. Both were checked by reintroducing the bug and
+confirming the suite goes red.
 
 `pnpm e2e tests/screenshots.spec.mjs` writes `tests/.shots/` for eyeballing the
 UI. The dev shell supplies fonts so that rendering is representative; without

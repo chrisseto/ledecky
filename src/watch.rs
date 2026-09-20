@@ -442,11 +442,12 @@ fn install(watcher: &mut RecommendedWatcher, watched: &mut HashSet<PathBuf>, dir
 /// have every diff request announce a change, and the client's answering
 /// request announce another, forever.
 fn changed_content(kind: &EventKind) -> bool {
-    match kind {
-        EventKind::Create(_) | EventKind::Remove(_) => true,
-        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any) => true,
-        _ => false,
-    }
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any)
+    )
 }
 
 fn is_git_internal(path: &Path) -> bool {

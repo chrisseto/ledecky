@@ -1,3 +1,9 @@
+// Each entity lives in the file it is named for — `Card` in `card.rs`, `Project`
+// in `project.rs`, `Agent` in `agent.rs` — which collides with the domain folder
+// for the two whose name matches it. The convention is the point; see Layout in
+// README.md.
+#![allow(clippy::module_inception)]
+
 #[macro_use]
 extern crate rocket;
 
@@ -13,14 +19,38 @@ mod review;
 mod tmpl;
 mod watch;
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use rocket::fairing::AdHoc;
 use rocket::figment::providers::Env;
 
 use crate::config::Settings;
 
-#[launch]
-fn rocket() -> _ {
+/// NB: hooks are checked before anything else runs. The `SessionStart` hook
+/// re-executes this binary (`hooks::dispatch`), and that process must not open
+/// the database, sweep orphans or bind a port on its way to sending one request.
+#[rocket::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(result) = hooks::dispatch(&args) {
+        if let Err(err) = result {
+            eprintln!("ledecky hook: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // NB: reported and exited rather than returned. `rocket::Error` is large
+    // enough that returning it from `main` is a lint of its own, and the
+    // `Debug` rendering a returned `Err` gets is worse than this anyway.
+    if let Err(err) = rocket().launch().await {
+        eprintln!("ledecky: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn rocket() -> rocket::Rocket<rocket::Build> {
     // Rocket's own figment reads `Rocket.toml` and `ROCKET_*`; layering
     // `LEDECKY_*` on top gives this app's keys an override that reads naturally
     // and does not collide with Rocket's.
@@ -39,13 +69,20 @@ fn rocket() -> _ {
         .context("loading templates")
         .unwrap_or_else(|err| panic!("{err:#}"));
 
-    // A previous run may have been killed without getting to its shutdown hook.
-    agent::session::sweep_orphans(&db, &settings);
-
-    // The watcher needs its own handles on both, so they are built here rather
-    // than inline in `manage`.
+    // The watcher and the manager need their own handles on these, so they are
+    // built here rather than inline in `manage`.
     let cache = review::DiffCache::default();
     let changes = events::Changes::default();
+
+    let manager = agent::AgentManager::new(
+        db.clone(),
+        changes.clone(),
+        hooks::HookAuth::new(),
+        settings.clone(),
+    );
+
+    // A previous run may have been killed without getting to its shutdown hook.
+    manager.sweep_orphans();
     let worktrees = watch::Worktrees::new(
         cache.clone(),
         changes.clone(),
@@ -56,9 +93,8 @@ fn rocket() -> _ {
         .manage(settings)
         .manage(db)
         .manage(templates)
-        .manage(agent::Agents::default())
+        .manage(Arc::clone(&manager))
         .manage(cache)
-        .manage(hooks::HookAuth::new())
         .manage(changes)
         .manage(worktrees)
         .mount("/static", assets::routes())
@@ -66,27 +102,15 @@ fn rocket() -> _ {
         .mount("/", project::routes())
         .mount("/", agent::routes())
         .mount("/", review::routes())
-        // The bound port is only known here: `port = 0` asks for a free one,
-        // and hook URLs have to name the one agents can actually reach.
-        .attach(AdHoc::on_liftoff("hook port", |rocket| {
+        // Binds the hook port on liftoff and takes the agents down on shutdown.
+        .attach(manager)
+        .attach(AdHoc::on_liftoff("banner", |rocket| {
             Box::pin(async move {
                 let config = rocket.config();
-                if let Some(auth) = rocket.state::<hooks::HookAuth>() {
-                    auth.bind(config.port);
-                }
                 println!(
                     "ledecky listening on http://{}:{}",
                     config.address, config.port
                 );
-            })
-        }))
-        // Live agents are children of this process; leaving them behind on exit
-        // would strand worktrees with nothing driving them.
-        .attach(AdHoc::on_shutdown("kill agents", |rocket| {
-            Box::pin(async move {
-                if let Some(agents) = rocket.state::<agent::Agents>() {
-                    agents.shutdown();
-                }
             })
         }))
 }
