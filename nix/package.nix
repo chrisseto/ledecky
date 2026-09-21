@@ -65,7 +65,7 @@ rustPlatform.buildRustPackage {
   pnpmDeps = fetchPnpmDeps {
     inherit pname version src pnpmInstallFlags;
     fetcherVersion = 4;
-    hash = "sha256-XTWY1HA7VK7vzzQ6+2CTOb/PwS6ZsVqmea+ekGy+gBI=";
+    hash = "sha256-AgCEqQxVclyHvKFmZyWPNFYmCaLfGnHTQT99FS72XU0=";
   };
 
   # `pnpmConfigHook` lands `node_modules`, and `build.rs` bundles out of it into
