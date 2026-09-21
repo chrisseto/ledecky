@@ -21,7 +21,10 @@
 //     the server reads the last rows to tell a dialog from an input box;
 //   * the HTTP hooks named in its own --settings argument;
 //   * naming itself after its first prompt, as a metadata line in its
-//     transcript — which is where the server reads the card's title from.
+//     transcript — which is where the server reads the card's title from;
+//   * a permission mode recorded in its transcript, which `--resume` without
+//     --permission-mode picks back up. `[mode:<name>]` in a prompt changes it,
+//     standing in for shift+tab or approving a plan.
 //
 // Each submitted prompt appends a line to main.rs so turn snapshots have
 // something to capture, and the merge prompt is understood well enough to move
@@ -62,7 +65,6 @@ const openingTask = separator >= 0 ? argv[separator + 1] : undefined;
 const settings = JSON.parse(flag("--settings") ?? "{}");
 const hookUrl = (event) => settings.hooks?.[event]?.[0]?.hooks?.[0]?.url;
 const repo = flag("--add-dir");
-const permissionMode = flag("--permission-mode") ?? "default";
 const resuming = flag("--resume");
 const sessionId = resuming ?? `fake-${process.pid}`;
 
@@ -78,6 +80,21 @@ if (resuming && !existsSync(transcriptPath)) {
 }
 mkdirSync(SESSIONS, { recursive: true });
 appendFileSync(transcriptPath, `${JSON.stringify({ session: sessionId })}\n`);
+
+/** The mode this session was last in, as its transcript recorded it. */
+function recordedMode() {
+  return readFileSync(transcriptPath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line).permissionMode)
+    .filter(Boolean)
+    .at(-1);
+}
+
+let permissionMode = flag("--permission-mode") ?? recordedMode() ?? "default";
+const recordMode = () =>
+  appendFileSync(transcriptPath, `${JSON.stringify({ type: "mode", permissionMode })}\n`);
+recordMode();
 
 // NB: in the system temp dir rather than under the card, because a unix socket
 // path is capped near 100 bytes and the suite's data directories are long.
@@ -281,6 +298,12 @@ async function submit(prompt) {
         sessionId,
       })}\n`,
     );
+  }
+
+  const mode = prompt.match(/\[mode:(\w+)\]/)?.[1];
+  if (mode) {
+    permissionMode = mode;
+    recordMode();
   }
 
   await hook("UserPromptSubmit", { prompt });

@@ -4,7 +4,8 @@ import { SLOW } from "../playwright.config.mjs";
 
 import { expect, test } from "./support/fixtures.mjs";
 
-import { addCard, addProject, cardIn, moveCard, openCard, turnRefs } from "./support/board.mjs";
+import { addCard, addProject, cardIn, moveCard, openAgent, openCard, turnRefs } from "./support/board.mjs";
+import { terminalRows } from "./support/dom.mjs";
 import { DATA_HOME } from "./support/paths.mjs";
 
 test.describe.configure({ mode: "serial" });
@@ -51,4 +52,30 @@ test("a card whose session has gone starts a fresh one", async ({ page }) => {
 
   // It got its task in again, which it could not have done had the resume stuck.
   await expect.poll(() => turnRefs(cardId).length, { timeout: SLOW }).toBe(2);
+});
+
+/**
+ * A card's permission mode seeds its first session only. A plan-mode card whose
+ * plan was approved has left plan mode, and restarting it must not put it back.
+ */
+test("a resumed session keeps the mode it was last in", async ({ page }) => {
+  const title = "Leave plan mode behind";
+  await addCard(page, projectUrl, {
+    title,
+    description: "[mode:acceptEdits]",
+    base: "main",
+    permissions: "plan",
+  });
+  const id = await cardIn(page, "todo", title).getAttribute("data-card-id");
+
+  await moveCard(page, id, "in_progress");
+  await expect.poll(() => turnRefs(id).length, { timeout: SLOW }).toBe(1);
+
+  await openCard(page, id);
+  await page.getByRole("button", { name: "Stop agent" }).click();
+  await expect(page.getByRole("button", { name: "Start agent" })).toBeVisible({ timeout: SLOW });
+  await page.getByRole("button", { name: "Start agent" }).click();
+
+  await openAgent(page, id);
+  await expect(terminalRows(page)).toContainText("mode acceptEdits", { timeout: SLOW });
 });

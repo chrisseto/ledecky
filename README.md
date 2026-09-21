@@ -192,7 +192,8 @@ Per-card permission mode and model are set on the new-card form, whose one Task
 field doubles as the card's title: the first line names the card, the whole
 thing is what the agent is told. `bypassPermissions` shows a one-time consent
 dialog in the terminal — answer it there; the card reports `needs you` and waits
-in In Review until you do.
+in In Review until you do. The mode only seeds a card's first session; a
+restarted one resumes in whatever mode it was last in, as the client recorded it.
 
 ## Running it as a user service
 

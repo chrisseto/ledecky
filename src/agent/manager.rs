@@ -150,13 +150,21 @@ impl AgentManager {
     /// The command line for a card's agent.
     fn command(&self, card: &Card, worktree: &Path, repo: &Path) -> CommandBuilder {
         let mut cmd = CommandBuilder::new(&self.settings.agent_bin);
-        cmd.arg("--permission-mode");
-        cmd.arg(&card.permission_mode);
         // Restarting a card picks the conversation back up rather than starting
         // over with no memory of the work already done.
-        if let Some(session_id) = &card.session_id {
-            cmd.arg("--resume");
-            cmd.arg(session_id);
+        //
+        // NB: the card's mode only seeds a new session. A resumed one restores
+        // the mode it was last in from its transcript, and passing ours would
+        // override that — putting a card whose plan was approved back in plan.
+        match &card.session_id {
+            Some(session_id) => {
+                cmd.arg("--resume");
+                cmd.arg(session_id);
+            }
+            None => {
+                cmd.arg("--permission-mode");
+                cmd.arg(&card.permission_mode);
+            }
         }
         if let Some(model) = &card.model {
             cmd.arg("--model");
