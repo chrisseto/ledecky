@@ -52,6 +52,15 @@
 
     {# Every file is already on the page, so these only have to jump to one. #}
     <x-file-tree class="tree-body">
+      {% if messages %}
+        <a class="file-node mono" href="#commits">
+          <span class="tick"></span>
+          <span class="name">{{ messages | length }} commit{{ "" if messages | length == 1 else "s" }}</span>
+          {% if message_comments %}
+            <span class="badge" title="comments">{{ message_comments }}</span>
+          {% endif %}
+        </a>
+      {% endif %}
       {% for group in tree %}
         {% if group.dir %}
           <details class="dir" open>
@@ -101,6 +110,18 @@
        from here so it takes its place in the pane's queue — see `app.js` for
        why the lines do not carry it themselves. #}
     <div class="lines" id="diff-lines" hx-sync="#review:replace">
+      {% if messages %}
+        <section class="commits" id="commits">
+          {% for commit in messages %}
+            <header class="file-head">
+              <span class="sha mono" title="{{ commit.sha }}">{{ commit.short }}</span>
+            </header>
+            {% with path = commit.sha %}
+              {% for line in commit.lines %}{% include "_line.html" %}{% endfor %}
+            {% endwith %}
+          {% endfor %}
+        </section>
+      {% endif %}
       {% for file in files %}
         <section class="file" id="file-{{ file.index }}" data-path="{{ file.path }}">
           <header class="file-head">
@@ -164,57 +185,7 @@
                 </div>
               {% else %}
                 {% for line in segment.lines %}
-                  {% set key = file.path ~ "#" ~ line.anchor %}
-                  <div class="line l-{{ line.kind }} {% if comment == key %}commenting{% endif %}"
-                       data-file="{{ file.path }}" data-anchor="{{ line.anchor }}">
-                    <span class="add">+</span>
-                    <span class="n">{{ line.old_line if line.old_line else "" }}</span>
-                    <span class="n">{{ line.new_line if line.new_line else "" }}</span>
-                    <span class="sign"></span>
-                    <span class="code">{{ line.html | safe }}</span>
-                  </div>
-
-                  {% if comment == key %}
-                    <form class="compose" method="post" action="/cards/{{ card.id }}/comments"
-                          hx-post="/cards/{{ card.id }}/comments" hx-target="#review"
-                          hx-swap="outerMorph" hx-sync="#review:replace">
-                      <input type="hidden" name="file_path" value="{{ comment_file }}" />
-                      <input type="hidden" name="side" value="{{ comment_side }}" />
-                      <input type="hidden" name="line" value="{{ comment_line }}" />
-                      <input type="hidden" name="scope" value="{{ scope }}" />
-                      <input type="hidden" name="expand" value="{{ expand }}" />
-                      <textarea name="body" rows="3" data-autofocus
-                                placeholder="Comment on this line — click away to save"></textarea>
-                      {# What Escape and an emptied box both reach for. #}
-                      <a class="cancel" href="{{ comment_base }}" data-cancel-comment
-                         hx-get="{{ comment_base }}" hx-target="#review"
-                         hx-swap="outerMorph" hx-sync="#review:replace">Cancel</a>
-                    </form>
-                  {% endif %}
-
-                  {% if threads[key] %}
-                    <div class="thread">
-                      {% for comment in threads[key] %}
-                        <div class="comment comment-{{ comment.state }}">
-                          <div class="comment-body">{{ comment.body }}</div>
-                          <div class="comment-meta">
-                            {% if comment.state == "draft" %}
-                              <span class="tag">draft</span>
-                              <form method="post"
-                                    action="/cards/{{ card.id }}/comments/{{ comment.id }}/delete"
-                                    hx-post="/cards/{{ card.id }}/comments/{{ comment.id }}/delete" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
-                                <input type="hidden" name="scope" value="{{ scope }}" />
-                                <input type="hidden" name="expand" value="{{ expand }}" />
-                                <button class="link" type="submit">Remove</button>
-                              </form>
-                            {% else %}
-                              <span class="tag tag-sent">sent to agent</span>
-                            {% endif %}
-                          </div>
-                        </div>
-                      {% endfor %}
-                    </div>
-                  {% endif %}
+                  {% with path = file.path %}{% include "_line.html" %}{% endwith %}
                 {% endfor %}
               {% endif %}
             {% endfor %}

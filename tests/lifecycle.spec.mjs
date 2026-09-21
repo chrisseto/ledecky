@@ -276,6 +276,28 @@ test("a commit the agent made is a point of its own in the picker", async ({ pag
   await expect(review.locator(".file-head .path")).toHaveText(["scratch.txt"]);
 });
 
+test("a commit's message is on screen, and takes comments like a diff line", async ({ page }) => {
+  worktreeGit(
+    cardId, "-c", "user.email=a@b.c", "-c", "user.name=a",
+    "commit", "-q", "--allow-empty", "-m", "banner: explain it", "-m", "Why it prints first.",
+  );
+
+  await openCard(page, cardId);
+  const review = page.locator("#review");
+  const commits = review.locator("#commits");
+
+  await expect(commits.locator(".line", { hasText: "banner: explain it" })).toBeVisible();
+  const body = commits.locator(".line", { hasText: "Why it prints first." });
+
+  await comment(page, body, "Say what it prints.");
+  await expect(commits.locator(".comment-draft", { hasText: "Say what it prints." })).toBeVisible();
+  await expect(review.locator('.file-node[href="#commits"] .badge')).toHaveText("1");
+  await expect(review.locator(".batch-label")).toContainText("1 comment pending");
+
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(commits.locator(".comment")).toHaveCount(0);
+});
+
 test("the pane keeps up with the worktree on its own", async ({ page }) => {
   const refetches = pollsOfPath(page, `/cards/${cardId}/diff`);
   await openCard(page, cardId);
@@ -392,8 +414,8 @@ test("the tree jumps to a file instead of reloading the pane", async ({ page }) 
   await page.locator('.file-node[href="#file-1"]').click();
   await expect.poll(top).toBeGreaterThan(0);
 
-  // And back up to the first file.
-  await page.locator('.file-node[href="#file-0"]').click();
+  // And back up to the top, where the card's commits sit above its files.
+  await page.locator('.file-node[href="#commits"]').click();
   await expect.poll(top).toBe(0);
 
   // Both jumps were scrolls, not navigations: the tree left the URL alone.

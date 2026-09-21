@@ -123,9 +123,14 @@ export const fileSection = (page, path) => page.locator(`#review .file[data-path
 export async function comment(page, line, body) {
   await line.click();
   await page.locator(".compose textarea").fill(body);
-  // Blur is the save; the file's own header is the nearest thing that is not a
-  // diff line and cannot scroll out from under the click.
-  await line.locator("xpath=ancestor::section[@class='file']").locator(".file-head .path").click();
+  // Blur is the save; the section's own header is the nearest thing that is not
+  // a line and cannot scroll out from under the click.
+  const file = await line.getAttribute("data-file");
+  await page
+    .locator(`#review section:has(> .line[data-file="${file}"])`)
+    .locator(".file-head .path, .file-head .sha")
+    .first()
+    .click();
 }
 
 /**

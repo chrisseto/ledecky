@@ -382,6 +382,10 @@ pub struct Commit {
     /// Absent on a root commit, which is diffed against the empty tree instead.
     pub parent: Option<String>,
     pub subject: String,
+    /// The whole message, laid out as it was written — so a line number in a
+    /// review is one the agent can find. `subject` is a one-line rendering of
+    /// it and joins a first paragraph that wraps, which is why both are here.
+    pub message: String,
     /// Committer time, which is what interleaves commits with turns.
     pub at: i64,
 }
@@ -394,12 +398,14 @@ const MAX_COMMITS: usize = 50;
 /// Best-effort: a worktree that has gone away simply has no commits to offer.
 pub async fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
     let range = format!("{base}..{head}");
+    // NB: `-z` and unit separators because `%b` spans lines.
     let Ok(out) = run(
         repo,
         &[
             "log",
+            "-z",
             "--no-decorate",
-            "--format=%H%x00%P%x00%ct%x00%s",
+            "--format=%H%x1f%P%x1f%ct%x1f%s%x1f%B",
             &range,
         ],
     )
@@ -408,21 +414,25 @@ pub async fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
         return Vec::new();
     };
 
-    out.lines()
+    out.split('\0')
         .take(MAX_COMMITS)
-        .filter_map(|line| {
-            let mut fields = line.split('\0');
-            let sha = fields.next()?.to_owned();
+        .filter_map(|record| {
+            let mut fields = record.split('\x1f');
+            let sha = fields.next()?.trim().to_owned();
             // `%P` is every parent, space separated; the first is the one a
             // diff of this commit alone is measured against.
             let parent = fields.next()?.split_whitespace().next().map(str::to_owned);
             let at = fields.next()?.parse().ok()?;
-            let subject = fields.next().unwrap_or_default().to_owned();
+            // Both are there whatever the message says: git writes the
+            // separator for an empty field too.
+            let subject = fields.next()?.to_owned();
+            let message = fields.next()?.trim_end().to_owned();
 
             Some(Commit {
                 sha,
                 parent,
                 subject,
+                message,
                 at,
             })
         })
@@ -843,5 +853,51 @@ mod tests {
 
     fn worktree_of(settings: &Settings) -> PathBuf {
         settings.worktree_path(1)
+    }
+
+    /// A review comment names a line of the message, so the lines have to be
+    /// the ones git wrote — `%s` joins a first paragraph that wraps.
+    #[tokio::test]
+    async fn a_commit_carries_its_message_as_it_was_written() {
+        let (_settings, repo) = scratch("messages").await;
+        let base = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        run(&repo, &["commit", "-qam", "banner: land it\nand wrap"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("a.txt"), "three\n").unwrap();
+        run(
+            &repo,
+            &[
+                "commit",
+                "-qam",
+                "banner: explain it\n\nWhy it prints first.",
+            ],
+        )
+        .await
+        .unwrap();
+
+        let listed = commits(&repo, &base, "HEAD").await;
+        let messages: Vec<_> = listed.iter().map(|c| c.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "banner: explain it\n\nWhy it prints first.",
+                "banner: land it\nand wrap"
+            ]
+        );
+        // The picker's label is still the one-line rendering.
+        assert_eq!(listed[1].subject, "banner: land it and wrap");
+
+        // A commit with no message at all is still a commit, and git writes
+        // the empty fields rather than leaving them out.
+        std::fs::write(repo.join("a.txt"), "four\n").unwrap();
+        run(&repo, &["commit", "-qam", "", "--allow-empty-message"])
+            .await
+            .unwrap();
+        let with_empty = commits(&repo, &base, "HEAD").await;
+        assert_eq!(with_empty.len(), 3);
+        assert_eq!(with_empty[0].message, "");
     }
 }

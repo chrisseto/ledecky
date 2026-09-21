@@ -11,6 +11,8 @@ use crate::db::{sql, Db};
 pub enum Side {
     Old,
     New,
+    /// A line of a commit message rather than of the diff.
+    Message,
 }
 
 impl Side {
@@ -18,6 +20,7 @@ impl Side {
         match self {
             Self::Old => "old",
             Self::New => "new",
+            Self::Message => "message",
         }
     }
 
@@ -26,25 +29,28 @@ impl Side {
         match self {
             Self::Old => "before",
             Self::New => "after",
+            Self::Message => "message",
         }
     }
 
     pub fn parse(raw: &str) -> Self {
-        if raw == "old" {
-            Self::Old
-        } else {
-            Self::New
+        match raw {
+            "old" => Self::Old,
+            "message" => Self::Message,
+            _ => Self::New,
         }
     }
 }
 
-/// A review note on one line of a diff.
+/// A review note on one line of a diff, or of a commit message.
 #[derive(Debug, Clone, Serialize)]
 #[serde(crate = "rocket::serde")]
 pub struct Comment {
     pub id: i64,
     pub turn_id: Option<i64>,
+    /// The commit's sha when `side` is `message`.
     pub file_path: String,
+    /// On a message, counted from 1 at the subject.
     pub line: i64,
     pub side: String,
     pub body: String,
@@ -235,14 +241,23 @@ pub fn format_review(drafts: &[Comment], scope: &str) -> String {
     let mut out = format!("Code review on {scope}:\n");
 
     for comment in drafts {
-        let _ = write!(
-            out,
-            "\n{}:{} ({})\n{}\n",
-            comment.file_path,
-            comment.line,
-            Side::parse(&comment.side).describe(),
-            comment.body.trim()
-        );
+        let _ = match Side::parse(&comment.side) {
+            Side::Message => write!(
+                out,
+                "\ncommit {} message, line {}\n{}\n",
+                comment.file_path.chars().take(7).collect::<String>(),
+                comment.line,
+                comment.body.trim()
+            ),
+            side => write!(
+                out,
+                "\n{}:{} ({})\n{}\n",
+                comment.file_path,
+                comment.line,
+                side.describe(),
+                comment.body.trim()
+            ),
+        };
     }
 
     out.push_str("\nAddress each comment, then commit.");
@@ -317,6 +332,7 @@ mod tests {
     fn sides_round_trip_and_default_to_new() {
         assert_eq!(Side::parse("old"), Side::Old);
         assert_eq!(Side::parse("new"), Side::New);
+        assert_eq!(Side::parse("message"), Side::Message);
         // An unexpected value anchors to the post-change side, which is what a
         // reviewer almost always means.
         assert_eq!(Side::parse("sideways"), Side::New);
@@ -336,6 +352,7 @@ mod tests {
         let drafts = vec![
             sample("src/a.rs", 12, "new", "  Hoist this.  "),
             sample("src/b.rs", 4, "old", "Why was this removed?"),
+            sample("c0ffee1234abcd", 1, "message", "Say why, not what."),
         ];
 
         let review = format_review(&drafts, "Turn 2");
@@ -343,6 +360,7 @@ mod tests {
         assert!(review.starts_with("Code review on Turn 2:\n"));
         assert!(review.contains("src/a.rs:12 (after)\nHoist this.\n"));
         assert!(review.contains("src/b.rs:4 (before)\nWhy was this removed?\n"));
+        assert!(review.contains("commit c0ffee1 message, line 1\nSay why, not what.\n"));
         assert!(review.ends_with("Address each comment, then commit."));
     }
 

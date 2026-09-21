@@ -247,6 +247,41 @@ impl Scope {
         }
     }
 
+    /// The agent's commits whose changes this range covers, oldest first.
+    ///
+    /// `commits` is newest first, as `git::commits` lists them.
+    ///
+    /// NB: turns are placed by time, not ancestry. A turn ref is a parallel
+    /// chain that never contains the agent's commits, so the only thing
+    /// relating the two is when each happened — as in `menu`.
+    pub fn commits_in<'a>(&self, turns: &[Turn], commits: &'a [Commit]) -> Vec<&'a Commit> {
+        let at = |n: i64| turns.iter().find(|t| t.n == n).map(|t| t.at);
+        let after = |from: Option<i64>| {
+            commits
+                .iter()
+                .filter(move |c| from.is_none_or(|from| c.at > from))
+        };
+
+        let mut out: Vec<&Commit> = match (&self.anchor, self.mode) {
+            (Anchor::Base, _) => commits.iter().collect(),
+            (Anchor::Live, _) => after(turns.last().map(|t| t.at)).collect(),
+            (Anchor::Turn(n), Mode::Just) => match at(*n) {
+                Some(to) => after(at(n - 1)).filter(|c| c.at <= to).collect(),
+                None => Vec::new(),
+            },
+            (Anchor::Turn(n), Mode::Since) => match at(*n) {
+                Some(from) => after(Some(from)).collect(),
+                None => Vec::new(),
+            },
+            (Anchor::Commit(sha), Mode::Just) => commits.iter().filter(|c| c.sha == *sha).collect(),
+            (Anchor::Commit(sha), Mode::Since) => {
+                commits.iter().take_while(|c| c.sha != *sha).collect()
+            }
+        };
+        out.reverse();
+        out
+    }
+
     /// Every anchor offered for a card, newest first.
     ///
     /// Turns and commits interleave by time rather than sitting in separate
@@ -358,6 +393,7 @@ mod tests {
             sha: sha.into(),
             parent: parent.map(str::to_owned),
             subject: format!("work on {sha}"),
+            message: format!("work on {sha}"),
             at,
         }
     }
@@ -649,6 +685,7 @@ mod tests {
             sha: "abc1234def".into(),
             parent: None,
             subject: "review: stack every file in the diff and evict the agent's message".into(),
+            message: String::new(),
             at: 1,
         }];
 
@@ -656,6 +693,62 @@ mod tests {
         assert_eq!(
             menu[0].label,
             "abc1234 review: stack every file in the diff and e…"
+        );
+    }
+
+    #[test]
+    fn each_range_lists_the_commits_it_covers_oldest_first() {
+        // Turns at 20 and 40; commits either side of each, newest first.
+        let turns = [turn(1, "sha1"), turn(2, "sha2")];
+        let commits = [
+            commit("ddddddd", Some("x"), 50),
+            commit("ccccccc", Some("x"), 40),
+            commit("bbbbbbb", Some("x"), 30),
+            commit("aaaaaaa", Some("x"), 10),
+        ];
+        let shas = |scope: Scope| {
+            scope
+                .commits_in(&turns, &commits)
+                .into_iter()
+                .map(|c| c.sha.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            shas(scope(Mode::Since, Anchor::Base)),
+            ["aaaaaaa", "bbbbbbb", "ccccccc", "ddddddd"]
+        );
+        assert_eq!(shas(scope(Mode::Just, Anchor::Live)), ["ddddddd"]);
+        assert_eq!(shas(scope(Mode::Just, Anchor::Turn(1))), ["aaaaaaa"]);
+        // A commit at the same second as the turn was captured by it.
+        assert_eq!(
+            shas(scope(Mode::Just, Anchor::Turn(2))),
+            ["bbbbbbb", "ccccccc"]
+        );
+        assert_eq!(
+            shas(scope(Mode::Since, Anchor::Turn(1))),
+            ["bbbbbbb", "ccccccc", "ddddddd"]
+        );
+        assert_eq!(
+            shas(scope(Mode::Just, Anchor::Commit("bbbbbbb".into()))),
+            ["bbbbbbb"]
+        );
+        // `bbbbbbb..head` leaves the anchor itself out.
+        assert_eq!(
+            shas(scope(Mode::Since, Anchor::Commit("bbbbbbb".into()))),
+            ["ccccccc", "ddddddd"]
+        );
+        assert!(shas(scope(Mode::Just, Anchor::Turn(9))).is_empty());
+    }
+
+    #[test]
+    fn with_no_turns_every_commit_is_live() {
+        let commits = [commit("aaaaaaa", None, 10)];
+        assert_eq!(
+            scope(Mode::Just, Anchor::Live)
+                .commits_in(&[], &commits)
+                .len(),
+            1
         );
     }
 }

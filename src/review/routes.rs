@@ -111,6 +111,51 @@ struct FileView {
     segments: Vec<SegmentView>,
 }
 
+/// One of the agent's commits in the range, its message laid out as lines a
+/// comment can hang off.
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct CommitView {
+    sha: String,
+    short: String,
+    lines: Vec<MessageLine>,
+}
+
+/// A message line, shaped like a diff `Line` so the template draws both alike.
+/// Plain `text` rather than `html`, which the template escapes itself.
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct MessageLine {
+    kind: &'static str,
+    new_line: u32,
+    text: String,
+    anchor: String,
+}
+
+impl CommitView {
+    /// Numbered as `git log` prints the message, so a line number in the review
+    /// is one the agent can find.
+    fn new(commit: &git::Commit) -> Self {
+        let lines = commit
+            .message
+            .lines()
+            .zip(1u32..)
+            .map(|(text, n)| MessageLine {
+                kind: "message",
+                new_line: n,
+                text: text.to_owned(),
+                anchor: format!("{}:{n}", Side::Message.as_str()),
+            })
+            .collect();
+
+        Self {
+            sha: commit.sha.clone(),
+            short: commit.sha.chars().take(7).collect(),
+            lines,
+        }
+    }
+}
+
 /// What the pane is currently showing. Carried on every form and link so a
 /// re-render after a comment lands back on the same view.
 #[derive(Debug, Clone, Copy, Default)]
@@ -333,6 +378,18 @@ async fn pane(
     let counts = |path: &str| here.iter().filter(|c| c.file_path == path).count();
     let tree = group(&files, &viewed, counts);
 
+    // NB: `range` gates this too — with no head there is nothing on screen for
+    // a message to describe.
+    let messages: Vec<CommitView> = match range {
+        Some(_) => scope
+            .commits_in(&turns, &commits)
+            .into_iter()
+            .map(CommitView::new)
+            .collect(),
+        None => Vec::new(),
+    };
+    let message_comments: usize = messages.iter().map(|m| counts(&m.sha)).sum();
+
     let rendered: Vec<FileView> = files
         .iter()
         .enumerate()
@@ -411,6 +468,7 @@ async fn pane(
 
     Ok(context! {
         card, tree, threads, scopes, modes, submitted, stranded, last_message, turn_note,
+        messages, message_comments,
         drafts => pending,
         files => rendered,
         has_diff => !files.is_empty(),

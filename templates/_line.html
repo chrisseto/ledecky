@@ -1,0 +1,55 @@
+{#
+  One commentable line: a diff line, or a line of a commit message. Expects
+  `path` and `line` from the caller, and the pane's own context besides.
+#}
+{% set key = path ~ "#" ~ line.anchor %}
+<div class="line l-{{ line.kind }} {% if comment == key %}commenting{% endif %}"
+     data-file="{{ path }}" data-anchor="{{ line.anchor }}">
+  <span class="add">+</span>
+  <span class="n">{{ line.old_line if line.old_line else "" }}</span>
+  <span class="n">{{ line.new_line if line.new_line else "" }}</span>
+  <span class="sign"></span>
+  <span class="code">{% if line.html is defined %}{{ line.html | safe }}{% else %}{{ line.text }}{% endif %}</span>
+</div>
+
+{% if comment == key %}
+  <form class="compose" method="post" action="/cards/{{ card.id }}/comments"
+        hx-post="/cards/{{ card.id }}/comments" hx-target="#review"
+        hx-swap="outerMorph" hx-sync="#review:replace">
+    <input type="hidden" name="file_path" value="{{ comment_file }}" />
+    <input type="hidden" name="side" value="{{ comment_side }}" />
+    <input type="hidden" name="line" value="{{ comment_line }}" />
+    <input type="hidden" name="scope" value="{{ scope }}" />
+    <input type="hidden" name="expand" value="{{ expand }}" />
+    <textarea name="body" rows="3" data-autofocus
+              placeholder="Comment on this line — click away to save"></textarea>
+    {# What Escape and an emptied box both reach for. #}
+    <a class="cancel" href="{{ comment_base }}" data-cancel-comment
+       hx-get="{{ comment_base }}" hx-target="#review"
+       hx-swap="outerMorph" hx-sync="#review:replace">Cancel</a>
+  </form>
+{% endif %}
+
+{% if threads[key] %}
+  <div class="thread">
+    {% for comment in threads[key] %}
+      <div class="comment comment-{{ comment.state }}">
+        <div class="comment-body">{{ comment.body }}</div>
+        <div class="comment-meta">
+          {% if comment.state == "draft" %}
+            <span class="tag">draft</span>
+            <form method="post"
+                  action="/cards/{{ card.id }}/comments/{{ comment.id }}/delete"
+                  hx-post="/cards/{{ card.id }}/comments/{{ comment.id }}/delete" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
+              <input type="hidden" name="scope" value="{{ scope }}" />
+              <input type="hidden" name="expand" value="{{ expand }}" />
+              <button class="link" type="submit">Remove</button>
+            </form>
+          {% else %}
+            <span class="tag tag-sent">sent to agent</span>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}
