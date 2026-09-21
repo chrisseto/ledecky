@@ -4,6 +4,12 @@
 `XDG_DATA_HOME` isolation story and the fake agent's contract. Read it first.
 What follows is only what is easy to get wrong.
 
+## Fresh worktrees
+
+A new worktree has no `node_modules` or `static/`: the server won't boot and
+`pnpm e2e` can't resolve Playwright. Run `pnpm install && pnpm build`. Don't
+symlink `node_modules` from another checkout; its lockfile may not match.
+
 ## Running tests
 
 ```sh
