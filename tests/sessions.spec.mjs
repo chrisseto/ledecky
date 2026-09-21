@@ -36,7 +36,7 @@ test("a card whose session has gone starts a fresh one", async ({ page }) => {
 
   await openCard(page, cardId);
   await page.getByRole("button", { name: "Stop agent" }).click();
-  await expect(page.getByRole("button", { name: "Start agent" })).toBeVisible({ timeout: SLOW });
+  await expect(page.getByRole("button", { name: "Resume" })).toBeVisible({ timeout: SLOW });
 
   // The conversation the card is holding on to is now gone.
   //
@@ -48,7 +48,7 @@ test("a card whose session has gone starts a fresh one", async ({ page }) => {
   rmSync(sessions, { recursive: true, force: true });
   mkdirSync(sessions, { recursive: true });
 
-  await page.getByRole("button", { name: "Start agent" }).click();
+  await page.getByRole("button", { name: "Resume" }).click();
 
   // It got its task in again, which it could not have done had the resume stuck.
   await expect.poll(() => turnRefs(cardId).length, { timeout: SLOW }).toBe(2);
@@ -73,8 +73,8 @@ test("a resumed session keeps the mode it was last in", async ({ page }) => {
 
   await openCard(page, id);
   await page.getByRole("button", { name: "Stop agent" }).click();
-  await expect(page.getByRole("button", { name: "Start agent" })).toBeVisible({ timeout: SLOW });
-  await page.getByRole("button", { name: "Start agent" }).click();
+  await expect(page.getByRole("button", { name: "Resume" })).toBeVisible({ timeout: SLOW });
+  await page.getByRole("button", { name: "Resume" }).click();
 
   await openAgent(page, id);
   await expect(terminalRows(page)).toContainText("mode acceptEdits", { timeout: SLOW });

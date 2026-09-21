@@ -72,12 +72,18 @@
     {% if live %}
       <form method="post" action="/cards/{{ card.id }}/stop"
             hx-post="/cards/{{ card.id }}/stop" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
-        <button class="btn accent" type="submit">{{ icon("square") }} Stop agent</button>
+        <button class="btn accent" type="submit">{{ icon("pause") }} Stop agent</button>
       </form>
-    {% else %}
+    {% elif card.lane == "todo" %}
+      <form method="post" action="/cards/{{ card.id }}/lane"
+            hx-post="/cards/{{ card.id }}/lane" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
+        <input type="hidden" name="lane" value="in_progress" />
+        <button class="btn accent" type="submit">{{ icon("play") }} Start</button>
+      </form>
+    {% elif card.lane in ["in_progress", "in_review"] %}
       <form method="post" action="/cards/{{ card.id }}/start"
             hx-post="/cards/{{ card.id }}/start" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
-        <button class="btn accent" type="submit">{{ icon("play") }} Start agent</button>
+        <button class="btn accent" type="submit">{{ icon("refresh-cw") }} Resume</button>
       </form>
     {% endif %}
 

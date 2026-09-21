@@ -504,13 +504,12 @@ pub async fn move_card_to_lane(
     Ok(Redirect::to(format!("/cards/{id}")))
 }
 
-/// Puts a card in a lane at an index, and starts its agent if that lane is
-/// In Progress.
+/// Puts a card in a lane at an index. Entering In Progress starts its agent;
+/// entering Done stops it.
 ///
 /// Both movers land here: the board's drag handler, which answers 204, and the
-/// drawer's, which redirects back to the card. Entering In Progress is the one
-/// lane change that does more than reorder, which is why this takes everything
-/// a session needs rather than just a database.
+/// drawer's, which redirects back to the card. Entering In Progress needs
+/// everything a session does, which is why this takes more than a database.
 ///
 /// NB: the arguments are its two callers' request guards, passed straight
 /// through; see the note on `webhooks::receive`.
@@ -545,6 +544,11 @@ async fn relane(
             error!("card {id}: {err:#}");
             manager.failed(id).await;
         }
+    }
+
+    // The worktree stays: Done is not a merge, and garbage collection reclaims it.
+    if lane == Lane::Done && manager.running(id).is_some() {
+        manager.stop(id).await;
     }
 
     Ok(())

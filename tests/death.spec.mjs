@@ -65,7 +65,7 @@ test("a dead agent leaves no terminal to open", async ({ page }) => {
  */
 test("the card starts again after its agent died", async ({ page }) => {
   await page.goto(`/cards/${cardId}`);
-  await page.getByRole("button", { name: /start/i }).click();
+  await page.getByRole("button", { name: "Resume" }).click();
 
   await openAgent(page, cardId);
   await expect(terminalRows(page)).toContainText(`worktrees/${cardId}`, { timeout: SLOW });
