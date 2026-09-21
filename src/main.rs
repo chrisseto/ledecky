@@ -13,6 +13,7 @@ mod config;
 mod db;
 mod events;
 mod git;
+mod gzip;
 mod hooks;
 mod project;
 mod review;
@@ -92,6 +93,12 @@ async fn rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>> {
         changes.clone(),
         std::time::Duration::from_millis(settings.watch_debounce),
     );
+
+    let rocket = if settings.gzip {
+        rocket.attach(gzip::Gzip)
+    } else {
+        rocket
+    };
 
     Ok(rocket
         .manage(settings)

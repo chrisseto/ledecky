@@ -182,6 +182,7 @@ variable:
 | `agent_bin` | `claude` | The executable spawned for an agent. 2.1.224 or newer, for the inbox socket |
 | `watch_debounce` | `250` | How long a burst of worktree writes settles before the diff is announced, in ms |
 | `head_ttl` | `30000` | How long a staged worktree head stands without the watcher, in ms |
+| `gzip` | release builds | Whether to gzip responses |
 
 `Rocket.toml` carries the agent plumbing's real-time waits beside these; the
 end-to-end suite shrinks every one of them rather than waiting them out.

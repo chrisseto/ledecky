@@ -57,6 +57,9 @@ pub struct Settings {
     /// How long, in milliseconds, a requested dialog has to paint before the
     /// watcher gives up on it.
     pub dialog_grace: u64,
+
+    /// Whether to gzip responses. Defaults on in release builds only.
+    pub gzip: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +74,7 @@ impl Default for Settings {
             hook_grace: 15_000,
             startup_timeout: 5000,
             dialog_grace: 5000,
+            gzip: !cfg!(debug_assertions),
         }
     }
 }

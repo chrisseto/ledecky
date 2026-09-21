@@ -24,6 +24,9 @@ watch_debounce = 250
 # otherwise, in milliseconds. A backstop for a missed event, not the mechanism.
 head_ttl = 30000
 
+# Whether to gzip responses. Unset, it follows the build: on in release, off in
+# debug. Not set here, since any value would override that.
+# gzip = true
 
 # data_dir defaults to $XDG_DATA_HOME/<app_slug>; set it to override.
 
