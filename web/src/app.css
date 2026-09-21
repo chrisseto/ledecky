@@ -374,6 +374,9 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   color: var(--fg-faint);
   font-size: 13px;
 }
+/* NB: gone the moment a card is dragged over or dropped, not when the board next
+   redraws. */
+.lane-cards:has(.card) .drop-here { display: none; }
 
 .card {
   position: relative;

@@ -90,6 +90,19 @@ test("a card can be dragged between lanes and the move sticks", async ({ page })
   await expect(cardIn(page, "in_review", "Teach it to whistle")).toBeVisible();
 });
 
+test("an empty lane's placeholder takes a drop", async ({ page }) => {
+  await page.goto(projectUrl);
+
+  const done = page.locator(".lane-done");
+  await cardIn(page, "in_review", "Teach it to whistle").dragTo(done.getByText("Drop a card here"));
+
+  await expect(cardIn(page, "done", "Teach it to whistle")).toBeVisible();
+  await expect(done.getByText("Drop a card here")).toBeHidden();
+
+  await moveCard(page, await cardIn(page, "done", "Teach it to whistle").getAttribute("data-card-id"), "in_review");
+  await expect(cardIn(page, "in_review", "Teach it to whistle")).toBeVisible();
+});
+
 test("the drawer moves a card without leaving the board", async ({ page }) => {
   await page.goto(projectUrl);
   await cardIn(page, "in_review", "Teach it to whistle").click();

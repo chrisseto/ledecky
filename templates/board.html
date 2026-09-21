@@ -77,11 +77,10 @@
             <x-sortable-lane class="lane-cards" id="lane-{{ lane.key }}"
                              data-lane="{{ lane.key }}">
               {% for card in lane.cards %}{% include "_card.html" %}{% endfor %}
+              {% if not lane.cards and lane.key != "todo" %}
+                <p class="drop-here">Drop a card here</p>
+              {% endif %}
             </x-sortable-lane>
-
-            {% if not lane.cards and lane.key != "todo" %}
-              <p class="drop-here">Drop a card here</p>
-            {% endif %}
           </section>
         {% endfor %}
       </main>
