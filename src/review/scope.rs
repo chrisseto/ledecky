@@ -27,7 +27,7 @@ pub enum Anchor {
 pub enum Mode {
     /// What this point alone changed.
     Just,
-    /// Everything from this point to the live head.
+    /// This point and everything after it, to the live head.
     Since,
 }
 
@@ -60,6 +60,14 @@ impl Mode {
         match self {
             Self::Just => "Just this",
             Self::Since => "Since this",
+        }
+    }
+
+    /// Where a range starting at `point` stops.
+    fn end(self, point: String, head: &str) -> String {
+        match self {
+            Self::Just => point,
+            Self::Since => head.to_owned(),
         }
     }
 
@@ -223,22 +231,18 @@ impl Scope {
                 Some((from, head.to_owned()))
             }
 
-            (Anchor::Turn(n), Mode::Just) => {
+            (Anchor::Turn(n), mode) => {
                 let to = at(*n)?;
                 // Turn 1 has no predecessor, so it is measured from the base.
-                Some((at(n - 1).unwrap_or(base), to))
+                let from = at(n - 1).unwrap_or(base);
+                Some((from, mode.end(to, head)))
             }
-            (Anchor::Turn(n), Mode::Since) => Some((at(*n)?, head.to_owned())),
 
-            (Anchor::Commit(sha), Mode::Just) => {
+            (Anchor::Commit(sha), mode) => {
                 let commit = commits.iter().find(|c| c.sha == *sha)?;
                 // A root commit has nothing behind it but the empty tree.
                 let from = commit.parent.clone().unwrap_or_else(|| EMPTY_TREE.into());
-                Some((from, commit.sha.clone()))
-            }
-            (Anchor::Commit(sha), Mode::Since) => {
-                let commit = commits.iter().find(|c| c.sha == *sha)?;
-                Some((commit.sha.clone(), head.to_owned()))
+                Some((from, mode.end(commit.sha.clone(), head)))
             }
         }
     }
@@ -468,11 +472,27 @@ mod tests {
         );
         assert_eq!(
             range(scope(Mode::Since, Anchor::Turn(1))),
-            Some(("sha1".into(), "worktree-tree".into()))
+            Some(("refs/ledecky/7/base".into(), "worktree-tree".into()))
         );
         assert_eq!(
             range(scope(Mode::Since, Anchor::Commit("c0ffee1".into()))),
-            Some(("c0ffee1".into(), "worktree-tree".into()))
+            Some(("sha-parent".into(), "worktree-tree".into()))
+        );
+    }
+
+    #[test]
+    fn since_a_point_includes_that_point() {
+        let settings = settings();
+        let turns = [turn(1, "sha1"), turn(2, "sha2")];
+        let commits = [commit("c0ffee1", None, 10)];
+        let range = |anchor| {
+            scope(Mode::Since, anchor).revisions(&settings, 7, &turns, &commits, Some("h"))
+        };
+
+        assert_eq!(range(Anchor::Turn(2)), Some(("sha1".into(), "h".into())));
+        assert_eq!(
+            range(Anchor::Commit("c0ffee1".into())),
+            Some((EMPTY_TREE.into(), "h".into()))
         );
     }
 

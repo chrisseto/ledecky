@@ -208,15 +208,22 @@ test("an empty range keeps the picker, so there is a way back out of it", async 
   const review = page.locator("#review");
   const menu = review.locator("[data-range-menu]");
 
-  // With one turn and a clean worktree, "since turn 1" is that turn against
-  // itself: no files.
-  // The mode carries across a change of anchor, and the default is "since".
+  // The mode carries across a change of anchor, and the default is "since",
+  // which includes the point itself.
   await menu.locator("summary").click();
   await menu.getByText("Turn 1").click();
+  await expect(menu.locator("summary")).toContainText("Since turn 1");
+  await expect(review.locator(".file")).toHaveCount(2);
+
+  // A commit that changed nothing, read on its own: no files.
+  worktreeGit(cardId, "-c", "user.email=a@b.c", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "nothing at all");
+  await openCard(page, cardId);
+  await menu.locator("summary").click();
+  await menu.locator(".menu-item.anchor-commit", { hasText: "nothing at all" }).click();
+  await review.locator(".modes a.mode", { hasText: "Just this" }).click();
 
   await expect(review.locator("#diff-lines > .empty")).toBeVisible();
   await expect(review.locator(".file")).toHaveCount(0);
-  await expect(menu.locator("summary")).toContainText("Since turn 1");
 
   await menu.locator("summary").click();
   await menu.getByText("What this card is based on").click();
