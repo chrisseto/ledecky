@@ -1,11 +1,11 @@
-use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
-use tokio::sync::broadcast;
+use pty_process::{Command, OwnedReadPty, OwnedWritePty, Size};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, watch, Notify};
 
 use crate::agent::messaging::Inbox;
 use crate::config::Timings;
@@ -53,10 +53,15 @@ enum Dialog {
 pub struct Agent {
     /// Recorded so a later server run can sweep this up if we die without
     /// getting the chance to.
+    ///
+    /// NB: a pid rather than the `Child`. The reaper holds the child across
+    /// its `wait`, which needs it exclusively for the child's whole life.
     pub pid: Option<i64>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    writer: tokio::sync::Mutex<OwnedWritePty>,
+    /// Asks the reaper to kill the child.
+    kill: Arc<Notify>,
+    /// Flips once the reaper has collected the child.
+    exited: watch::Receiver<bool>,
     screen: Arc<Mutex<vt100::Parser>>,
     output: broadcast::Sender<Bytes>,
     /// What the pump believes about a dialog, and when it started believing it.
@@ -76,25 +81,25 @@ impl Agent {
     /// NB: takes a prepared command rather than a card. Turning a card into a
     /// command line is the manager's job; this side knows about a process and a
     /// terminal and nothing else.
-    pub(crate) fn attach(
-        cmd: CommandBuilder,
-        timings: Timings,
-    ) -> Result<(Arc<Self>, Box<dyn Read + Send>)> {
-        let pty = portable_pty::native_pty_system()
-            .openpty(PtySize {
-                rows: DEFAULT_ROWS,
-                cols: DEFAULT_COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("opening a pty")?;
+    ///
+    /// Must be called from within the runtime: the pty registers with its
+    /// reactor, and the child's reaper is a task on it.
+    pub(crate) fn attach(cmd: Command, timings: Timings) -> Result<(Arc<Self>, OwnedReadPty)> {
+        let (pty, pts) = pty_process::open().context("opening a pty")?;
+        pty.resize(Size::new(DEFAULT_ROWS, DEFAULT_COLS))
+            .context("sizing the pty")?;
 
-        let child = pty.slave.spawn_command(cmd).context("spawning claude")?;
-        drop(pty.slave);
+        // NB: `kill_on_drop` covers a runtime going down before the reaper has
+        // had a chance to act on a kill.
+        let mut child = cmd
+            .kill_on_drop(true)
+            .spawn(pts)
+            .context("spawning claude")?;
 
-        let pid = child.process_id().map(i64::from);
-        let reader = pty.master.try_clone_reader()?;
-        let writer = pty.master.take_writer()?;
+        let pid = child.id().map(i64::from);
+        let (reader, writer) = pty.into_split();
+        let (exited_tx, exited) = watch::channel(false);
+        let kill = Arc::new(Notify::new());
 
         let (output, _) = broadcast::channel(1024);
         let screen = Arc::new(Mutex::new(vt100::Parser::new(
@@ -105,14 +110,27 @@ impl Agent {
 
         let agent = Arc::new(Agent {
             pid,
-            master: Mutex::new(pty.master),
-            writer: Mutex::new(writer),
-            child: Mutex::new(child),
+            writer: tokio::sync::Mutex::new(writer),
+            kill: kill.clone(),
+            exited,
             screen,
             output,
             dialog: Mutex::new((Dialog::None, Instant::now())),
             inbox: Mutex::new(None),
             timings,
+        });
+
+        // The only owner of the child, so the only thing that reaps it. Without
+        // the `wait` an exited agent lingers as a zombie for as long as this
+        // server runs.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = child.wait() => {}
+                _ = kill.notified() => {
+                    let _ = child.kill().await;
+                }
+            }
+            let _ = exited_tx.send(true);
         });
 
         Ok((agent, reader))
@@ -135,10 +153,10 @@ impl Agent {
         history_bytes(self.screen.lock().unwrap().screen_mut(), client_rows)
     }
 
-    pub fn write_input(&self, bytes: &[u8]) {
-        let mut writer = self.writer.lock().unwrap();
-        let _ = writer.write_all(bytes);
-        let _ = writer.flush();
+    pub async fn write_input(&self, bytes: &[u8]) {
+        let mut writer = self.writer.lock().await;
+        let _ = writer.write_all(bytes).await;
+        let _ = writer.flush().await;
     }
 
     /// Records where this session takes messages.
@@ -203,14 +221,8 @@ impl Agent {
         resumed
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) {
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        let _ = self.master.lock().unwrap().resize(size);
+    pub async fn resize(&self, rows: u16, cols: u16) {
+        let _ = self.writer.lock().await.resize(Size::new(rows, cols));
         self.screen
             .lock()
             .unwrap()
@@ -218,17 +230,15 @@ impl Agent {
             .set_size(rows, cols);
     }
 
-    /// Kills the agent and reaps it. Without the `wait` the process lingers as a
-    /// zombie for as long as this server runs, because nothing else calls it once
-    /// the agent has been dropped from the registry.
+    /// Kills the agent. Returns before it is gone; the reaper collects it.
     pub fn kill(&self) {
-        let mut child = self.child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        // NB: `notify_one` keeps a permit, so a kill that lands before the
+        // reaper first polls is not lost.
+        self.kill.notify_one();
     }
 
     pub fn is_running(&self) -> bool {
-        matches!(self.child.lock().unwrap().try_wait(), Ok(None))
+        !*self.exited.borrow()
     }
 }
 
@@ -292,15 +302,15 @@ fn history_bytes(screen: &mut vt100::Screen, client_rows: Option<u16>) -> Vec<u8
 /// keeps this module clear of the database and the event bus, and it makes a
 /// cycle between the pump and the registry that owns this agent impossible
 /// rather than merely absent.
-pub(crate) fn pump(
-    mut reader: Box<dyn Read + Send>,
+pub(crate) async fn pump(
+    mut reader: OwnedReadPty,
     agent: Arc<Agent>,
     watcher: Weak<dyn Watcher>,
     card_id: i64,
 ) {
     let mut buf = [0u8; 8192];
     loop {
-        match reader.read(&mut buf) {
+        match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let chunk = Bytes::copy_from_slice(&buf[..n]);

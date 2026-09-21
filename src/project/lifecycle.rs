@@ -6,11 +6,10 @@
 //! above the manager rather than in it. `teardown`'s other caller deletes a
 //! card and involves no agent at all.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rocket::tokio::task::spawn_blocking;
 
 use crate::agent::{Agent, AgentManager};
 use crate::config::Settings;
@@ -49,15 +48,15 @@ pub async fn start(
             .context("creating the worktree")?;
     }
 
-    // Said before the spawn, which blocks: a client that learned of the move
+    // Said before the spawn: a client that learned of the move
     // over the bus would otherwise keep showing the pre-start state — and the
     // drawer "no agent running" — until the opening prompt lands.
     manager.starting(card_id, &worktree.to_string_lossy()).await;
 
     let card = Card::find(db, card_id).await.context("card vanished")?;
 
-    let mut agent = spawned(manager, &card, &worktree, &repo)
-        .await
+    let mut agent = manager
+        .spawn(&card, &worktree, &repo)
         .context("spawning the agent")?;
 
     // A recorded session can stop being resumable — a transcript that was never
@@ -69,8 +68,8 @@ pub async fn start(
         Card::clear_session_id(db, card_id).await;
 
         let card = Card::find(db, card_id).await.context("card vanished")?;
-        agent = spawned(manager, &card, &worktree, &repo)
-            .await
+        agent = manager
+            .spawn(&card, &worktree, &repo)
             .context("spawning the agent")?;
     }
 
@@ -91,24 +90,6 @@ pub async fn start(
     rocket::tokio::spawn(watching.watch_startup(started, card_id, timings));
 
     Ok(agent)
-}
-
-/// NB: on the blocking pool. Opening a pty and forking a child are both
-/// blocking calls, and `portable-pty` offers no async way to make them.
-async fn spawned(
-    manager: &Arc<AgentManager>,
-    card: &Card,
-    worktree: &Path,
-    repo: &Path,
-) -> Result<Arc<Agent>> {
-    let manager = Arc::clone(manager);
-    let card = card.clone();
-    let worktree = worktree.to_path_buf();
-    let repo = repo.to_path_buf();
-
-    spawn_blocking(move || manager.spawn(&card, &worktree, &repo))
-        .await
-        .expect("spawning an agent panicked")
 }
 
 /// Kills the agent and removes the worktree. Turn refs are kept.

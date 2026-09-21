@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use portable_pty::CommandBuilder;
+use pty_process::Command;
 use rocket::fairing::{self, Fairing, Info};
 use rocket::tokio::sync::mpsc;
 use rocket::tokio::task::spawn_blocking;
@@ -46,12 +46,9 @@ pub struct AgentManager {
 
 /// What the pump has to tell the manager.
 ///
-/// NB: a channel rather than the call itself. The pump runs on a thread of
-/// `portable-pty`'s making, so it cannot await the writes these turn into — and
-/// blocking on the runtime from there panics outright once the runtime is
-/// shutting down, which is exactly when a pty closes and the pump reports. A
-/// send costs the pump nothing and cannot fail loudly: once the manager is
-/// gone, so is anything a report would have written.
+/// NB: a channel rather than the call itself, so the read loop never waits on
+/// a database write. A send costs the pump nothing and cannot fail loudly: once
+/// the manager is gone, so is anything a report would have written.
 enum Report {
     /// The dialog that was holding the keyboard has left the screen.
     DialogCleared(i64),
@@ -125,9 +122,8 @@ impl AgentManager {
             if existing.is_running() {
                 return Ok(existing);
             }
-            // NB: killed, not just dropped. There is no `Drop` for `Agent`, so
-            // an evicted one is never reaped and lingers as a zombie for the
-            // life of the server.
+            // NB: killed, not just dropped. A dropped agent's child runs on
+            // for as long as it keeps its end of the pty open.
             self.evict(card.id);
         }
 
@@ -136,44 +132,32 @@ impl AgentManager {
 
         self.agents.write().unwrap().insert(card.id, agent.clone());
 
-        // portable-pty hands back a blocking reader, so it gets its own thread.
-        // It reports back through a `Weak`, so it cannot keep the manager — and
-        // through it this agent — alive.
+        // The pump reports back through a `Weak`, so it cannot keep the
+        // manager — and through it this agent — alive.
         let watcher: Weak<dyn Watcher> = Arc::downgrade(self) as Weak<dyn Watcher>;
-        let pumped = agent.clone();
-        let card_id = card.id;
-        std::thread::spawn(move || agent::pump(reader, pumped, watcher, card_id));
+        rocket::tokio::spawn(agent::pump(reader, agent.clone(), watcher, card.id));
 
         Ok(agent)
     }
 
     /// The command line for a card's agent.
-    fn command(&self, card: &Card, worktree: &Path, repo: &Path) -> CommandBuilder {
-        let mut cmd = CommandBuilder::new(&self.settings.agent_bin);
+    fn command(&self, card: &Card, worktree: &Path, repo: &Path) -> Command {
+        let mut cmd = Command::new(&self.settings.agent_bin);
         // Restarting a card picks the conversation back up rather than starting
         // over with no memory of the work already done.
         //
         // NB: the card's mode only seeds a new session. A resumed one restores
         // the mode it was last in from its transcript, and passing ours would
         // override that — putting a card whose plan was approved back in plan.
-        match &card.session_id {
-            Some(session_id) => {
-                cmd.arg("--resume");
-                cmd.arg(session_id);
-            }
-            None => {
-                cmd.arg("--permission-mode");
-                cmd.arg(&card.permission_mode);
-            }
-        }
+        cmd = match &card.session_id {
+            Some(session_id) => cmd.arg("--resume").arg(session_id),
+            None => cmd.arg("--permission-mode").arg(&card.permission_mode),
+        };
         if let Some(model) = &card.model {
-            cmd.arg("--model");
-            cmd.arg(model);
+            cmd = cmd.arg("--model").arg(model);
         }
-        cmd.arg("--settings");
-        cmd.arg(self.auth.settings_json(card.id));
-        cmd.arg("--add-dir");
-        cmd.arg(repo);
+        cmd = cmd.arg("--settings").arg(self.auth.settings_json(card.id));
+        cmd = cmd.arg("--add-dir").arg(repo);
         // NB: no `--name`. Naming the session suppresses the name it would
         // give itself, which is the one the card takes.
 
@@ -185,17 +169,17 @@ impl AgentManager {
         // NB: `--` first. A task is the user's prose and may well start with a
         // dash, which would otherwise be read as a flag.
         if let Some(prompt) = card.opening_prompt() {
-            cmd.arg("--");
-            cmd.arg(prompt);
+            cmd = cmd.arg("--").arg(prompt);
         }
 
-        cmd.cwd(worktree);
+        cmd = cmd.current_dir(worktree);
         // Match what xterm.js renders; the inherited TERM may be anything.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        cmd = cmd
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor");
         // Applied last so a deployment can override the above if it must.
         for (key, value) in &self.settings.agent_env {
-            cmd.env(key, value);
+            cmd = cmd.env(key, value);
         }
         // If this server was itself launched from a Claude Code session, these
         // markers make the child think it is a nested agent and disable session
@@ -207,13 +191,13 @@ impl AgentManager {
             "CLAUDE_CODE_SSE_PORT",
             "CLAUDE_SESSION_ID",
         ] {
-            cmd.env_remove(marker);
+            cmd = cmd.env_remove(marker);
         }
 
         cmd
     }
 
-    /// Takes an agent out of the registry and reaps it.
+    /// Takes an agent out of the registry and kills it.
     fn evict(&self, card_id: i64) -> Option<Arc<Agent>> {
         let agent = self.agents.write().unwrap().remove(&card_id);
         if let Some(agent) = &agent {
@@ -571,8 +555,8 @@ impl Watcher for AgentManager {
     /// is up says "needs you" forever, because the redraw that would have
     /// cleared it can never come.
     fn exited(&self, card_id: i64) {
-        // Inline, unlike the write behind it: this reaps the child, and a
-        // report waiting its turn is a zombie waiting with it.
+        // Inline, unlike the write behind it, so the registry stops handing out
+        // a dead agent as soon as the pump knows.
         self.evict(card_id);
         let _ = self.reports.send(Report::Exited(card_id));
     }

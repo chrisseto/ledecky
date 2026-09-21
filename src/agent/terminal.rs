@@ -115,10 +115,10 @@ pub struct ResizeForm {
 }
 
 #[post("/cards/<id>/resize", data = "<form>")]
-pub fn resize(manager: &State<Arc<AgentManager>>, id: i64, form: Form<ResizeForm>) -> Status {
+pub async fn resize(manager: &State<Arc<AgentManager>>, id: i64, form: Form<ResizeForm>) -> Status {
     match manager.running(id) {
         Some(agent) => {
-            agent.resize(form.rows.max(1), form.cols.max(1));
+            agent.resize(form.rows.max(1), form.cols.max(1)).await;
             Status::NoContent
         }
         None => Status::NotFound,
@@ -148,7 +148,7 @@ pub fn socket(
                 return Ok(());
             };
 
-            agent.resize(rows.max(1), cols.max(1));
+            agent.resize(rows.max(1), cols.max(1)).await;
 
             // Subscribe before snapshotting so no output slips through the gap.
             let mut rx = agent.subscribe();
@@ -160,8 +160,8 @@ pub fn socket(
             loop {
                 tokio::select! {
                     incoming = stream.next() => match incoming {
-                        Some(Ok(ws::Message::Binary(bytes))) => agent.write_input(&bytes),
-                        Some(Ok(ws::Message::Text(text))) => agent.write_input(text.as_bytes()),
+                        Some(Ok(ws::Message::Binary(bytes))) => agent.write_input(&bytes).await,
+                        Some(Ok(ws::Message::Text(text))) => agent.write_input(text.as_bytes()).await,
                         Some(Ok(_)) => {}
                         Some(Err(_)) | None => break,
                     },

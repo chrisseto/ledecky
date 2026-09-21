@@ -9,7 +9,7 @@ bytes = "1"
 include_dir = "0.7.4"
 minijinja = { version = "2", features = ["loader", "urlencode"] }
 notify = "8.2.0"
-portable-pty = "0.9"
+pty-process = { version = "0.5", features = ["async"] }
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 rocket = { version = "0.5", features = ["json"] }
 rocket_ws = "0.1"
