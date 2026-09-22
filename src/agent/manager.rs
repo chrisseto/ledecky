@@ -755,6 +755,63 @@ mod tests {
         assert_eq!(look(&db, card).await, (Lane::InReview, AgentState::Idle));
     }
 
+    // ---- startup ------------------------------------------------------------
+
+    /// A stand-in client that paints `rows` from the top of a cleared screen, as
+    /// the startup dialogs are drawn, and then never reports in.
+    fn painting(rows: &[&str]) -> pty_process::Command {
+        pty_process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"printf '\033[2J\033[2;1H'; printf '%s\r\n' "$@"; exec sleep 60"#)
+            .arg("sh")
+            .args(rows)
+    }
+
+    /// Neither startup dialog fires a hook, so the screen is all that says one
+    /// is up. The card has to say it needs the user, and the dialog has to be
+    /// left for them: its highlighted choice is "No, exit".
+    #[tokio::test]
+    async fn a_startup_dialog_leaves_the_card_waiting_on_the_user() {
+        let trust: &[&str] = &[
+            "  Quick safety check: Is this a project you created or one you trust?",
+            "❯ No, exit",
+            "  Yes, I trust this folder",
+            "",
+            "  Enter to confirm · Esc to cancel",
+        ];
+        let consent: &[&str] = &[
+            "  WARNING: Claude Code running in Bypass Permissions mode",
+            "❯ No, exit",
+            "  Yes, I accept",
+            "",
+            "  Enter to confirm · Esc to cancel",
+        ];
+
+        for rows in [trust, consent] {
+            let db = memory_db().await;
+            let card = card_in(&db, Lane::InProgress, AgentState::Starting).await;
+            let manager = manager(&db);
+            let timings = Settings::default().timings();
+
+            let (agent, reader) = Agent::attach(painting(rows), timings).unwrap();
+            let watcher: Weak<dyn Watcher> = Arc::downgrade(&manager) as Weak<dyn Watcher>;
+            tokio::spawn(agent::pump(reader, agent.clone(), watcher, card));
+
+            manager
+                .clone()
+                .watch_startup(agent.clone(), card, timings)
+                .await;
+            assert_eq!(
+                look(&db, card).await,
+                (Lane::InReview, AgentState::AwaitingUser),
+                "{}",
+                rows[0]
+            );
+            assert!(agent.is_running() && agent.is_blocked(), "{}", rows[0]);
+            agent.kill();
+        }
+    }
+
     // ---- the sweep ----------------------------------------------------------
 
     use rocket::figment::providers::Serialized;

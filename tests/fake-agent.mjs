@@ -5,16 +5,13 @@
 // It imitates only the parts of the real client that ledecky actually couples
 // to:
 //
-//   * an opening task taken as a positional argument, held while a modal is up
-//     and submitted on its own once the modal is answered;
+//   * an opening task taken as a positional argument, submitted on its own
+//     once the client is up;
 //   * a per-session inbox socket, whose path it reports by running the
 //     SessionStart command hook out of its own --settings — which is both how
 //     the server sends it anything and how the server knows it has started;
 //   * a startup window where it has drawn nothing yet and the SessionStart hook
 //     has not run, which the server must not mistake for being ready;
-//   * a modal that owns the keyboard and treats a bare Enter as "exit", which is
-//     how the trust and bypass-permissions dialogs behave. Neither numbers its
-//     options, so neither is matched by looking for a leading "1.";
 //   * dying on "k" without a SessionEnd hook, the way a crash or an outside
 //     kill does — the case where the pty reaching EOF is the only notice;
 //   * a full-height screen with the input box pinned near the bottom, because
@@ -108,8 +105,7 @@ const transcript = [
   "",
 ];
 
-// bypassPermissions shows a one-time consent dialog before anything else runs.
-let modal = permissionMode === "bypassPermissions" ? "consent" : null;
+let modal = null;
 
 // Set between answering a permission prompt and `f`. The turn is deliberately
 // still open in that window: a card has to have stopped saying "needs you" while
@@ -128,19 +124,17 @@ let booting = true;
 setTimeout(() => {
   booting = false;
   render();
-  // Only now: SessionStart fires once the client is up and past any dialog,
-  // which is exactly what makes it worth anything as a signal to the server.
+  // Only now: SessionStart fires once the client is up, which is exactly what
+  // makes it worth anything as a signal to the server.
   ready();
 }, Number(process.env.FAKE_AGENT_BOOT_MS ?? 4000));
 
 /**
  * Opens the inbox socket and runs the SessionStart command hook, which is how
- * the server learns where to send messages — and, because this only happens
- * once no modal is left holding the keyboard, how it learns the session is up.
+ * the server learns where to send messages — and how it learns the session is
+ * up.
  */
 function ready() {
-  if (modal) return; // still the user's to answer; the task waits with it
-
   const server = createServer((connection) => {
     const lines = createInterface({ input: connection });
     lines.on("line", (line) => {
@@ -186,33 +180,16 @@ function render() {
 
   // A modal replaces the input box with its own choices, marking the
   // highlighted one the way the real client does.
-  //
-  // NB: the consent dialog's options carry no numbers, because the real one's
-  // do not — that is how it tells a dialog from an input box, and numbering
-  // them here is what hid the bug where neither startup dialog was recognised.
-  // The mid-turn permission prompt does number its options, so one of each is
-  // on the screen the server reads.
   let block;
   if (booting) {
     block = [border(), "starting…"];
-  } else if (modal === "consent") {
-    block = [
-      "WARNING: Bypass Permissions mode",
-      "❯ No, exit",
-      "  Yes, I accept",
-      "Enter to confirm · Esc to cancel",
-    ];
   } else if (modal === "permission") {
     block = ["Bash command needs approval", "❯ 1. Yes", "  2. No", "Enter to confirm"];
   } else {
     block = composer();
   }
 
-  // The consent dialog is drawn from the *top* of an otherwise empty screen, as
-  // the real one is — twenty rows above where the input box would be. Pinning it
-  // to the bottom like everything else is what hid the startup dialogs from a
-  // server that only read the last rows.
-  out(modal === "consent" ? `${ESC}[2;1H` : `${ESC}[${ROWS - block.length};1H`);
+  out(`${ESC}[${ROWS - block.length};1H`);
   out(block.join("\r\n"));
 }
 
@@ -350,27 +327,6 @@ async function submit(prompt) {
 }
 
 function answerModal(key) {
-  if (modal === "consent") {
-    if (key === "2") {
-      modal = null;
-      transcript.push("* bypass permissions accepted");
-      render();
-      // The client has the keyboard back, so it can start and take the task it
-      // was launched with.
-      ready();
-      return true;
-    }
-    if (key === "1" || key === "\r" || key === "\n") {
-      // Enter takes the highlighted option, which is "No, exit". The server is
-      // expected never to send a bare Enter into a modal.
-      transcript.push("* declined bypass permissions, exiting");
-      render();
-      hook("SessionEnd", { reason: "declined" }).then(() => process.exit(0));
-      return true;
-    }
-    return true; // everything else is swallowed by the modal
-  }
-
   if (modal === "permission") {
     if (key !== "1" && key !== "2") return true;
     modal = null;

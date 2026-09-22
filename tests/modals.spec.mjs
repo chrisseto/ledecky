@@ -1,5 +1,5 @@
 import { expect, test } from "./support/fixtures.mjs";
-import { PAST_GRACE, SLOW } from "../playwright.config.mjs";
+import { SLOW } from "../playwright.config.mjs";
 
 import {
   addCard,
@@ -7,17 +7,12 @@ import {
   cardIn,
   comment,
   fileSection,
-  openAgent,
   openCard,
-  pollsOfPath,
   turnRefs,
 } from "./support/board.mjs";
 import { terminalInput, terminalRows } from "./support/dom.mjs";
 
-test.describe.configure({ mode: "serial" });
-
-const TITLE = "Runs unattended";
-const TASK = "Tighten the loop.";
+const TITLE = "Asks first";
 
 let projectUrl;
 let cardId;
@@ -25,74 +20,13 @@ let cardId;
 test.beforeAll(async ({ browser }) => {
   const page = await browser.newPage();
   projectUrl = await addProject(page);
-  await addCard(page, projectUrl, {
-    title: TITLE,
-    description: TASK,
-    base: "main",
-    permissions: "bypassPermissions",
-  });
+  await addCard(page, projectUrl, { title: TITLE, description: "Tighten the loop.", base: "main" });
   cardId = await cardIn(page, "todo", TITLE).getAttribute("data-card-id");
-  await page.close();
-});
 
-/**
- * The consent dialog owns the keyboard, and it defaults to "No, exit" — so
- * anything the server sends blind answers it and kills the agent. Nothing is
- * sent now: the task went in on the command line and the client holds it behind
- * the dialog itself.
- *
- * The card still has to notice. Neither this dialog nor the workspace-trust
- * prompt fires a hook, and neither numbers its options, so the only thing that
- * says a dialog is up is the screen — and a `SessionStart` that never arrives.
- */
-test("a consent dialog leaves the card waiting on the user, not working", async ({ page }) => {
-  await page.goto(projectUrl);
+  // A first turn, so there is a diff to comment on. SLOW: an agent start.
   await cardIn(page, "todo", TITLE).dragTo(page.locator('[data-lane="in_progress"]'));
-
-  await openAgent(page, cardId);
-  const rows = terminalRows(page);
-  await expect(rows).toContainText("Bypass Permissions mode");
-
-  // The card says it is blocked rather than pretending to work, and steps into
-  // In Review so the board says so too. Getting here at all means the server
-  // read the unnumbered dialog as a dialog and gave up waiting for the session
-  // to report in — the startup timeout has already passed.
-  await expect(page.locator("#agent-state")).toContainText("needs you", { timeout: SLOW });
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
-
-  // The dialog is still the user's to answer: unanswered, and no turn behind it.
-  // There is no retry loop to count against any more — the server writes nothing
-  // to the pty at startup — so what is checked is that nothing moved.
-  await expect(rows).toContainText("Bypass Permissions mode");
-  await expect(rows).not.toContainText("exiting");
-  expect(turnRefs(cardId)).toHaveLength(0);
-
-  // The card must not be rescued by the dialog grace either. It elapses on the
-  // pty output the watcher runs on, so a fragment fetch is the clock: the card
-  // is still waiting once one has gone by past the grace.
-  const ticks = pollsOfPath(page, `/cards/${cardId}/state`);
-  await page.reload();
-  await openAgent(page, cardId);
-  await expect.poll(() => ticks.length, { timeout: PAST_GRACE }).toBeGreaterThan(0);
-  await expect(page.locator("#agent-state")).toContainText("needs you");
-});
-
-test("answering the dialog releases the task the client was holding", async ({ page }) => {
-  await openAgent(page, cardId);
-  const rows = terminalRows(page);
-  await expect(rows).toContainText("Bypass Permissions mode");
-
-  // Typing goes straight down the websocket, the same as a real keystroke.
-  await terminalInput(page).press("2");
-  await expect(rows).toContainText("bypass permissions accepted", { timeout: SLOW });
-
-  // The task went in on the command line and the client has been holding it
-  // behind the dialog; answering releases it, with nothing sent from here.
-  await expect.poll(() => turnRefs(cardId).length).toBe(1);
-  await expect(page.locator("#agent-state")).toContainText("idle");
-
-  await page.goto(projectUrl);
-  await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
+  await expect.poll(() => turnRefs(cardId).length, { timeout: SLOW }).toBe(1);
+  await page.close();
 });
 
 /**

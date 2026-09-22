@@ -20,13 +20,10 @@ use crate::tmpl::Tmpl;
 use crate::watch::Worktrees;
 
 pub const PERMISSION_MODES: &[(&str, &str)] = &[
-    (
-        "acceptEdits",
-        "Accept edits — prompts for Bash and other tools",
-    ),
-    ("bypassPermissions", "Bypass permissions — fully unattended"),
-    ("default", "Manual — prompt for everything"),
-    ("plan", "Plan — read-only until you approve"),
+    ("plan", "Plan"),
+    ("auto", "Auto Mode"),
+    ("acceptEdits", "Accept Edits"),
+    ("default", "Manual"),
 ];
 
 pub const MODELS: &[(&str, &str)] = &[
@@ -259,12 +256,22 @@ pub struct CardForm {
 
 /// What the card form holds, wherever it came from: a card being edited, a
 /// submission that came back with an error, or the defaults.
-#[derive(Default)]
 struct Fields {
     task: String,
     base_branch: String,
     permission_mode: String,
     model: String,
+}
+
+impl Default for Fields {
+    fn default() -> Self {
+        Self {
+            task: String::new(),
+            base_branch: String::new(),
+            permission_mode: "plan".into(),
+            model: String::new(),
+        }
+    }
 }
 
 impl Fields {
@@ -624,8 +631,9 @@ mod tests {
 
     #[test]
     fn only_offered_permission_modes_are_accepted() {
-        assert_eq!(permission_mode("bypassPermissions"), "bypassPermissions");
+        assert_eq!(permission_mode("auto"), "auto");
         assert_eq!(permission_mode("plan"), "plan");
+        assert_eq!(permission_mode("bypassPermissions"), "acceptEdits");
         // Anything unrecognised lands on the conservative default.
         assert_eq!(permission_mode("rm -rf"), "acceptEdits");
         assert_eq!(permission_mode(""), "acceptEdits");

@@ -106,7 +106,7 @@ terminal.
 **Talking to the agent.** Nothing the server sends is typed at the terminal.
 The opening task is a command-line argument, so it is the user's own prompt and
 the session names itself from it; the client holds it behind the workspace-trust
-and `bypassPermissions` dialogs and submits it once they are answered. Anything
+dialog and submits it once that is answered. Anything
 later — a review batch, a merge request — goes to the session's inbox socket,
 whose path it reports through a `SessionStart` hook. That event is the only
 place `CLAUDE_CODE_MESSAGING_SOCKET` is exported, and only to a `command`
@@ -191,9 +191,7 @@ The port is fixed in `Rocket.toml` because hook URLs have to be stable.
 
 Per-card permission mode and model are set on the new-card form, whose one Task
 field doubles as the card's title: the first line names the card, the whole
-thing is what the agent is told. `bypassPermissions` shows a one-time consent
-dialog in the terminal — answer it there; the card reports `needs you` and waits
-in In Review until you do. The mode only seeds a card's first session; a
+thing is what the agent is told. The mode only seeds a card's first session; a
 restarted one resumes in whatever mode it was last in, as the client recorded it.
 
 ## Running it as a user service
@@ -312,14 +310,14 @@ reads a bare Enter as "exit", and the HTTP hooks named in that same
 `--settings`. That makes worktrees, turn snapshots, lane transitions, review
 submission and merge deterministic and free to run.
 
-Its dialogs are deliberately drawn the way the real client draws them, which
-means the startup ones do **not** number their options. Numbering them is what
-hid a bug where the workspace-trust prompt read as an input box and the card sat
-in `starting` with nobody told there was anything to answer.
+The startup dialogs are covered by unit tests instead, drawn verbatim from the
+real client: they do **not** number their options. Numbering them is what hid a
+bug where the workspace-trust prompt read as an input box and the card sat in
+`starting` with nobody told there was anything to answer.
 
-Two regression guards are worth knowing about. `tests/modals.spec.mjs`: a card
-behind a consent dialog has to report `needs you` and stay untouched, and the
-task has to arrive on its own once the dialog is answered.
+Two regression guards are worth knowing about.
+`a_startup_dialog_leaves_the_card_waiting_on_the_user` in `src/agent/manager.rs`:
+a card behind a startup dialog has to report `needs you` and stay untouched.
 `tests/death.spec.mjs`: an agent killed without a `SessionEnd` — the stand-in
 dies on `k` for this — still has to stop its card, because the pty reaching EOF
 is the only notice anyone gets. Both were checked by reintroducing the bug and

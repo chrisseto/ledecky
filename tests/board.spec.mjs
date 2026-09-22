@@ -25,7 +25,7 @@ test("a new card offers the repository's branches and lands in To Do", async ({ 
   await branches.fill("rel");
   await expect(page.locator(".combo-menu [data-branch]:visible")).toHaveText(["release"]);
 
-  await expect(page.getByLabel("Permissions")).toHaveValue("acceptEdits");
+  await expect(page.getByLabel("Permissions")).toHaveValue("plan");
 
   await addCard(page, projectUrl, {
     title: "Teach it to whistle",
