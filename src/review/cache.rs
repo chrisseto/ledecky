@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rocket::serde::Serialize;
+use tokio::sync::Semaphore;
 
 use crate::git;
-use crate::review::diff::{self, ParsedFile};
+use crate::review::diff::{self, Change, ParsedFile};
 
-/// How many parses to keep before dropping the oldest.
-const CAPACITY: usize = 64;
+/// Bytes of parsed files to keep before dropping the least recently used.
+const BUDGET: usize = 256 << 20;
 
 /// How many stats to keep, which is a different question.
 ///
@@ -25,21 +26,39 @@ const STAT_CAPACITY: usize = 1024;
 /// Memoises parsed diffs so selecting a file, opening a hunk and every comment
 /// action do not re-run git and delta over a whole file.
 ///
-/// Keyed on resolved commit shas rather than ref names: turn refs point at
-/// immutable commits, so an entry can never go stale and there is no
+/// Kept per file and keyed on the blobs at either end rather than on the range,
+/// so a worktree write re-highlights the files it touched and nothing else.
+/// Content addressed, so an entry can never go stale and there is no
 /// invalidation to get wrong. Entries are dropped when a card is torn down, and
-/// otherwise when the cache is full.
+/// otherwise once [`BUDGET`] is spent.
 /// Cloned into the worktree watcher, which invalidates a card's head from a
 /// thread of its own. Otherwise shared exactly as Rocket managed state.
 #[derive(Default, Clone)]
 pub struct DiffCache(Arc<Store>);
 
-#[derive(Default)]
 struct Store {
-    entries: Mutex<Vec<(Key, Arc<Vec<ParsedFile>>)>>,
+    files: Mutex<Files>,
     stats: Mutex<Vec<(Key, Stat)>>,
     /// A lock per card rather than one over all of them — see [`DiffCache::head`].
     heads: Mutex<HashMap<i64, SlotRef>>,
+    /// The right to run one `git diff | delta`: one ration for the process, so
+    /// two cards asking at once queue rather than each taking a core apiece.
+    /// Taken per file, so a card wanting one is not stuck behind another's
+    /// thirty.
+    highlighting: Semaphore,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            files: Mutex::default(),
+            stats: Mutex::default(),
+            heads: Mutex::default(),
+            highlighting: Semaphore::new(
+                std::thread::available_parallelism().map_or(4, |cores| cores.get()),
+            ),
+        }
+    }
 }
 
 type SlotRef = Arc<Slot>;
@@ -67,6 +86,37 @@ pub struct Stat {
     pub deletions: u32,
 }
 
+struct Files {
+    entries: HashMap<FileKey, Entry>,
+    bytes: usize,
+    budget: usize,
+    /// Bumped on every touch, so eviction can find the least recently used.
+    clock: u64,
+}
+
+impl Default for Files {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            budget: BUDGET,
+            clock: 0,
+        }
+    }
+}
+
+struct Entry {
+    parsed: Vec<Arc<ParsedFile>>,
+    bytes: usize,
+    used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileKey {
+    repo: PathBuf,
+    change: Change,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Key {
     repo: PathBuf,
@@ -87,23 +137,60 @@ impl Slot {
 }
 
 impl DiffCache {
-    /// The parsed diff between two revisions, computing it on a miss.
-    pub async fn get(&self, repo: &Path, from: &str, to: &str) -> Result<Arc<Vec<ParsedFile>>> {
-        // Resolving first is what makes the key stable: `refs/.../turn-2` and the
-        // sha it points at are the same entry.
-        let key = Key {
-            repo: repo.to_path_buf(),
-            from: git::run(repo, &["rev-parse", from]).await?,
-            to: git::run(repo, &["rev-parse", to]).await?,
+    /// The parsed diff between two revisions, computing the files it misses.
+    pub async fn get(&self, repo: &Path, from: &str, to: &str) -> Result<Vec<Arc<ParsedFile>>> {
+        // NB: resolved once, so a ref moving part way through cannot pair one
+        // file's blobs with another revision's diff of it.
+        let resolved = git::run(repo, &["rev-parse", from, to]).await?;
+        let Some((from, to)) = resolved.split_once('\n') else {
+            anyhow::bail!("rev-parse {from} {to} answered {resolved:?}");
         };
 
-        if let Some(hit) = self.lookup(&key) {
-            return Ok(hit);
+        let keys: Vec<FileKey> = diff::changes(repo, from, to)
+            .await?
+            .into_iter()
+            .map(|change| FileKey {
+                repo: repo.to_path_buf(),
+                change,
+            })
+            .collect();
+
+        let mut found: Vec<Option<Vec<Arc<ParsedFile>>>> =
+            keys.iter().map(|key| self.lookup(key)).collect();
+
+        // NB: one pipeline per file, run against the process-wide ration of
+        // them. Highlighting is single threaded inside delta and costs about
+        // the same per line whatever else is in the diff, so this is where the
+        // wall clock goes.
+        let mut work = tokio::task::JoinSet::new();
+        for (index, key) in keys.iter().enumerate() {
+            if found[index].is_some() {
+                continue;
+            }
+            let (key, from, to, store) =
+                (key.clone(), from.to_owned(), to.to_owned(), self.0.clone());
+            work.spawn(async move {
+                let _permit = store.highlighting.acquire().await;
+                let parsed = diff::between(&key.repo, &from, &to, &key.change.paths()).await;
+                (index, key, parsed)
+            });
         }
 
-        let parsed = Arc::new(diff::between(repo, &key.from, &key.to).await?);
-        self.insert(key, parsed.clone());
-        Ok(parsed)
+        while let Some(done) = work.join_next().await {
+            let (index, key, parsed) = done?;
+            let mut parsed = parsed?;
+            // NB: the `diff --git` header is ambiguous once a path has a space
+            // in it; `--raw -z` is not.
+            if let [file] = parsed.as_mut_slice() {
+                file.path = key.change.new_path.clone();
+                file.old_path = Some(key.change.old_path.clone());
+            }
+            let parsed: Vec<Arc<ParsedFile>> = parsed.into_iter().map(Arc::new).collect();
+            self.insert(key, parsed.clone());
+            found[index] = Some(parsed);
+        }
+
+        Ok(found.into_iter().flatten().flatten().collect())
     }
 
     /// Line counts for a range, computing them on a miss.
@@ -226,31 +313,63 @@ impl DiffCache {
         heads.entry(card_id).or_default().clone()
     }
 
-    fn lookup(&self, key: &Key) -> Option<Arc<Vec<ParsedFile>>> {
-        let entries = self.0.entries.lock().ok()?;
-        entries
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, parsed)| parsed.clone())
+    fn lookup(&self, key: &FileKey) -> Option<Vec<Arc<ParsedFile>>> {
+        let mut files = self.0.files.lock().ok()?;
+        files.clock += 1;
+        let clock = files.clock;
+        let entry = files.entries.get_mut(key)?;
+        entry.used = clock;
+        Some(entry.parsed.clone())
     }
 
-    fn insert(&self, key: Key, parsed: Arc<Vec<ParsedFile>>) {
-        let Ok(mut entries) = self.0.entries.lock() else {
+    fn insert(&self, key: FileKey, parsed: Vec<Arc<ParsedFile>>) {
+        let Ok(mut files) = self.0.files.lock() else {
             return;
         };
 
-        entries.retain(|(k, _)| *k != key);
-        entries.push((key, parsed));
+        files.clock += 1;
+        let entry = Entry {
+            bytes: parsed.iter().map(|file| file.weight()).sum(),
+            parsed,
+            used: files.clock,
+        };
+        files.bytes += entry.bytes;
+        if let Some(previous) = files.entries.insert(key, entry) {
+            files.bytes -= previous.bytes;
+        }
 
-        let overflow = entries.len().saturating_sub(CAPACITY);
-        entries.drain(..overflow);
+        if files.bytes <= files.budget {
+            return;
+        }
+        let mut ages: Vec<(u64, FileKey)> = files
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.used, key.clone()))
+            .collect();
+        ages.sort_unstable_by_key(|(used, _)| *used);
+        for (_, key) in ages {
+            if files.bytes <= files.budget {
+                break;
+            }
+            if let Some(evicted) = files.entries.remove(&key) {
+                files.bytes -= evicted.bytes;
+            }
+        }
     }
 
     /// Drops everything belonging to a repository, for when a card's worktree and
     /// refs go away.
     pub fn forget(&self, repo: &Path) {
-        if let Ok(mut entries) = self.0.entries.lock() {
-            entries.retain(|(k, _)| k.repo != repo);
+        if let Ok(mut files) = self.0.files.lock() {
+            let mut freed = 0;
+            files.entries.retain(|key, entry| {
+                let keep = key.repo != repo;
+                if !keep {
+                    freed += entry.bytes;
+                }
+                keep
+            });
+            files.bytes -= freed;
         }
         if let Ok(mut stats) = self.0.stats.lock() {
             stats.retain(|(k, _)| k.repo != repo);
@@ -303,18 +422,39 @@ mod tests {
         }
     }
 
-    fn parsed() -> Arc<Vec<ParsedFile>> {
-        Arc::new(Vec::new())
+    fn file_key(repo: &str, blob: &str) -> FileKey {
+        FileKey {
+            repo: PathBuf::from(repo),
+            change: Change {
+                old_mode: "100644".into(),
+                new_mode: "100644".into(),
+                old_blob: "0".repeat(40),
+                new_blob: blob.into(),
+                old_path: "f.rs".into(),
+                new_path: "f.rs".into(),
+            },
+        }
+    }
+
+    fn parsed() -> Vec<Arc<ParsedFile>> {
+        diff::parse("diff --git a/f.rs b/f.rs\n@@ -1 +1 @@\n-a\n+b\n")
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
+
+    fn weight() -> usize {
+        parsed().iter().map(|file| file.weight()).sum()
     }
 
     #[test]
     fn an_inserted_entry_is_found_again() {
         let cache = DiffCache::default();
-        cache.insert(key("/srv/repo", "aaa", "bbb"), parsed());
+        cache.insert(file_key("/srv/repo", "aaa"), parsed());
 
-        assert!(cache.lookup(&key("/srv/repo", "aaa", "bbb")).is_some());
-        assert!(cache.lookup(&key("/srv/repo", "aaa", "ccc")).is_none());
-        assert!(cache.lookup(&key("/other", "aaa", "bbb")).is_none());
+        assert!(cache.lookup(&file_key("/srv/repo", "aaa")).is_some());
+        assert!(cache.lookup(&file_key("/srv/repo", "bbb")).is_none());
+        assert!(cache.lookup(&file_key("/other", "aaa")).is_none());
     }
 
     #[test]
@@ -341,26 +481,103 @@ mod tests {
     }
 
     #[test]
-    fn reinserting_a_key_does_not_duplicate_it() {
+    fn reinserting_a_key_does_not_count_it_twice() {
         let cache = DiffCache::default();
-        cache.insert(key("/srv/repo", "aaa", "bbb"), parsed());
-        cache.insert(key("/srv/repo", "aaa", "bbb"), parsed());
+        cache.insert(file_key("/srv/repo", "aaa"), parsed());
+        cache.insert(file_key("/srv/repo", "aaa"), parsed());
 
-        assert_eq!(cache.0.entries.lock().unwrap().len(), 1);
+        let files = cache.0.files.lock().unwrap();
+        assert_eq!(files.entries.len(), 1);
+        assert_eq!(files.bytes, weight());
     }
 
     #[test]
-    fn the_oldest_entries_are_dropped_once_full() {
+    fn the_least_recently_used_go_once_over_budget() {
         let cache = DiffCache::default();
-        for i in 0..CAPACITY + 10 {
-            cache.insert(key("/srv/repo", "base", &i.to_string()), parsed());
+        cache.0.files.lock().unwrap().budget = 3 * weight();
+        for blob in ["a", "b", "c"] {
+            cache.insert(file_key("/srv/repo", blob), parsed());
         }
 
-        let entries = cache.0.entries.lock().unwrap();
-        assert_eq!(entries.len(), CAPACITY);
-        // The earliest are gone; the most recent survive.
-        assert_eq!(entries.first().unwrap().0.to, "10");
-        assert_eq!(entries.last().unwrap().0.to, (CAPACITY + 9).to_string());
+        // Read since, so younger than `b` in every way that matters.
+        cache.lookup(&file_key("/srv/repo", "a"));
+        cache.insert(file_key("/srv/repo", "d"), parsed());
+
+        assert!(cache.lookup(&file_key("/srv/repo", "b")).is_none());
+        for blob in ["a", "c", "d"] {
+            assert!(
+                cache.lookup(&file_key("/srv/repo", blob)).is_some(),
+                "{blob}"
+            );
+        }
+        assert_eq!(cache.0.files.lock().unwrap().bytes, 3 * weight());
+    }
+
+    /// Two files, and a second commit that touches only one of them.
+    fn scratch_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ledecky-cache-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("git ran");
+            assert!(out.status.success(), "git {args:?}");
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@ledecky"]);
+        git(&["config", "user.name", "ledecky test"]);
+        std::fs::write(dir.join("keep.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(dir.join("edit.rs"), "fn edit() {}\n").unwrap();
+        std::fs::write(dir.join("old name.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        std::fs::write(dir.join("keep.rs"), "fn keep() { 1 }\n").unwrap();
+        std::fs::write(dir.join("edit.rs"), "fn edit() { 1 }\n").unwrap();
+        git(&["mv", "old name.rs", "new name.rs"]);
+        std::fs::write(
+            dir.join("new name.rs"),
+            "fn a() {}\nfn b() {}\nfn c() { 1 }\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "one"]);
+
+        std::fs::write(dir.join("edit.rs"), "fn edit() { 2 }\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "two"]);
+
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_range_reuses_the_files_it_shares_with_another() {
+        let repo = scratch_repo("reuse");
+        let cache = DiffCache::default();
+
+        let before = cache.get(&repo, "HEAD~2", "HEAD~1").await.unwrap();
+        let after = cache.get(&repo, "HEAD~2", "HEAD").await.unwrap();
+
+        let paths = |files: &[Arc<ParsedFile>]| -> Vec<String> {
+            files.iter().map(|file| file.path.clone()).collect()
+        };
+        assert_eq!(paths(&before), ["edit.rs", "keep.rs", "new name.rs"]);
+        assert_eq!(paths(&after), paths(&before));
+
+        // Untouched between the two: the very same parse, not a second one.
+        assert!(!Arc::ptr_eq(&before[0], &after[0]));
+        assert!(Arc::ptr_eq(&before[1], &after[1]));
+        assert!(Arc::ptr_eq(&before[2], &after[2]));
+
+        // The rename survives being diffed on its own.
+        assert_eq!(after[2].old_path.as_deref(), Some("old name.rs"));
+        assert_eq!((after[2].additions, after[2].deletions), (1, 1));
     }
 
     #[tokio::test]
@@ -416,12 +633,13 @@ mod tests {
     #[test]
     fn forgetting_a_repository_leaves_the_others_alone() {
         let cache = DiffCache::default();
-        cache.insert(key("/srv/a", "x", "y"), parsed());
-        cache.insert(key("/srv/b", "x", "y"), parsed());
+        cache.insert(file_key("/srv/a", "x"), parsed());
+        cache.insert(file_key("/srv/b", "x"), parsed());
 
         cache.forget(Path::new("/srv/a"));
 
-        assert!(cache.lookup(&key("/srv/a", "x", "y")).is_none());
-        assert!(cache.lookup(&key("/srv/b", "x", "y")).is_some());
+        assert!(cache.lookup(&file_key("/srv/a", "x")).is_none());
+        assert!(cache.lookup(&file_key("/srv/b", "x")).is_some());
+        assert_eq!(cache.0.files.lock().unwrap().bytes, weight());
     }
 }

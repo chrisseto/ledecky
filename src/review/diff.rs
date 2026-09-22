@@ -13,6 +13,11 @@ use crate::review::expand::FileExpansion;
 ///
 /// Highlighter state is only correct when the opening `/*` or `"` is visible, so
 /// the diff has to carry the entire file rather than islands around each change.
+/// The bill is syntect's throughput — about 0.45s per five thousand lines,
+/// whatever the change was — which is why [`DiffCache`] keys on blobs and
+/// re-highlights only the files that moved.
+///
+/// [`DiffCache`]: crate::review::DiffCache
 const FULL_CONTEXT: &str = "-U1000000";
 
 /// Lines of context either side of a change before anything is opened up.
@@ -106,6 +111,14 @@ impl ParsedFile {
         }
     }
 
+    /// Roughly the bytes this holds, for bounding a cache of them.
+    pub fn weight(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|line| std::mem::size_of::<Line>() + line.html.len() + line.anchor.len())
+            .sum()
+    }
+
     /// The ranges to render, in order, each carrying the unopened lines on
     /// either side of it.
     ///
@@ -190,14 +203,111 @@ fn ranges(lines: &[Line], context: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Runs `git diff | delta` and parses the result.
+/// One entry of `git diff --raw`: a file as it stood at each end of a range.
+///
+/// Everything its rendered diff depends on, so two ranges that agree on it
+/// render that file identically.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Change {
+    pub old_mode: String,
+    pub new_mode: String,
+    pub old_blob: String,
+    pub new_blob: String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+impl Change {
+    /// What to hand `git diff` to reproduce just this file, rename and all.
+    pub fn paths(&self) -> Vec<String> {
+        match self.old_path == self.new_path {
+            true => vec![self.new_path.clone()],
+            false => vec![self.old_path.clone(), self.new_path.clone()],
+        }
+    }
+}
+
+/// The files that differ between two revisions, without reading any of them.
+pub async fn changes(repo: &Path, from: &str, to: &str) -> Result<Vec<Change>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-ext-diff",
+            "--find-renames",
+            from,
+            to,
+        ])
+        .output()
+        .await
+        .context("running git diff --raw")?;
+
+    if !out.status.success() {
+        bail!(
+            "git diff --raw {from} {to} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(parse_raw(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `:<mode> <mode> <blob> <blob> <status>\0<path>\0`, with a second path for a
+/// rename or copy.
+fn parse_raw(raw: &str) -> Vec<Change> {
+    let mut fields = raw.split('\0');
+    let mut changes = Vec::new();
+
+    while let Some(meta) = fields.next() {
+        let Some(meta) = meta.strip_prefix(':') else {
+            continue;
+        };
+        let parts: Vec<&str> = meta.split(' ').collect();
+        let [old_mode, new_mode, old_blob, new_blob, status] = parts[..] else {
+            continue;
+        };
+        let Some(old_path) = fields.next() else {
+            break;
+        };
+        let new_path = match status.starts_with(['R', 'C']) {
+            true => match fields.next() {
+                Some(path) => path,
+                None => break,
+            },
+            false => old_path,
+        };
+
+        changes.push(Change {
+            old_mode: old_mode.to_owned(),
+            new_mode: new_mode.to_owned(),
+            old_blob: old_blob.to_owned(),
+            new_blob: new_blob.to_owned(),
+            old_path: old_path.to_owned(),
+            new_path: new_path.to_owned(),
+        });
+    }
+    changes
+}
+
+/// Runs `git diff | delta` over `paths`, or over everything when there are
+/// none, and parses the result.
 ///
 /// git writes straight into delta through an OS pipe, so a large diff cannot
 /// deadlock the way it would if we buffered it ourselves.
-pub async fn between(repo: &Path, from: &str, to: &str) -> Result<Vec<ParsedFile>> {
+pub async fn between(
+    repo: &Path,
+    from: &str,
+    to: &str,
+    paths: &[String],
+) -> Result<Vec<ParsedFile>> {
     let mut git = Command::new("git")
         .arg("-C")
         .arg(repo)
+        // A path is a path, not a glob that might match its neighbours.
+        .arg("--literal-pathspecs")
         .args([
             "diff",
             FULL_CONTEXT,
@@ -206,7 +316,9 @@ pub async fn between(repo: &Path, from: &str, to: &str) -> Result<Vec<ParsedFile
             "--find-renames",
             from,
             to,
+            "--",
         ])
+        .args(paths)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -236,7 +348,11 @@ pub async fn between(repo: &Path, from: &str, to: &str) -> Result<Vec<ParsedFile
         );
     }
 
-    Ok(parse(&String::from_utf8_lossy(&delta.stdout)))
+    // NB: tens of milliseconds per thousand lines, which is too long to hold
+    // an async worker for.
+    tokio::task::spawn_blocking(move || parse(&String::from_utf8_lossy(&delta.stdout)))
+        .await
+        .context("parsing the diff")
 }
 
 fn delta_args() -> Vec<String> {
@@ -607,7 +723,7 @@ index 7b16f1f..333b15b 100644
             "let count = 43;",
         );
 
-        let files = between(&repo, "HEAD~1", "HEAD")
+        let files = between(&repo, "HEAD~1", "HEAD", &[])
             .await
             .expect("the pipeline ran");
         let html: String = files[0]
@@ -644,7 +760,7 @@ index 7b16f1f..333b15b 100644
             "hello world",
         );
 
-        let files = between(&repo, "HEAD~1", "HEAD")
+        let files = between(&repo, "HEAD~1", "HEAD", &[])
             .await
             .expect("the pipeline ran");
         let added = files[0]
@@ -677,7 +793,7 @@ index 7b16f1f..333b15b 100644
 
         let repo = scratch_repo("comment", "sample.rs", &body, "target OLD", "target NEW");
 
-        let files = between(&repo, "HEAD~1", "HEAD")
+        let files = between(&repo, "HEAD~1", "HEAD", &[])
             .await
             .expect("the pipeline ran");
         let added = files[0]
@@ -732,6 +848,20 @@ index 7b16f1f..333b15b 100644
         git(&["commit", "-qm", "change"]);
 
         dir
+    }
+
+    #[test]
+    fn raw_entries_carry_both_paths_of_a_rename() {
+        let raw = ":100644 100644 aaa bbb M\0a b.rs\0:100644 100644 ccc ddd R086\0old.rs\0new.rs\0";
+        let changes = parse_raw(raw);
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].paths(), ["a b.rs"]);
+        assert_eq!(
+            (changes[1].old_blob.as_str(), changes[1].new_blob.as_str()),
+            ("ccc", "ddd")
+        );
+        assert_eq!(changes[1].paths(), ["old.rs", "new.rs"]);
     }
 
     #[test]

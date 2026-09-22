@@ -504,7 +504,7 @@ fn gap(
 /// The diff's files as a tree: one group per directory, in the order the diff
 /// lists them.
 fn group(
-    files: &[ParsedFile],
+    files: &[Arc<ParsedFile>],
     viewed: &std::collections::HashSet<String>,
     comments: impl Fn(&str) -> usize,
 ) -> Vec<Group> {
