@@ -145,6 +145,35 @@ document.addEventListener("click", (event) => {
 // arrives from the server already in place. Clicking away is what saves it as a
 // draft; an empty box was a change of mind.
 
+// NB: one listener for every line, rather than an `hx-get` on each. The pane
+// holds every line of every file at once, and htmx processes each element it
+// finds — so per-line attributes cost the whole diff's length on every comment,
+// expansion, tick and update, and put four attributes per line on the wire.
+// Issued from `.lines` so it joins the pane's own request queue.
+//
+// NB: delegated from `document` like the rest of this file rather than an
+// `hx-on:click` on the pane. That attribute is evaluated in global scope, so it
+// would need this body inlined in the template or a function hung on `window`.
+document.addEventListener("click", (event) => {
+  const line = event.target.closest?.("#review .line");
+  if (!line) return;
+
+  const review = line.closest(".review");
+  const key = `${line.dataset.file}#${line.dataset.anchor}`;
+  // Clicking the line whose box is open is how it closes again: the same view
+  // with one query parameter dropped.
+  const base = review.dataset.commentBase;
+  const url = line.classList.contains("commenting")
+    ? base
+    : `${base}&comment=${encodeURIComponent(key)}`;
+
+  htmx.ajax("GET", url, {
+    target: "#review",
+    swap: "outerMorph",
+    source: line.closest(".lines"),
+  });
+});
+
 // NB: closing the box blurs it either way, and a blur is what saves — so both
 // ways out have to say which they are. A mouse announces itself by pressing
 // Cancel; Escape has to say so on its own.

@@ -11,6 +11,7 @@
 #}
 <div class="review" id="review" data-card="{{ card.id }}"
      data-scope="{{ scope }}" data-expand="{{ expand }}"
+     data-comment-base="{{ comment_base }}"
      data-additions="{{ additions }}" data-deletions="{{ deletions }}"
      data-has-diff="{{ 1 if has_diff else 0 }}"
      hx-get="{{ source }}"
@@ -95,7 +96,11 @@
   <div class="diff">
     {# The pane's one scroller. Morph matches it by id and never replaces it,
        which is what holds the scroll position; the tree scrolls to it too. #}
-    <div class="lines" id="diff-lines">
+    {# A click on a line asks for that line's box; the handler builds the view
+       from `data-comment-base` and the line's own anchor. The request is issued
+       from here so it takes its place in the pane's queue — see `app.js` for
+       why the lines do not carry it themselves. #}
+    <div class="lines" id="diff-lines" hx-sync="#review:replace">
       {% for file in files %}
         <section class="file" id="file-{{ file.index }}" data-path="{{ file.path }}">
           <header class="file-head">
@@ -161,12 +166,8 @@
 
               {% for line in hunk.lines %}
                 {% set key = file.path ~ "#" ~ line.anchor %}
-                {# Clicking a line opens its box; clicking it again closes it.
-                   Both are the same view with one query parameter changed. #}
                 <div class="line l-{{ line.kind }} {% if comment == key %}commenting{% endif %}"
-                     data-file="{{ file.path }}" data-anchor="{{ line.anchor }}"
-                     hx-get="{% if comment == key %}{{ comment_base }}{% else %}{{ comment_base }}&comment={{ key | urlencode }}{% endif %}"
-                     hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
+                     data-file="{{ file.path }}" data-anchor="{{ line.anchor }}">
                   <span class="add">+</span>
                   <span class="n">{{ line.old_line if line.old_line else "" }}</span>
                   <span class="n">{{ line.new_line if line.new_line else "" }}</span>

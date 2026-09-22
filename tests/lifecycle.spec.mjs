@@ -486,6 +486,26 @@ test("a file can be ticked off, which folds it away until it is untucked", async
   await expect(main.locator(".line").first()).toBeVisible();
 });
 
+test("the lines carry no request of their own, and still open their box", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await expect(line).toBeVisible();
+  // Every line of every file is on the page at once, so an `hx-get` per line is
+  // the diff's whole length in attributes — and in elements for htmx to process
+  // on each update. One delegated listener builds the same view from the line's
+  // anchor.
+  await expect(page.locator("#review .line[hx-get]")).toHaveCount(0);
+
+  await line.click();
+  await expect(page.locator("#review .compose textarea")).toBeVisible();
+
+  // And the same line again closes it, which is the toggle the attribute used
+  // to carry.
+  await line.click();
+  await expect(page.locator("#review .compose")).toHaveCount(0);
+});
+
 test("a review comment goes back to the agent and produces its own turn", async ({ page }) => {
   await openCard(page, cardId);
 
