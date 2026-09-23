@@ -36,6 +36,92 @@ pub enum Dir {
     Down,
 }
 
+/// Unchanged lines left hidden between or around the shown runs, and the
+/// unexpanded hunks either side that open into them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fold {
+    pub lines: usize,
+    /// Opens downward into the fold; absent at the top of the file.
+    pub above: Option<usize>,
+    /// Opens upward into the fold; absent at the bottom of the file.
+    pub below: Option<usize>,
+}
+
+/// One click on a fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opening {
+    pub hunk: usize,
+    pub dir: Dir,
+    pub lines: usize,
+    pub label: String,
+    /// Absent on the secondary "all" beside a stepped fold.
+    pub icon: Option<&'static str>,
+}
+
+impl Fold {
+    /// Lines one click of a stepped fold opens up.
+    const STEP: usize = 10;
+    /// Shorter than this is shown rather than folded.
+    const MIN_FOLDED: usize = 10;
+    /// Shorter than this opens whole in one click.
+    const MIN_STEPPED: usize = 20;
+
+    /// Whether `lines` unchanged lines are worth hiding at all.
+    pub fn hides(lines: usize) -> bool {
+        lines >= Self::MIN_FOLDED
+    }
+
+    /// What the reader is offered, most prominent first.
+    pub fn openings(&self) -> Vec<Opening> {
+        let lines = self.lines;
+        let (hunk, dir) = match (self.above, self.below) {
+            (Some(hunk), _) => (hunk, Dir::Down),
+            (None, Some(hunk)) => (hunk, Dir::Up),
+            (None, None) => return Vec::new(),
+        };
+
+        if lines < Self::MIN_STEPPED {
+            let icon = match (self.above, self.below) {
+                (Some(_), Some(_)) => "unfold-vertical",
+                (Some(_), None) => "chevron-down",
+                _ => "chevron-up",
+            };
+            return vec![Opening {
+                hunk,
+                dir,
+                lines,
+                label: format!("Expand all {lines} lines"),
+                icon: Some(icon),
+            }];
+        }
+
+        let steps = [
+            (self.above, Dir::Down, "below", "chevron-down"),
+            (self.below, Dir::Up, "above", "chevron-up"),
+        ];
+        let mut openings: Vec<_> = steps
+            .into_iter()
+            .filter_map(|(hunk, dir, side, icon)| {
+                Some(Opening {
+                    hunk: hunk?,
+                    dir,
+                    lines: Self::STEP,
+                    label: format!("Expand {} lines {side}", Self::STEP),
+                    icon: Some(icon),
+                })
+            })
+            .collect();
+        openings.push(Opening {
+            hunk,
+            dir,
+            lines,
+            label: format!("all {lines}"),
+            icon: None,
+        });
+        openings
+    }
+}
+
 impl FileExpansion {
     pub const WHOLE_FILE: &'static str = "file";
     pub const SHOW: &'static str = "show";
@@ -203,6 +289,57 @@ impl Expansion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn between(lines: usize) -> Fold {
+        Fold {
+            lines,
+            above: Some(0),
+            below: Some(1),
+        }
+    }
+
+    #[test]
+    fn a_short_fold_is_not_hidden() {
+        assert!(!Fold::hides(Fold::MIN_FOLDED - 1));
+        assert!(Fold::hides(Fold::MIN_FOLDED));
+    }
+
+    #[test]
+    fn a_medium_fold_opens_whole() {
+        let openings = between(Fold::MIN_STEPPED - 1).openings();
+        assert_eq!(openings.len(), 1);
+        assert_eq!(openings[0].lines, Fold::MIN_STEPPED - 1);
+    }
+
+    #[test]
+    fn a_long_fold_steps_from_either_side_or_opens_whole() {
+        let openings: Vec<_> = between(Fold::MIN_STEPPED)
+            .openings()
+            .into_iter()
+            .map(|opening| (opening.hunk, opening.dir, opening.lines))
+            .collect();
+        assert_eq!(
+            openings,
+            [
+                (0, Dir::Down, Fold::STEP),
+                (1, Dir::Up, Fold::STEP),
+                (0, Dir::Down, Fold::MIN_STEPPED),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fold_at_an_edge_opens_from_its_only_neighbour() {
+        let top = Fold {
+            lines: Fold::MIN_STEPPED,
+            above: None,
+            below: Some(0),
+        };
+        assert!(top
+            .openings()
+            .iter()
+            .all(|opening| (opening.hunk, opening.dir) == (0, Dir::Up)));
+    }
 
     #[test]
     fn nothing_expanded_by_default() {

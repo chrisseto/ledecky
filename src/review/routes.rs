@@ -15,15 +15,11 @@ use crate::db::Db;
 use crate::git;
 use crate::project::{Card, Lane, Project};
 use crate::review::comment::{format_review, Side};
-use crate::review::diff::{Line, ParsedFile};
-use crate::review::expand::Dir;
+use crate::review::diff::{Line, ParsedFile, Segment};
 use crate::review::scope::Mode;
 use crate::review::turn;
 use crate::review::{Comment, DiffCache, Expansion, Scope, Turn, Viewed};
 use crate::tmpl::Tmpl;
-
-/// Lines one click of an expander opens up.
-const STEP: usize = 10;
 
 /// Rendered lines beyond which a file is held back behind a button.
 ///
@@ -78,22 +74,20 @@ struct Group {
 
 /// Lines still folded away on one side of a hunk, and the views that would take
 /// a bite out of them or open them entirely.
+/// One stretch of a file's diff, tagged `kind` for the template to switch on.
 #[derive(Serialize)]
-#[serde(crate = "rocket::serde")]
-struct Gap {
-    lines: usize,
-    step: usize,
-    step_href: String,
-    all_href: String,
+#[serde(crate = "rocket::serde", tag = "kind", rename_all = "snake_case")]
+enum SegmentView {
+    Lines { lines: Vec<Line> },
+    Fold { links: Vec<FoldLink> },
 }
 
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
-struct HunkView {
-    header: String,
-    lines: Vec<Line>,
-    above: Option<Gap>,
-    below: Option<Gap>,
+struct FoldLink {
+    label: String,
+    href: String,
+    icon: Option<&'static str>,
 }
 
 /// One file's diff, as the stacked pane renders it.
@@ -114,7 +108,7 @@ struct FileView {
     show_href: String,
     /// Opens every hunk, when something is still folded.
     expand_all_href: Option<String>,
-    hunks: Vec<HunkView>,
+    segments: Vec<SegmentView>,
 }
 
 /// What the pane is currently showing. Carried on every form and link so a
@@ -344,44 +338,40 @@ async fn pane(
         .enumerate()
         .map(|(index, file)| {
             let opened = expansion.file(&file.path);
-            let diff = file.hunks(&opened);
-            let length: usize = diff.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+            let diff = file.window(&opened);
+            let length = diff.lines().count();
 
             let ticked = viewed.contains(&file.path);
             // Asking for a big file once is enough; the expansion carries it.
             let held_back = (!ticked && !opened.shown() && length > MAX_LINES).then_some(length);
 
-            let hunks: Vec<HunkView> = match ticked || held_back.is_some() || file.binary {
+            let segments: Vec<SegmentView> = match ticked || held_back.is_some() || file.binary {
                 true => Vec::new(),
                 false => diff
-                    .hunks
+                    .segments
                     .into_iter()
-                    .map(|hunk| HunkView {
-                        header: hunk.header,
-                        above: gap(
-                            &opening,
-                            &expansion,
-                            &file.path,
-                            hunk.gaps.first,
-                            Dir::Up,
-                            hunk.gaps.above,
-                        ),
-                        below: gap(
-                            &opening,
-                            &expansion,
-                            &file.path,
-                            hunk.gaps.last,
-                            Dir::Down,
-                            hunk.gaps.below,
-                        ),
-                        lines: hunk.lines,
+                    .map(|segment| match segment {
+                        Segment::Lines(lines) => SegmentView::Lines { lines },
+                        Segment::Fold(fold) => SegmentView::Fold {
+                            links: fold
+                                .openings()
+                                .into_iter()
+                                .map(|o| FoldLink {
+                                    href: opening(
+                                        &expansion.plus(&file.path, o.hunk, o.dir, o.lines),
+                                    ),
+                                    label: o.label,
+                                    icon: o.icon,
+                                })
+                                .collect(),
+                        },
                     })
                     .collect(),
             };
 
-            let folded = hunks
+            let folded = segments
                 .iter()
-                .any(|hunk| hunk.above.is_some() || hunk.below.is_some());
+                .any(|segment| matches!(segment, SegmentView::Fold { .. }));
 
             FileView {
                 index,
@@ -394,7 +384,7 @@ async fn pane(
                 held_back,
                 show_href: opening(&expansion.showing(&file.path)),
                 expand_all_href: folded.then(|| opening(&expansion.whole_file(&file.path))),
-                hunks,
+                segments,
             }
         })
         .collect();
@@ -482,23 +472,6 @@ async fn head_of(worktree: &Path) -> String {
     git::run(worktree, &["rev-parse", "HEAD"])
         .await
         .unwrap_or_else(|_| "HEAD".into())
-}
-
-/// The expansion a button hands back, or nothing when that side is already open.
-fn gap(
-    link: &impl Fn(&Expansion) -> String,
-    expansion: &Expansion,
-    file: &str,
-    hunk: usize,
-    dir: Dir,
-    lines: usize,
-) -> Option<Gap> {
-    (lines > 0).then(|| Gap {
-        lines,
-        step: STEP.min(lines),
-        step_href: link(&expansion.plus(file, hunk, dir, STEP.min(lines))),
-        all_href: link(&expansion.plus(file, hunk, dir, lines)),
-    })
 }
 
 /// The diff's files as a tree: one group per directory, in the order the diff
