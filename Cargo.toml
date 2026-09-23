@@ -12,8 +12,8 @@ minijinja = { version = "2", features = ["loader", "urlencode"] }
 notify = "8.2.0"
 pty-process = { version = "0.5", features = ["async"] }
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
-rocket = { version = "0.5", features = ["json"] }
-rocket_ws = "0.1"
+rocket = { git = "https://github.com/rwf2/Rocket", rev = "3a54d079aef060a8f732bd04ea54b0581a604087", features = ["json"] }
+rocket_ws = { git = "https://github.com/rwf2/Rocket", rev = "3a54d079aef060a8f732bd04ea54b0581a604087" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite"] }

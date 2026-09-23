@@ -22,7 +22,6 @@ let
     fileset = lib.fileset.unions (map (p: ../. + "/${p}") [
       "Cargo.toml"
       "Cargo.lock"
-      "Rocket.toml"
       "build.rs"
       "migrations"
       "package.json"
@@ -57,8 +56,12 @@ in
 rustPlatform.buildRustPackage {
   inherit pname version src pnpmInstallFlags;
 
-  # Vendoring from the lockfile leaves no second hash to keep in step.
-  cargoLock.lockFile = ../Cargo.lock;
+  # Vendoring from the lockfile leaves no second hash to keep in step. Rocket
+  # comes from git at a pinned rev, which the builtin fetcher takes without one.
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    allowBuiltinFetchGit = true;
+  };
 
   # Regenerate whenever `pnpm-lock.yaml` changes: build, and paste back the hash
   # the mismatch prints.
@@ -81,14 +84,13 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   # `static/icons` and `templates/` are read relative to the working directory
-  # at runtime, as is `Rocket.toml`, so the wrapper supplies one. Only the icons
+  # at runtime, so the wrapper supplies one. Only the icons
   # go with them: the rest of the bundle is already embedded, and a second copy
   # on disk would be one nothing reads.
   postInstall = ''
     mkdir -p $out/share/ledecky/static
     cp -r static/icons $out/share/ledecky/static/icons
     cp -r templates $out/share/ledecky/templates
-    cp Rocket.toml $out/share/ledecky/Rocket.toml
 
     wrapProgram $out/bin/ledecky \
       --chdir $out/share/ledecky \

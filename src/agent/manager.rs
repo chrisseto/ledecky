@@ -94,6 +94,11 @@ impl AgentManager {
         self.auth.matches(token)
     }
 
+    /// Whether a request was addressed to the hook listener.
+    pub fn is_hook_host(&self, host: &str) -> bool {
+        self.auth.host() == host
+    }
+
     pub fn get(&self, card_id: i64) -> Option<Arc<Agent>> {
         self.agents.read().unwrap().get(&card_id).cloned()
     }
@@ -511,12 +516,11 @@ fn kill_pid(pid: i64) {
         .status();
 }
 
-/// Two things the manager needs from the server's own lifetime, rather than
-/// from a caller: the port hook callbacks should name, and a chance to take its
-/// agents down with it.
+/// What the manager needs from the server's own lifetime, rather than from a
+/// caller: a chance to take its agents down with it.
 ///
-/// NB: a fairing on the manager rather than a pair of `AdHoc`s in `main`. Those
-/// had to fish the manager back out of managed state by type, which is a lookup
+/// NB: a fairing on the manager rather than an `AdHoc` in `main`. That had to
+/// fish the manager back out of managed state by type, which is a lookup
 /// that compiles whether or not anything was ever managed — attaching the
 /// manager itself cannot miss.
 #[rocket::async_trait]
@@ -524,14 +528,8 @@ impl Fairing for AgentManager {
     fn info(&self) -> Info {
         Info {
             name: "agents",
-            kind: fairing::Kind::Liftoff | fairing::Kind::Shutdown,
+            kind: fairing::Kind::Shutdown,
         }
-    }
-
-    /// The bound port is only knowable here: `port = 0` asks for a free one, and
-    /// hook URLs have to name the one agents can actually reach.
-    async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
-        self.auth.bind(rocket.config().port);
     }
 
     /// Live agents are children of this process; leaving them behind would
@@ -590,6 +588,7 @@ mod tests {
     use super::*;
     use crate::db::tests::memory_db;
     use crate::project::{NewCard, Project};
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::path::{Path, PathBuf};
     use std::process::Child;
 
@@ -676,7 +675,7 @@ mod tests {
         AgentManager::new(
             db.clone(),
             Changes::default(),
-            HookAuth::new(),
+            HookAuth::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
             Settings::default(),
         )
     }
@@ -855,7 +854,12 @@ mod tests {
 
     /// A manager whose settings point at a scratch data directory.
     fn sweeper(db: &Db, settings: Settings) -> Arc<AgentManager> {
-        AgentManager::new(db.clone(), Changes::default(), HookAuth::new(), settings)
+        AgentManager::new(
+            db.clone(),
+            Changes::default(),
+            HookAuth::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            settings,
+        )
     }
 
     fn sweep_settings(data_dir: &Path) -> Settings {

@@ -157,9 +157,9 @@ pub async fn board(
 ) -> Result<Tmpl, Status> {
     let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
     Ok(Shell {
-        db: &db,
-        settings: &settings,
-        cache: &cache,
+        db,
+        settings,
+        cache,
     }
     .render(Some(project), NOTHING, context! {})
     .await)
@@ -171,9 +171,9 @@ pub async fn board(
 pub async fn index(db: &State<Db>, settings: &State<Settings>, cache: &State<DiffCache>) -> Tmpl {
     let project = Project::all(db).await.into_iter().next();
     Shell {
-        db: &db,
-        settings: &settings,
-        cache: &cache,
+        db,
+        settings,
+        cache,
     }
     .render(project, NOTHING, context! {})
     .await
@@ -187,11 +187,11 @@ pub async fn switcher(
     cache: &State<DiffCache>,
     board: Option<i64>,
 ) -> Tmpl {
-    let project = current(&db, board).await;
+    let project = current(db, board).await;
     Shell {
-        db: &db,
-        settings: &settings,
-        cache: &cache,
+        db,
+        settings,
+        cache,
     }
     .render(project, PROJECTS, context! {})
     .await
@@ -208,9 +208,9 @@ pub async fn new_card(
     let form = form_context(&project, None, Fields::default(), None).await;
 
     Ok(Shell {
-        db: &db,
-        settings: &settings,
-        cache: &cache,
+        db,
+        settings,
+        cache,
     }
     .render(Some(project), NEW_CARD, form)
     .await)
@@ -235,9 +235,9 @@ pub async fn edit_card(
 
     let form = form_context(&project, Some(&card), Fields::of(&card), None).await;
     Ok(Shell {
-        db: &db,
-        settings: &settings,
-        cache: &cache,
+        db,
+        settings,
+        cache,
     }
     .render(Some(project), EDIT_CARD, form)
     .await)

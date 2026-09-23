@@ -57,11 +57,18 @@ export async function boot({ root, agentBin } = {}) {
       ...process.env,
       // A free port, so a run never fights the dev server, another worker, or a
       // leftover of its own for a fixed one.
-      ROCKET_PORT: "0",
-      ROCKET_LOG_LEVEL: "critical",
+      LEDECKY_PORT: "0",
+      LEDECKY_HOOK_PORT: "0",
+      // Rocket's liftoff line is the one place the bound port is reported, and
+      // it is logged at `info`.
+      LEDECKY_LOG_LEVEL: "info",
+      LEDECKY_LOG_FORMAT: "pretty",
+      LEDECKY_CLI_COLORS: "false",
       // Isolation: the app derives every path it writes from this, so a test
       // run never touches a real board and workers never touch each other's.
       XDG_DATA_HOME: join(root, "data"),
+      // Likewise, never read the real config.
+      XDG_CONFIG_HOME: join(root, "config"),
       LEDECKY_AGENT_BIN:
         agentBin ?? process.env.LEDECKY_AGENT_BIN ?? join(PROJECT, "tests/fake-agent.mjs"),
       ...AGENT_TIMINGS,
@@ -73,9 +80,14 @@ export async function boot({ root, agentBin } = {}) {
     let out = "";
     server.stdout.setEncoding("utf8");
     server.stdout.on("data", (chunk) => {
+      // NB: still drained once found; a full pipe would block the server.
+      if (out === null) return;
       out += chunk;
-      const found = out.match(/listening on (\S+)/)?.[1];
-      if (found) resolve(found);
+      const found = out.match(/launched on (\S+)/)?.[1];
+      if (found) {
+        out = null;
+        resolve(found);
+      }
     });
     // Nothing else says where the server is, so a death here is terminal.
     server.on("exit", (code) => reject(new Error(`the server exited with ${code}`)));
@@ -87,8 +99,8 @@ export async function boot({ root, agentBin } = {}) {
 /**
  * Stops a server started by `boot`.
  *
- * SIGINT rather than SIGTERM: Rocket's `shutdown.signals` defaults to `ctrl_c`,
- * so a TERM skips the fairing that kills the card's agents on the way out.
+ * Either SIGINT or SIGTERM starts Rocket's graceful shutdown, which runs the
+ * fairing that kills the card's agents on the way out; a KILL is the fallback.
  */
 export async function shutdown({ server }) {
   if (!server || server.exitCode !== null) return;

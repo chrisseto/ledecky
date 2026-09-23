@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rocket::http::Status;
+use rocket::request::{FromRequest, Outcome, Request};
 use rocket::serde::json::Json;
 use rocket::{post, State};
 use serde_json::{json, Value};
 
 use crate::agent::messaging::Inbox;
-use crate::agent::AgentManager;
+use crate::agent::{Agent, AgentManager};
 use crate::config::Settings;
 use crate::db::Db;
 use crate::events::Kind;
@@ -16,6 +17,52 @@ use crate::project::{Card, Project};
 use crate::review::{DiffCache, Turn};
 use crate::watch::Worktrees;
 
+/// Every route agents call back on.
+pub fn routes() -> Vec<rocket::Route> {
+    rocket::routes![receive, session_start]
+}
+
+/// The agent a hook came from: the one registered for the card the path names,
+/// on a request addressed to the hook listener and carrying this server's
+/// token. Registered, not running: a session's last hooks can land after it
+/// exits.
+///
+/// The hook listener binds loopback whatever the board's address, so widening
+/// that does not widen who can reach these. A request addressed elsewhere, or
+/// for a card with no agent, is forwarded, and so a 404; a wrong token is a 403.
+pub struct Caller(Arc<Agent>);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Caller {
+    type Error = ();
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, ()> {
+        let Some(manager) = req.rocket().state::<Arc<AgentManager>>() else {
+            return Outcome::Forward(Status::InternalServerError);
+        };
+        let host = req.host().map(|host| host.to_string());
+        if !host.is_some_and(|host| manager.is_hook_host(&host)) {
+            return Outcome::Forward(Status::NotFound);
+        }
+        // Both routes are `/<kind>/<token>/<card_id>`, and only the kind and
+        // what follows the card differ.
+        let mut path = req.routed_segments(0..);
+        let (Some(_kind), Some(token), Some(card_id)) = (path.next(), path.next(), path.next())
+        else {
+            return Outcome::Forward(Status::NotFound);
+        };
+
+        if !manager.verify(token) {
+            return Outcome::Error((Status::Forbidden, ()));
+        }
+
+        match card_id.parse().ok().and_then(|id: i64| manager.get(id)) {
+            Some(agent) => Outcome::Success(Caller(agent)),
+            None => Outcome::Forward(Status::NotFound),
+        }
+    }
+}
+
 /// Receives a session's inbox socket, reported by the `SessionStart` hook.
 ///
 /// NB: off `/hooks` on purpose. This is posted by a re-execution of this binary
@@ -23,17 +70,8 @@ use crate::watch::Worktrees;
 /// payload the others share — and it must not be recorded as a hook event,
 /// because its arrival proves only that *we* can reach ourselves. Whether Claude
 /// Code's own HTTP hooks land is the separate question `watch_startup` asks.
-#[post("/inbox/<token>/<card_id>", data = "<payload>")]
-pub fn session_start(
-    manager: &State<Arc<AgentManager>>,
-    token: &str,
-    card_id: i64,
-    payload: Json<Value>,
-) -> Result<Json<Value>, Status> {
-    if !manager.verify(token) {
-        return Err(Status::Forbidden);
-    }
-
+#[post("/inbox/<_>/<_>", data = "<payload>")]
+pub fn session_start(caller: Caller, payload: Json<Value>) -> Result<Json<Value>, Status> {
     let socket = payload
         .get("socket")
         .and_then(Value::as_str)
@@ -42,7 +80,8 @@ pub fn session_start(
         return Err(Status::BadRequest);
     }
 
-    if let Some(agent) = manager.running(card_id) {
+    let Caller(agent) = caller;
+    if agent.is_running() {
         agent.set_inbox(Inbox {
             socket: socket.to_owned(),
             token: payload
@@ -59,27 +98,24 @@ pub fn session_start(
 /// Receives Claude Code's HTTP hooks. Always answers 200 with an empty decision:
 /// a hook that blocks or errors would stall the agent, and nothing here is worth
 /// interrupting a turn for.
-// NB: every parameter below the token is a Rocket request guard, which is how
+// NB: every parameter but the path segments is a Rocket request guard, which is how
 // the framework injects managed state. Grouping them to please the lint would
 // mean a hand-written `FromRequest` whose only purpose is a smaller signature.
 #[allow(clippy::too_many_arguments)]
-#[post("/hooks/<token>/<card_id>/<event>", data = "<payload>")]
+#[post("/hooks/<_>/<card_id>/<event>", data = "<payload>")]
 pub async fn receive(
+    caller: Caller,
     db: &State<Db>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     worktrees: &State<Worktrees>,
-    token: &str,
     card_id: i64,
     event: &str,
     payload: Json<Value>,
 ) -> Result<Json<Value>, Status> {
-    if !manager.verify(token) {
-        return Err(Status::Forbidden);
-    }
-
     let server = Server {
+        agent: &caller.0,
         db,
         manager,
         settings,
@@ -92,9 +128,10 @@ pub async fn receive(
 
 /// Everything a hook can reach.
 ///
-/// A struct because answering one takes all five, and a call listing them reads
+/// A struct because answering one takes all six, and a call listing them reads
 /// as nothing at all.
 struct Server<'a> {
+    agent: &'a Agent,
     db: &'a Db,
     manager: &'a Arc<AgentManager>,
     settings: &'a Settings,
@@ -103,8 +140,6 @@ struct Server<'a> {
 }
 
 /// What a hook actually does, once it has proved who it is.
-///
-/// Separate so the token check reads as the one thing standing in front of it.
 async fn answer(
     server: &Server<'_>,
     card_id: i64,
@@ -112,6 +147,7 @@ async fn answer(
     payload: Json<Value>,
 ) -> Result<Json<Value>, Status> {
     let Server {
+        agent,
         db,
         manager,
         settings,
@@ -156,7 +192,7 @@ async fn answer(
         // leaves the screen.
         "needs-user" => {
             manager.needs_user(card_id).await;
-            if let Some(agent) = manager.running(card_id) {
+            if agent.is_running() {
                 agent.expect_dialog();
             }
         }

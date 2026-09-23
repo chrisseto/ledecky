@@ -15,18 +15,21 @@ mod events;
 mod git;
 mod gzip;
 mod hooks;
+mod listener;
 mod project;
 mod review;
 mod tmpl;
 mod watch;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use rocket::fairing::AdHoc;
-use rocket::figment::providers::Env;
+use rocket::figment::Figment;
+use rocket::listener::tcp::TcpListener;
 
 use crate::config::Settings;
+use crate::listener::All;
 
 /// NB: hooks are checked before anything else runs. The `SessionStart` hook
 /// re-executes this binary (`hooks::dispatch`), and that process must not open
@@ -42,31 +45,55 @@ async fn main() {
         return;
     }
 
-    // NB: reported and exited rather than returned. `rocket::Error` is large
-    // enough that returning it from `main` is a lint of its own, and the
-    // `Debug` rendering a returned `Err` gets is worse than this anyway.
-    if let Err(err) = launch().await {
-        eprintln!("ledecky: {err}");
+    // NB: reported and exited rather than returned: the `Debug` rendering a
+    // returned `Err` gets is worse than this.
+    if let Err(err) = launch(&args).await {
+        eprintln!("ledecky: {err:#}");
         std::process::exit(1);
     }
 }
 
-async fn launch() -> anyhow::Result<()> {
-    rocket().await?.launch().await?;
+/// One Rocket on two sockets bound here: the board on the configured address,
+/// and the hooks agents call back on over loopback only.
+async fn launch(args: &[String]) -> anyhow::Result<()> {
+    let figment = config::figment(config::config_file(args)?.as_deref());
+    let settings = Settings::from(&figment).context("reading settings")?;
+    // NB: Rocket's own keys ride the same figment, and the error it raises for
+    // a bad one names no key and no value.
+    figment
+        .extract::<rocket::Config>()
+        .context("reading Rocket's settings")?;
+
+    let board = TcpListener::bind((settings.address, settings.port))
+        .await
+        .with_context(|| format!("binding {}:{}", settings.address, settings.port))?;
+    let hook_addr = (settings.hook_address, settings.hook_port);
+    let hooks = TcpListener::bind(hook_addr)
+        .await
+        .with_context(|| format!("binding {}:{}", hook_addr.0, hook_addr.1))?;
+
+    // Where hook callbacks are served, which only the bound listener knows: a
+    // configured port of 0 asks for a free one.
+    let hooks_at = hooks.local_addr()?;
+
+    rocket(figment, settings, hooks_at)
+        .await?
+        .launch_on(All::new(vec![board, hooks]))
+        .await
+        // NB: `rocket::Error` is not `Sync`, and so is not an `anyhow::Error`.
+        // Rocket has already logged whatever detail it carries.
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
     Ok(())
 }
 
 /// NB: `async`, and so not `#[launch]`, which hands Rocket a synchronous
 /// builder and runs it for us. Opening the database awaits, and so does the
 /// orphan sweep behind it.
-async fn rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>> {
-    // Rocket's own figment reads `Rocket.toml` and `ROCKET_*`; layering
-    // `LEDECKY_*` on top gives this app's keys an override that reads naturally
-    // and does not collide with Rocket's.
-    let figment = rocket::Config::figment().merge(Env::prefixed("LEDECKY_").global());
-    let rocket = rocket::custom(&figment);
-
-    let settings = Settings::from(&figment).context("reading settings")?;
+async fn rocket(
+    figment: Figment,
+    settings: Settings,
+    hooks_at: SocketAddr,
+) -> anyhow::Result<rocket::Rocket<rocket::Build>> {
     let db = db::Db::open(&settings)
         .await
         .context("opening the database")?;
@@ -77,12 +104,8 @@ async fn rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>> {
     let cache = review::DiffCache::default();
     let changes = events::Changes::default();
 
-    let manager = agent::AgentManager::new(
-        db.clone(),
-        changes.clone(),
-        hooks::HookAuth::new(),
-        settings.clone(),
-    );
+    let auth = hooks::HookAuth::new(hooks_at);
+    let manager = agent::AgentManager::new(db.clone(), changes.clone(), auth, settings.clone());
 
     // A previous run may have been killed without getting to its shutdown hook.
     manager.sweep_orphans().await;
@@ -94,6 +117,7 @@ async fn rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>> {
         std::time::Duration::from_millis(settings.watch_debounce),
     );
 
+    let rocket = rocket::custom(&figment);
     let rocket = if settings.gzip {
         rocket.attach(gzip::Gzip)
     } else {
@@ -113,15 +137,6 @@ async fn rocket() -> anyhow::Result<rocket::Rocket<rocket::Build>> {
         .mount("/", project::routes())
         .mount("/", agent::routes())
         .mount("/", review::routes())
-        // Binds the hook port on liftoff and takes the agents down on shutdown.
-        .attach(manager)
-        .attach(AdHoc::on_liftoff("banner", |rocket| {
-            Box::pin(async move {
-                let config = rocket.config();
-                println!(
-                    "ledecky listening on http://{}:{}",
-                    config.address, config.port
-                );
-            })
-        })))
+        .mount("/", agent::webhooks::routes())
+        .attach(manager))
 }

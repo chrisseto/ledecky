@@ -115,11 +115,11 @@ pub async fn new(
     cache: &State<DiffCache>,
     board: Option<i64>,
 ) -> Tmpl {
-    let project = board::current(&db, board).await;
+    let project = board::current(db, board).await;
     Shell {
-        db: &db,
-        settings: &settings,
-        cache: &cache,
+        db,
+        settings,
+        cache,
     }
     .render(
         project,

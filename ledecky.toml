@@ -1,8 +1,13 @@
 [default]
 address = "127.0.0.1"
-# Fixed on purpose: hook URLs handed to `claude --settings` must be stable, and
-# stable enough for a user to put in `allowedHttpHookUrls` if they ever set it.
 port = 8770
+
+# Hooks are served on a socket of their own. Loopback because agents run here,
+# and the URLs handed to them name whatever this says. The port is fixed on
+# purpose: those URLs must be stable, and stable enough for a user to put in
+# `allowedHttpHookUrls` if they ever set it.
+hook_address = "127.0.0.1"
+hook_port = 8771
 
 # Names the data directory and the `refs/<app_slug>/<card>/` namespace.
 app_slug = "ledecky"

@@ -1,7 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _IoWrite};
-use std::net::TcpStream;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -52,7 +51,8 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// local process cannot forge turn boundaries.
 pub struct HookAuth {
     token: String,
-    port: AtomicU16,
+    /// Where callbacks are served, as the listener serving them bound it.
+    served_at: SocketAddr,
     /// This binary, which the `SessionStart` hook re-executes. See `HOOK_ARG`.
     exe: String,
 }
@@ -67,7 +67,7 @@ struct HttpHook {
 }
 
 impl HookAuth {
-    pub fn new() -> Self {
+    pub fn new(served_at: SocketAddr) -> Self {
         let exe = std::env::current_exe()
             .expect("this executable's own path is unavailable")
             .to_string_lossy()
@@ -75,17 +75,9 @@ impl HookAuth {
 
         Self {
             token: random_token(),
-            port: AtomicU16::new(0),
+            served_at,
             exe,
         }
-    }
-
-    /// Point callbacks at the port the server actually bound.
-    ///
-    /// NB: separate from `new` because a configured port of 0 asks for a free
-    /// one, so the answer does not exist until the listener is up.
-    pub fn bind(&self, port: u16) {
-        self.port.store(port, Ordering::Relaxed);
     }
 
     pub fn matches(&self, token: &str) -> bool {
@@ -106,8 +98,13 @@ impl HookAuth {
         format!("{}/inbox/{}/{card_id}", self.origin(), self.token)
     }
 
+    /// The `Host` every callback arrives with.
+    pub fn host(&self) -> String {
+        self.served_at.to_string()
+    }
+
     fn origin(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port.load(Ordering::Relaxed))
+        format!("http://{}", self.served_at)
     }
 
     /// The `--settings` payload handed to `claude`.
@@ -275,6 +272,12 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    /// A hook listener's address, as `HookAuth` takes it.
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
 
     #[test]
     fn tokens_are_hex_and_unpredictable() {
@@ -288,7 +291,7 @@ mod tests {
 
     #[test]
     fn only_the_issuing_token_is_accepted() {
-        let auth = HookAuth::new();
+        let auth = HookAuth::new(local(0));
         let token = auth.url(1, "stop").split('/').nth(4).unwrap().to_owned();
 
         assert!(auth.matches(&token));
@@ -297,8 +300,7 @@ mod tests {
     }
 
     fn settings_for(card_id: i64) -> (HookAuth, Value) {
-        let auth = HookAuth::new();
-        auth.bind(9999);
+        let auth = HookAuth::new(local(9999));
         let settings = auth.settings(card_id);
         (auth, settings)
     }
@@ -395,8 +397,7 @@ mod tests {
     /// are built from the same two constants, and this is what holds them there.
     #[test]
     fn dispatch_accepts_what_the_hook_command_passes() {
-        let auth = HookAuth::new();
-        auth.bind(9999);
+        let auth = HookAuth::new(local(9999));
         let url = auth.inbox_url(42);
 
         let command = auth.settings(42)["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -426,7 +427,7 @@ mod tests {
 
     #[test]
     fn the_payload_is_valid_json_for_the_cli() {
-        let json = HookAuth::new().settings_json(7);
+        let json = HookAuth::new(local(0)).settings_json(7);
         let parsed: Value = serde_json::from_str(&json).unwrap();
         assert!(parsed["hooks"]["Stop"][0]["hooks"][0]["url"]
             .as_str()

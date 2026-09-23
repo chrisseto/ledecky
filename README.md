@@ -171,12 +171,18 @@ before marking the card Done and pruning the worktree. Turn refs are kept; the
 
 ## Configuration
 
-Settings live in `Rocket.toml` beside Rocket's own and are read from the same
-figment, so any of them can be overridden per-run with a `LEDECKY_` environment
-variable:
+Settings are read from `--config <path>`, or else
+`$XDG_CONFIG_HOME/ledecky/ledecky.toml`, under `[default]` beside Rocket's own.
+Any of them — Rocket's included — can be overridden per-run with a `LEDECKY_`
+environment variable. `ROCKET_*` is not read. `ledecky.toml` in this repository
+documents every key at its default; nothing reads it unless named.
 
 | Key | Default | What it does |
 | --- | --- | --- |
+| `address` | `127.0.0.1` | Where the board listens |
+| `port` | `8770` | The board's port; `0` takes a free one |
+| `hook_address` | `127.0.0.1` | Where hooks are served; agents are handed URLs naming it |
+| `hook_port` | `8771` | The hook port; `0` takes a free one |
 | `app_slug` | `ledecky` | Names the data directory and the `refs/<slug>/` namespace |
 | `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
 | `agent_bin` | `claude` | The executable spawned for an agent. 2.1.224 or newer, for the inbox socket |
@@ -184,10 +190,12 @@ variable:
 | `head_ttl` | `30000` | How long a staged worktree head stands without the watcher, in ms |
 | `gzip` | release builds | Whether to gzip responses |
 
-`Rocket.toml` carries the agent plumbing's real-time waits beside these; the
+`ledecky.toml` carries the agent plumbing's real-time waits beside these; the
 end-to-end suite shrinks every one of them rather than waiting them out.
 
-The port is fixed in `Rocket.toml` because hook URLs have to be stable.
+The hook port is fixed by default because hook URLs have to be stable. Hooks
+are served on a listener of their own, so widening `address` exposes the board
+and never them — `hook_address` is what widens the hooks.
 
 Per-card permission mode and model are set on the new-card form, whose one Task
 field doubles as the card's title: the first line names the card, the whole
@@ -281,7 +289,7 @@ The suite runs four workers, each with a server, a database and a scratch
 repository of its own, so no spec depends on another's state or on file order.
 `tests/support/fixtures.mjs` owns that; `tests/support/server.mjs` builds and
 starts the binary. The waits the agent plumbing makes in real time are settings
-(`startup_timeout`, `dialog_grace` and friends in `Rocket.toml`), which is what
+(`startup_timeout`, `dialog_grace` and friends in `ledecky.toml`), which is what
 keeps a run in seconds rather than minutes — see `AGENT_TIMINGS` in
 `playwright.config.mjs`.
 

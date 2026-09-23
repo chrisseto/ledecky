@@ -10,7 +10,8 @@ pub mod webhooks;
 pub use agent::Agent;
 pub use manager::AgentManager;
 
-/// Every route this domain serves.
+/// Every route this domain serves on the board. Hooks are served apart; see
+/// `webhooks::routes`.
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
         terminal::focus,
@@ -21,7 +22,5 @@ pub fn routes() -> Vec<rocket::Route> {
         terminal::resize,
         terminal::merge,
         terminal::socket,
-        webhooks::receive,
-        webhooks::session_start,
     ]
 }

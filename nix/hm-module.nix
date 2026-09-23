@@ -7,13 +7,17 @@ let
 
   inherit (lib) mkIf mkOption mkEnableOption types;
 
-  toValue = v: if lib.isBool v then lib.boolToString v else toString v;
+  toml = pkgs.formats.toml { };
 
-  # `watch_debounce = 250` becomes `LEDECKY_WATCH_DEBOUNCE=250`. Every key in
-  # `Settings` is reachable this way; the named options below are the ones worth
-  # documenting.
-  settingsEnv =
-    lib.mapAttrsToList (k: v: "LEDECKY_${lib.toUpper k}=${toValue v}") cfg.settings;
+  # Named in the unit, so a change to it is a change to the unit and restarts
+  # the service.
+  configFile = toml.generate "ledecky.toml" {
+    default = cfg.settings // {
+      inherit (cfg) address port;
+      hook_address = cfg.hookAddress;
+      hook_port = cfg.hookPort;
+    };
+  };
 in
 {
   options.services.ledecky = {
@@ -30,8 +34,8 @@ in
       type = types.str;
       default = "127.0.0.1";
       description = ''
-        Address to bind. Agents reach their hooks over the loopback address
-        whatever this says, so widening it only widens who can see the board.
+        Address the board binds. Hooks are served on loopback whatever this
+        says, so widening it only widens who can see the board.
       '';
     };
 
@@ -39,19 +43,37 @@ in
       type = types.port;
       default = 8770;
       description = ''
-        Port to listen on, or 0 to take a free one. Hook URLs are built from the
-        port actually bound, so agents follow it either way — but a fixed port is
-        what makes a `allowedHttpHookUrls` allowlist possible.
+        The board's port, or 0 to take a free one.
+      '';
+    };
+
+    hookAddress = mkOption {
+      type = types.str;
+      default = "127.0.0.1";
+      description = ''
+        Address hooks are served on. Agents are handed URLs naming it, so
+        widening it hands those URLs out wider too.
+      '';
+    };
+
+    hookPort = mkOption {
+      type = types.port;
+      default = 8771;
+      description = ''
+        Loopback port hooks are served on, or 0 to take a free one. Hook URLs are
+        built from the port actually bound, so agents follow it either way — but
+        a fixed port is what makes a `allowedHttpHookUrls` allowlist possible.
       '';
     };
 
     settings = mkOption {
-      type = types.attrsOf (types.oneOf [ types.str types.int types.bool ]);
+      type = toml.type;
       default = { };
       example = { agent_bin = "claude"; watch_debounce = 250; };
       description = ''
-        Any other key from `Rocket.toml`, passed through as a `LEDECKY_*`
-        environment variable. See the Configuration section of the README.
+        Any other key from `ledecky.toml`, written under `[default]` in the
+        config file the service is started with. See the Configuration section
+        of the README.
       '';
     };
   };
@@ -65,17 +87,11 @@ in
       };
 
       Service = {
-        ExecStart = lib.getExe cfg.package;
+        ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
 
-        # NB: no PATH. A user unit inherits the session's, which carries the
-        # profile directories an agent is installed into, and `Environment=`
-        # replaces rather than prepends — setting it here would take that away.
-        # `git` and `delta` come from the package's wrapper, which prefixes
-        # them so its own pinned pair wins.
-        Environment = [
-          "ROCKET_ADDRESS=${cfg.address}"
-          "ROCKET_PORT=${toString cfg.port}"
-        ] ++ settingsEnv;
+        # NB: no `Environment=` PATH. A user unit inherits the session's, which
+        # carries the profile directories an agent is installed into, and
+        # `Environment=` would replace it rather than prepend.
 
         Restart = "on-failure";
         RestartSec = 5;

@@ -135,13 +135,13 @@ pub async fn diff_pane(
     comment: Option<&str>,
 ) -> Result<Tmpl, Status> {
     let view = View {
-        scope: scope.as_deref(),
-        expand: expand.as_deref(),
-        comment: comment.as_deref(),
+        scope,
+        expand,
+        comment,
     };
     Ok(Tmpl(
         "_review.html",
-        pane(&db, &settings, &cache, id, view).await?,
+        pane(db, settings, cache, id, view).await?,
     ))
 }
 
@@ -570,7 +570,7 @@ pub async fn add_comment(
     };
     Ok(Tmpl(
         "_review.html",
-        pane(&db, &settings, &cache, id, view).await?,
+        pane(db, settings, cache, id, view).await?,
     ))
 }
 
@@ -586,7 +586,7 @@ pub async fn delete_comment(
     Comment::delete_draft(db, id, comment_id).await;
     Ok(Tmpl(
         "_review.html",
-        pane(&db, &settings, &cache, id, form.view()).await?,
+        pane(db, settings, cache, id, form.view()).await?,
     ))
 }
 
@@ -603,7 +603,7 @@ pub async fn discard_comments(
     Comment::delete_drafts(db, id).await;
     Ok(Tmpl(
         "_review.html",
-        pane(&db, &settings, &cache, id, form.view()).await?,
+        pane(db, settings, cache, id, form.view()).await?,
     ))
 }
 
@@ -633,7 +633,7 @@ pub async fn toggle_viewed(
     };
     Ok(Tmpl(
         "_review.html",
-        pane(&db, &settings, &cache, id, view).await?,
+        pane(db, settings, cache, id, view).await?,
     ))
 }
 
@@ -680,6 +680,6 @@ pub async fn submit_review(
 
     Ok(Tmpl(
         "_review.html",
-        pane(&db, &settings, &cache, id, form.view()).await?,
+        pane(db, settings, cache, id, form.view()).await?,
     ))
 }

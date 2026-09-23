@@ -1,19 +1,35 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rocket::figment::Figment;
+use rocket::figment::providers::{Env, Format, Toml};
+use rocket::figment::{Figment, Profile};
 use rocket::serde::Deserialize;
 
 /// Application settings, read from the same figment Rocket uses.
 ///
-/// Keys live under `[default]` in `Rocket.toml` alongside Rocket's own, and can
+/// Keys live under `[default]` in `ledecky.toml` alongside Rocket's own, and can
 /// be overridden per-run with `LEDECKY_*` environment variables. Every field
-/// carries its own default, so `Rocket.toml` documents rather than supplies
+/// carries its own default, so `ledecky.toml` documents rather than supplies
 /// them and a figment with none of these keys still deserializes.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(crate = "rocket::serde", default)]
 pub struct Settings {
+    /// Where the board listens.
+    pub address: IpAddr,
+
+    /// The board's port, or 0 for a free one.
+    pub port: u16,
+
+    /// Where hooks are served. Loopback by default: agents run here, and the
+    /// URLs handed to them name whatever this says.
+    pub hook_address: IpAddr,
+
+    /// The port hooks are served on, or 0 for a free one. Fix it to name it in
+    /// an `allowedHttpHookUrls` allowlist.
+    pub hook_port: u16,
+
     /// Names this app's data directory and its git ref namespace.
     pub app_slug: String,
 
@@ -65,6 +81,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            address: Ipv4Addr::LOCALHOST.into(),
+            port: 8770,
+            hook_address: Ipv4Addr::LOCALHOST.into(),
+            hook_port: 8771,
             app_slug: "ledecky".to_owned(),
             data_dir: None,
             agent_bin: "claude".to_owned(),
@@ -76,6 +96,39 @@ impl Default for Settings {
             dialog_grace: 5000,
             gzip: !cfg!(debug_assertions),
         }
+    }
+}
+
+/// Rocket's defaults, the config file, then `LEDECKY_*`: one namespace for both
+/// Rocket's keys and this app's. `ROCKET_*` is not read.
+pub fn figment(file: Option<&Path>) -> Figment {
+    let mut figment = Figment::from(rocket::Config::default());
+    if let Some(file) = file {
+        figment = figment.merge(Toml::file_exact(file).nested());
+    }
+    figment
+        .merge(Env::prefixed("LEDECKY_").ignore(&["PROFILE"]).global())
+        .select(Profile::from_env_or(
+            "LEDECKY_PROFILE",
+            rocket::Config::DEFAULT_PROFILE,
+        ))
+}
+
+/// The config file named by `--config <path>`, or else
+/// `$XDG_CONFIG_HOME/ledecky/ledecky.toml` if there is one. Only a named one
+/// has to exist.
+pub fn config_file(args: &[String]) -> anyhow::Result<Option<PathBuf>> {
+    match args {
+        [] => {
+            let path = xdg_home("XDG_CONFIG_HOME", ".config").join("ledecky/ledecky.toml");
+            Ok(Some(path).filter(|p| p.is_file()))
+        }
+        [flag, path] if flag == "--config" => {
+            let path = PathBuf::from(path);
+            anyhow::ensure!(path.is_file(), "no config file at {}", path.display());
+            Ok(Some(path))
+        }
+        _ => anyhow::bail!("usage: ledecky [--config <path>]"),
     }
 }
 
@@ -163,14 +216,18 @@ impl Settings {
 }
 
 fn default_data_dir(app_slug: &str) -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
+    xdg_home("XDG_DATA_HOME", ".local/share").join(app_slug)
+}
+
+/// An XDG base directory, or its default under `$HOME`.
+fn xdg_home(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME").expect("HOME is not set");
-            PathBuf::from(home).join(".local/share")
-        });
-    base.join(app_slug)
+            PathBuf::from(home).join(fallback)
+        })
 }
 
 #[cfg(test)]
@@ -184,6 +241,22 @@ mod tests {
             figment = figment.merge(Serialized::default(key, value.to_string()));
         }
         Settings::from(&figment).unwrap()
+    }
+
+    #[test]
+    fn a_named_config_file_has_to_exist() {
+        let args = |path: &str| vec!["--config".to_owned(), path.to_owned()];
+        assert!(config_file(&args("/nonexistent/ledecky.toml")).is_err());
+
+        let file = std::env::temp_dir().join(format!("ledecky-{}.toml", std::process::id()));
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            config_file(&args(file.to_str().unwrap())).unwrap(),
+            Some(file.clone())
+        );
+        std::fs::remove_file(&file).unwrap();
+
+        assert!(config_file(&["--port".to_owned()]).is_err());
     }
 
     #[test]
