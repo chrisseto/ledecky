@@ -243,6 +243,44 @@ pub async fn edit_card(
     .await)
 }
 
+/// The card drawer over its board, which is what `/cards/<id>` is and what a
+/// write from inside the drawer answers with.
+///
+/// `error` is a complaint to show above the panes. The drawer's own controls
+/// can be refused — the chip asking for a branch that has gone, a merge already
+/// out — and a refusal nobody can read is a control that looks broken.
+pub async fn card_view(
+    db: &Db,
+    manager: &AgentManager,
+    settings: &Settings,
+    cache: &DiffCache,
+    id: i64,
+    scope: Option<&str>,
+    error: Option<&str>,
+) -> Result<Tmpl, Status> {
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let project = Project::find(db, card.project_id)
+        .await
+        .ok_or(Status::NotFound)?;
+
+    let live = manager.running(id).is_some();
+    let review = review::routes::initial(db, settings, cache, id, scope).await?;
+    // For the base-branch chip, which is the card form's picker over again.
+    let branches = git::branches(&project.repo()).await;
+
+    Ok(Shell {
+        db,
+        settings,
+        cache,
+    }
+    .render(
+        Some(project),
+        CARD,
+        context! { live, branches, error, editable => card.editable(), ..review },
+    )
+    .await)
+}
+
 #[derive(rocket::FromForm)]
 pub struct CardForm {
     task: String,
@@ -447,6 +485,76 @@ async fn update(
         Ok(false) => Err(Status::Conflict),
         Err(_) => Err(Status::InternalServerError),
     }
+}
+
+#[derive(rocket::FromForm)]
+pub struct BaseForm {
+    base_branch: String,
+}
+
+/// Re-points a card at another base branch, from the chip in its drawer.
+///
+/// Unlike the form's `update`, this lands on a card an agent is already working
+/// in — so the name is resolved against git rather than against the list the
+/// page was drawn from, which can be stale by the time the form comes back.
+/// Nothing is written until it resolves.
+///
+/// A refusal is the drawer again with the reason on it, under the status it
+/// deserves; htmx swaps a 4xx body, so the chip says what went wrong instead of
+/// quietly springing back.
+#[post("/cards/<id>/base", data = "<form>")]
+pub async fn set_base(
+    db: &State<Db>,
+    manager: &State<Arc<AgentManager>>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    changes: &State<Changes>,
+    id: i64,
+    form: Form<BaseForm>,
+) -> Result<Result<Redirect, (Status, Tmpl)>, Status> {
+    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
+    let project = Project::find(db, card.project_id)
+        .await
+        .ok_or(Status::NotFound)?;
+
+    let refused = async |status: Status, error: String| {
+        let page = card_view(db, manager, settings, cache, id, None, Some(&error)).await?;
+        Ok(Err((status, page)))
+    };
+
+    // The agent has been told to land on the branch this card had, and
+    // `check_merge` is watching that one for the work. Moving the name now would
+    // have it read another branch's history as the merge.
+    if card.merge_requested {
+        return refused(
+            Status::Conflict,
+            format!(
+                "This card is already waiting to land on {}. Stop the merge before moving it.",
+                card.base_branch
+            ),
+        )
+        .await;
+    }
+
+    let branch = form.base_branch.trim();
+    if git::rev_parse(&project.repo(), git::Rev::Branch(branch))
+        .await
+        .is_none()
+    {
+        return refused(
+            Status::UnprocessableEntity,
+            format!("No branch called {branch} in {}.", project.name),
+        )
+        .await;
+    }
+
+    Card::set_base_branch(db, id, branch).await.map_err(|err| {
+        error!("card {id}: re-pointing at {branch}: {err}");
+        Status::InternalServerError
+    })?;
+
+    changes.project(card.project_id, Kind::Board);
+    Ok(Ok(Redirect::to(format!("/cards/{id}"))))
 }
 
 /// Only modes the form offers are accepted; anything else is someone poking at

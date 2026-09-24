@@ -323,6 +323,24 @@ impl Card {
         .await;
     }
 
+    /// Re-points a card at another base branch, at any point in its life.
+    ///
+    /// NB: deliberately not gated by [`Self::EDITABLE`], the way the form's
+    /// [`Self::update`] is. The worktree keeps its root and the base ref keeps
+    /// its value; what moves is what `reconcile_base` measures against and where
+    /// a later merge is asked to land.
+    pub async fn set_base_branch(db: &Db, id: i64, branch: &str) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE cards SET base_branch = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+        )
+        .bind(branch)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_lane(db: &Db, id: i64, lane: Lane) {
         let _ =
             sqlx::query("UPDATE cards SET lane = ?1, updated_at = datetime('now') WHERE id = ?2")
@@ -747,6 +765,23 @@ mod tests {
                 "Teach it to hum\n\nQuietly."
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_base_branch_can_be_re_pointed_after_an_agent_has_started() {
+        let (db, project_id) = seeded().await;
+
+        let id = add(&db, project_id, "Teach it to whistle").await;
+        Card::set_lane(&db, id, Lane::InProgress).await;
+        Card::set_session_id(&db, id, "session-1").await;
+
+        // The form's own write is shut out by now; this one is not.
+        assert!(!rewrite(&db, id).await);
+        Card::set_base_branch(&db, id, "release").await.unwrap();
+
+        let card = Card::find(&db, id).await.unwrap();
+        assert_eq!(card.base_branch, "release");
+        assert_eq!(card.task, "Teach it to whistle");
     }
 
     #[tokio::test]

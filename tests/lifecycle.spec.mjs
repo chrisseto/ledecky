@@ -17,6 +17,7 @@ import {
   fileSection,
   git,
   lane,
+  moveCard,
   openAgent,
   openCard,
   pollsOfPath,
@@ -634,6 +635,32 @@ test("a rebase keeps upstream commits out of the card's diff", async ({ page }) 
   await expect(fileSection(page, "main.rs")).toBeVisible();
 });
 
+test("re-pointing a live card aims the merge elsewhere, not the worktree", async ({ page }) => {
+  const rooted = baseRef(cardId);
+  const head = worktreeGit(cardId, "rev-parse", "HEAD");
+
+  await openCard(page, cardId);
+  const chip = page.getByLabel("Base branch");
+  await chip.click();
+  await page.locator(".combo-menu [data-branch]", { hasText: "release" }).click();
+  await expect(chip).toHaveValue("release");
+
+  // Renaming the target is not a rebase. The worktree keeps its root, and the
+  // anchor the diff is measured from keeps its value — `release` is behind it,
+  // and reconciliation only ever moves that forward.
+  expect(worktreeGit(cardId, "rev-parse", "HEAD")).toBe(head);
+  expect(baseRef(cardId)).toBe(rooted);
+  await expect(fileSection(page, "upstream.txt")).toHaveCount(0);
+
+  // What does move is where the work is asked to land.
+  await expect(page.getByRole("button", { name: "Merge" })).toHaveAttribute("title", /release/);
+
+  await chip.click();
+  await page.locator(".combo-menu [data-branch]", { hasText: "main" }).click();
+  await expect(chip).toHaveValue("main");
+  expect(baseRef(cardId)).toBe(rooted);
+});
+
 test("merging lands the work on the base branch and retires the card", async ({ page }) => {
   const before = git("rev-parse", "main");
 
@@ -695,4 +722,28 @@ test("collecting the garbage reclaims what the finished card still held", async 
   // Its review cannot be reopened, though — the refs its turns name are gone, so
   // the drawer declines rather than trying to diff against nothing.
   expect((await page.request.get(`/cards/${cardId}`)).status()).toBe(404);
+});
+
+test("a merge already out refuses a change of base", async ({ page }) => {
+  // Its own card, based on a branch the merge cannot reach. The agent lands its
+  // work on whatever the repository has checked out, so `release` never moves,
+  // the request is never satisfied, and the card stays in the state under test.
+  await addCard(page, projectUrl, { title: "Stuck merge", base: "release" });
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "todo", "Stuck merge").getAttribute("data-card-id");
+
+  await moveCard(page, id, "in_progress", 0);
+  await expect(cardIn(page, "in_review", "Stuck merge")).toBeVisible({ timeout: SLOW });
+
+  // The request is recorded before the agent is told, so it is set by the time
+  // this answers — and the branch it named is what will be watched for the work.
+  expect((await page.request.post(`/cards/${id}/merge`)).status()).toBe(200);
+
+  const refused = await page.request.post(`/cards/${id}/base`, { form: { base_branch: "main" } });
+  expect(refused.status()).toBe(409);
+  // The status carries the refusal; the body is the drawer saying why.
+  expect(await refused.text()).toContain("already waiting to land on release");
+
+  await openCard(page, id);
+  await expect(page.getByLabel("Base branch")).toHaveValue("release");
 });

@@ -149,6 +149,47 @@ pub async fn head_branch(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// What [`rev_parse`] is being asked to resolve.
+///
+/// A kind rather than a string, because git reads a bare name generously: the
+/// same word can be a branch, a tag or a file, and `HEAD~3` is a revision too.
+/// Naming the kind is what makes "is this a branch?" answerable.
+#[derive(Clone, Copy, Debug)]
+pub enum Rev<'a> {
+    /// A local branch, and only a branch: `refs/heads/<name>`.
+    Branch(&'a str),
+    /// A ref by its full name — `refs/{APP_SLUG}/<card>/base` and its siblings.
+    Ref(&'a str),
+    /// Whatever the repository or worktree has checked out.
+    Head,
+}
+
+impl Rev<'_> {
+    /// The revision as git should read it.
+    fn spec(&self) -> String {
+        match self {
+            Rev::Branch(name) => format!("refs/heads/{name}"),
+            Rev::Ref(name) => (*name).to_owned(),
+            Rev::Head => "HEAD".to_owned(),
+        }
+    }
+}
+
+/// The commit a revision names, or `None` if it does not name one.
+pub async fn rev_parse(repo: &Path, rev: Rev<'_>) -> Option<String> {
+    run(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", rev.spec()),
+        ],
+    )
+    .await
+    .ok()
+    .filter(|sha| !sha.is_empty())
+}
+
 /// Creates a detached worktree at `path` based on `base_branch`, and records the
 /// starting commit as `refs/{APP_SLUG}/<card>/base`, which is where the card's
 /// diffs are measured from until [`reconcile_base`] moves it.
@@ -290,19 +331,12 @@ pub async fn reconcile_base(
     base_ref: &str,
     base_branch: &str,
 ) -> Option<String> {
-    let current = run(
-        repo,
-        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
-    )
-    .await
-    .ok()?;
+    let current = rev_parse(repo, Rev::Ref(base_ref)).await?;
 
     // NB: in the worktree, not the repo. `HEAD` is per-worktree, and its own
     // commits are reachable from nowhere else; the repo's is whatever happens to
     // be checked out there.
-    let head = run(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
-        .await
-        .ok()?;
+    let head = rev_parse(worktree, Rev::Head).await?;
 
     // Back in the repo, where the base branch lives. The object database and
     // `refs/heads` are shared, so this resolves either way.
@@ -766,6 +800,39 @@ mod tests {
         let listed = commits(&repo, &settings.base_ref(1), &head).await;
         let subjects: Vec<_> = listed.iter().map(|c| c.subject.as_str()).collect();
         assert_eq!(subjects, ["agent work"]);
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_branch_gets_a_branch_and_nothing_else() {
+        let (settings, repo) = scratch("rev-parse").await;
+        let head = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        run(&repo, &["tag", "v1"]).await.unwrap();
+
+        assert_eq!(
+            rev_parse(&repo, Rev::Branch("main")).await,
+            Some(head.clone())
+        );
+        assert_eq!(rev_parse(&repo, Rev::Head).await, Some(head.clone()));
+        assert_eq!(rev_parse(&repo, Rev::Branch("nope")).await, None);
+        assert_eq!(rev_parse(&repo, Rev::Branch("")).await, None);
+        // A tag and a raw sha are revisions, but they are not branches — which
+        // is the whole reason the caller says which kind it means.
+        assert_eq!(rev_parse(&repo, Rev::Branch("v1")).await, None);
+        assert_eq!(rev_parse(&repo, Rev::Branch(&head)).await, None);
+
+        run(&repo, &["branch", "feature"]).await.unwrap();
+        assert_eq!(
+            rev_parse(&repo, Rev::Branch("feature")).await,
+            Some(head.clone())
+        );
+        run(&repo, &["branch", "-D", "feature"]).await.unwrap();
+        assert_eq!(rev_parse(&repo, Rev::Branch("feature")).await, None);
+
+        // A ref of ours, by its full name.
+        let base = settings.base_ref(1);
+        assert_eq!(rev_parse(&repo, Rev::Ref(&base)).await, None);
+        run(&repo, &["update-ref", &base, &head]).await.unwrap();
+        assert_eq!(rev_parse(&repo, Rev::Ref(&base)).await, Some(head));
     }
 
     /// `--fork-point` would not cover this; plain `merge-base` does.

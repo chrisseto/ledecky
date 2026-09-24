@@ -12,10 +12,10 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::agent::AgentManager;
 use crate::config::Settings;
 use crate::db::Db;
-use crate::project::board::{self, Shell};
+use crate::project::Card;
+use crate::project::board;
 use crate::project::lifecycle;
-use crate::project::{Card, Project};
-use crate::review::{self, DiffCache};
+use crate::review::DiffCache;
 use crate::tmpl::Tmpl;
 use crate::watch::Worktrees;
 
@@ -28,25 +28,7 @@ pub async fn focus(
     id: i64,
     scope: Option<&str>,
 ) -> Result<Tmpl, Status> {
-    let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
-    let project = Project::find(db, card.project_id)
-        .await
-        .ok_or(Status::NotFound)?;
-
-    let live = manager.running(id).is_some();
-    let review = review::routes::initial(db, settings, cache, id, scope).await?;
-
-    Ok(Shell {
-        db,
-        settings,
-        cache,
-    }
-    .render(
-        Some(project),
-        board::CARD,
-        context! { live, editable => card.editable(), ..review },
-    )
-    .await)
+    board::card_view(db, manager, settings, cache, id, scope, None).await
 }
 
 /// Just the agent-state chip, so a state change redraws it without re-running a

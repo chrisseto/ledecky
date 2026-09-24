@@ -1,6 +1,6 @@
 import { expect, test } from "./support/fixtures.mjs";
 
-import { addCard, addProject, cardIn, lane, moveCard, openCard, pollsOf } from "./support/board.mjs";
+import { addCard, addProject, cardIn, git, lane, moveCard, openCard, pollsOf } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -304,7 +304,7 @@ test("a card waiting in To Do can have its task rewritten", async ({ page }) => 
   // Saving lands back on the card it edited, which is still unnamed and so
   // still standing in its task.
   await expect(page.locator(".drawer-card h2")).toHaveText("Rewritten errand\n\nSecond attempt.");
-  await expect(page.locator(".drawer-card .branch")).toContainText("release");
+  await expect(page.getByLabel("Base branch")).toHaveValue("release");
 
   await page.goto(projectUrl);
   await expect(cardIn(page, "todo", "Rewritten errand")).toBeVisible();
@@ -333,6 +333,55 @@ test("a card that has left To Do is no longer a draft", async ({ page }) => {
 
   await page.goto(projectUrl);
   await expect(cardIn(page, "done", "Rewritten errand")).toBeVisible();
+});
+
+test("the base branch is still a card's to change once it is not", async ({ page }) => {
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
+  await openCard(page, id);
+
+  // The chip is the picker, and it is the card form's: clicking it opens the
+  // same menu, and typing narrows it without going back to the server.
+  const chip = page.getByLabel("Base branch");
+  await expect(chip).toHaveValue("release");
+  await chip.click();
+  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main", "release"]);
+  await chip.fill("mai");
+  await expect(page.locator(".combo-menu [data-branch]:visible")).toHaveText(["main"]);
+
+  await page.locator(".combo-menu [data-branch]", { hasText: "main" }).click();
+  await expect(chip).toHaveValue("main");
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "done", "Rewritten errand")).toContainText("main");
+});
+
+test("a base branch git will not resolve is turned down", async ({ page }) => {
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
+
+  // A tag and a raw sha resolve as revisions, but everything downstream hands
+  // this to git as a branch.
+  git("tag", "-f", "v1");
+  for (const base_branch of ["nope", "", "v1", git("rev-parse", "main")]) {
+    const refused = await page.request.post(`/cards/${id}/base`, { form: { base_branch } });
+    expect(refused.status()).toBe(422);
+  }
+
+  // And the list the page was drawn from is not what answers: a branch picked
+  // out of it that went away in between is turned down too — as the drawer
+  // again with the reason on it, rather than a status nobody sees.
+  git("branch", "doomed");
+  await openCard(page, id);
+  await page.getByLabel("Base branch").click();
+  const doomed = page.locator(".combo-menu [data-branch]", { hasText: "doomed" });
+  await expect(doomed).toBeVisible();
+
+  git("branch", "-D", "doomed");
+  await doomed.click();
+  await expect(page.locator(".drawer-error")).toContainText("No branch called doomed");
+
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "done", "Rewritten errand")).toContainText("main");
 });
 
 test("the garbage button clears Done and takes its cards off the board", async ({ page }) => {

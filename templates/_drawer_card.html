@@ -24,7 +24,20 @@
     </details>
 
     <h2>{{ card.title or card.task }}</h2>
-    <span class="branch mono">{{ icon("git-branch") }} {{ card.base_branch }}</span>
+    <form class="branch combo" method="post" action="/cards/{{ card.id }}/base"
+          hx-post="/cards/{{ card.id }}/base" hx-target="body"
+          hx-swap="outerMorph" hx-push-url="true" data-branch-submit>
+      {{ icon("git-branch") }}
+      <input name="base_branch" class="mono" value="{{ card.base_branch }}"
+             aria-label="Base branch" placeholder="Search branches…"
+             autocomplete="off" spellcheck="false" data-branch-filter />
+      <div class="combo-menu" hidden>
+        {% for branch in branches %}
+          <button class="mono" type="button" data-branch>{{ branch }}</button>
+        {% endfor %}
+        <p class="empty-match" hidden>No branch matches</p>
+      </div>
+    </form>
 
     <span class="spacer"></span>
 
@@ -91,6 +104,12 @@
        aria-label="Close" data-close-overlay
        hx-get="/projects/{{ project.id }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("x") }}</a>
   </div>
+
+  {# A refusal from one of the controls above, which answers with the drawer
+     again rather than a status nobody sees. #}
+  {% if error %}
+    <p class="drawer-error error">{{ icon("alert-triangle") }} {{ error }}</p>
+  {% endif %}
 
   {% include "_pane_agent.html" %}
 

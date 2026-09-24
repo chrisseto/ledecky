@@ -92,11 +92,11 @@ document.addEventListener("click", (event) => {
 // The whole branch list is already on the page, so narrowing it is a filter over
 // the rendered options rather than a round trip.
 
-const filterBranches = (input) => {
+/** Opens the menu on the options matching `wanted`; `""` is all of them. */
+const showBranches = (input, wanted) => {
   const menu = input.parentElement.querySelector(".combo-menu");
   if (!menu) return;
 
-  const wanted = input.value.trim().toLowerCase();
   let shown = 0;
 
   for (const option of menu.querySelectorAll("[data-branch]")) {
@@ -110,13 +110,33 @@ const filterBranches = (input) => {
   menu.hidden = false;
 };
 
-const onBranchInput = (event) => {
+document.addEventListener("input", (event) => {
   const input = event.target.closest?.("[data-branch-filter]");
-  if (input) filterBranches(input);
-};
+  if (input) showBranches(input, input.value.trim().toLowerCase());
+});
 
-document.addEventListener("input", onBranchInput);
-document.addEventListener("focusin", onBranchInput);
+// `focus` does not bubble; `focusin` is the delegable form of it.
+//
+// NB: the whole list, not the options matching what the field already says.
+// What is in it is a branch that was picked rather than a search someone is
+// part-way through, and narrowing to it would leave a picker whose only option
+// is the branch you have — which is the one thing nobody opens it for. It is
+// selected instead, so typing replaces it.
+document.addEventListener("focusin", (event) => {
+  const input = event.target.closest?.("[data-branch-filter]");
+  if (!input) return;
+
+  input.select();
+  showBranches(input, "");
+});
+
+// A swap re-renders the menu shut, because its being open is client state the
+// server knows nothing about — and on the drawer's chip an update can land
+// while someone is still choosing. Reopen it under a filter that kept focus.
+document.addEventListener("htmx:after:settle", () => {
+  const input = document.activeElement?.closest?.("[data-branch-filter]");
+  if (input) showBranches(input, input.value.trim().toLowerCase());
+});
 
 document.addEventListener("focusout", (event) => {
   const input = event.target.closest?.("[data-branch-filter]");
@@ -125,7 +145,16 @@ document.addEventListener("focusout", (event) => {
   const menu = input.parentElement.querySelector(".combo-menu");
   // Late enough for a click on an option to land first.
   setTimeout(() => {
+    // A swap blurs the field and hands the focus straight back, so a blur alone
+    // is not someone leaving: only a field that no longer has it has been left.
+    if (document.activeElement === input) return;
+
     if (menu) menu.hidden = true;
+    // Leaving without picking was not a change, and a picker that is its own
+    // form is showing the card's branch rather than editing a draft — so the
+    // filter text has to go. A body morph deliberately keeps what is in an
+    // input, so nothing else would clear it.
+    if (input.closest("[data-branch-submit]")) input.value = input.defaultValue;
   }, 120);
 });
 
@@ -138,6 +167,16 @@ document.addEventListener("click", (event) => {
 
   input.value = option.textContent.trim();
   option.closest(".combo-menu").hidden = true;
+  // A picker that is its own form applies the choice as it is made; the card
+  // form waits to be submitted along with the rest of the draft.
+  const picker = input.closest("[data-branch-submit]");
+  if (picker) {
+    // NB: the pick becomes the input's own default first. Blurring the input is
+    // what got the click here, so the focusout above has already scheduled a
+    // reset, which would put the old branch back for the length of the trip.
+    input.defaultValue = input.value;
+    picker.requestSubmit();
+  }
 });
 
 // ---- review comments --------------------------------------------------------
