@@ -21,7 +21,17 @@
 //     transcript — which is where the server reads the card's title from;
 //   * a permission mode recorded in its transcript, which `--resume` without
 //     --permission-mode picks back up. `[mode:<name>]` in a prompt changes it,
-//     standing in for shift+tab or approving a plan.
+//     standing in for shift+tab or approving a plan;
+//   * bracketed paste, because a person pasting into the pane is the one thing
+//     that does arrive by being typed at the terminal;
+//   * mouse reporting on "m", in the default encoding — the one xterm.js sends
+//     over `onBinary` rather than `onData`. Behind a key rather than always on,
+//     and to be left off in any spec that scrolls the terminal: a protocol that
+//     reports the wheel sends it to the pty instead of the viewport, and the
+//     scrollback assertions that prove the server replayed its history go quiet
+//     rather than red;
+//   * copying through OSC 52 on "y", followed by a read of the clipboard that
+//     the pane is expected to answer with nothing.
 //
 // Each submitted prompt appends a line to main.rs so turn snapshots have
 // something to capture, and the merge prompt is understood well enough to move
@@ -44,6 +54,9 @@ import { tmpdir } from "node:os";
 const ESC = "\u001b";
 const PASTE_START = `${ESC}[200~`;
 const PASTE_END = `${ESC}[201~`;
+const BEL = "\u0007";
+/** What "y" copies, so a spec knows what to look for on the clipboard. */
+const YANKED = "copied out of the agent";
 const ROWS = 40;
 /** Width of the ruler line in the startup banner. See its use below. */
 const RULER_COLS = 100;
@@ -369,10 +382,90 @@ function answerModal(key) {
 // ---- input ------------------------------------------------------------------
 
 let pasting = null; // accumulates while a bracketed paste is being received
+/** DECSET 1000: button and wheel events, in the default encoding. */
+let mouse = false;
+/** A report split across two reads of the pty. */
+let carry = Buffer.alloc(0);
+
+/**
+ * Keys that are this client's own rather than text for the composer.
+ *
+ * Sits after `answerModal`, which swallows everything while a dialog is up —
+ * these would otherwise read as typing into one. "k" stays over there because a
+ * kill has to work with a dialog up; neither of these does.
+ */
+function control(key) {
+  if (key === "m") {
+    mouse = !mouse;
+    // 1000 rather than 1006: the default encoding is the one xterm.js reports
+    // over `onBinary`, which is the half a pane wiring only `onData` drops.
+    out(mouse ? `${ESC}[?1000h` : `${ESC}[?1000l`);
+    transcript.push(mouse ? "* mouse on" : "* mouse off");
+    render();
+    return true;
+  }
+
+  if (key === "y") {
+    out(`${ESC}]52;c;${Buffer.from(YANKED, "utf8").toString("base64")}${BEL}`);
+    // And asks for it straight back, which is the half a pane should refuse.
+    out(`${ESC}]52;c;?${BEL}`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Takes the reports off the front of the stream, before anything reads it as text.
+ *
+ * These are answers to something this process asked for rather than keystrokes,
+ * and neither survives `toString("utf8")`: a mouse report in the default
+ * encoding carries `col + 32` in a single byte, so any column past 95 is not
+ * ASCII, and an OSC 52 reply would be typed into the composer one character at
+ * a time. A report split across two reads is carried rather than half-decoded.
+ */
+function takeReports(buf) {
+  const kept = [];
+  let seen = false;
+  let i = 0;
+
+  while (i < buf.length) {
+    if (buf[i] !== 0x1b) {
+      kept.push(buf[i++]);
+      continue;
+    }
+
+    // ESC [ M <button+32> <col+32> <row+32>
+    if (buf[i + 1] === 0x5b && buf[i + 2] === 0x4d) {
+      if (i + 5 >= buf.length) break;
+      transcript.push(`mouse ${buf[i + 3] - 32} at ${buf[i + 4] - 32},${buf[i + 5] - 32}`);
+      seen = true;
+      i += 6;
+      continue;
+    }
+
+    // ESC ] 52 ; <selection> ; <base64> BEL
+    if (buf[i + 1] === 0x5d && buf.subarray(i + 2, i + 5).toString() === "52;") {
+      const end = buf.indexOf(0x07, i);
+      if (end === -1) break;
+      const [, payload = ""] = buf.subarray(i + 5, end).toString("latin1").split(";");
+      transcript.push(`clipboard "${Buffer.from(payload, "base64").toString("utf8")}"`);
+      seen = true;
+      i = end + 1;
+      continue;
+    }
+
+    kept.push(buf[i++]);
+  }
+
+  carry = Buffer.from(buf.subarray(i));
+  if (seen) render();
+  return Buffer.from(kept);
+}
 
 process.stdin.setRawMode?.(true);
 process.stdin.on("data", (chunk) => {
-  let text = chunk.toString("utf8");
+  let text = takeReports(Buffer.concat([carry, chunk])).toString("utf8");
 
   while (text.length) {
     if (pasting !== null) {
@@ -391,7 +484,9 @@ process.stdin.on("data", (chunk) => {
         buffer = pasting;
         shown =
           pasting.length > 200
-            ? `[Pasted text #1 +${pasting.split("\n").length} lines]`
+            // The client normalises a paste's newlines to CR on the way out,
+            // so what arrives here is not split on "\n".
+            ? `[Pasted text #1 +${pasting.split(/\r\n|\r|\n/).length} lines]`
             : pasting;
       }
       pasting = null;
@@ -412,6 +507,7 @@ process.stdin.on("data", (chunk) => {
     // Nothing is listening for keys until the client has drawn itself.
     if (booting) continue;
     if (answerModal(key)) continue;
+    if (control(key)) continue;
 
     if (key === "\r" || key === "\n") {
       if (buffer.trim()) submit(buffer);
@@ -449,6 +545,11 @@ for (let i = 0; i < ROWS + 20; i++) {
   if (i === 5) out(`${"=".repeat(RULER_COLS)}\r\n`);
   out(`banner-${i}\r\n`);
 }
+
+// The real client turns bracketed paste on as it draws itself and leaves it on.
+// `Screen::state_formatted` replays the mode, so a client connecting later than
+// this gets it too.
+out(`${ESC}[?2004h`);
 
 // Keep the process alive on a pty even while stdin is quiet.
 setInterval(() => {}, 1 << 30);

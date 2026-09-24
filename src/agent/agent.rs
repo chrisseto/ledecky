@@ -733,4 +733,17 @@ mod tests {
             (Dialog::None, true)
         );
     }
+
+    /// A client connecting late has to get the input modes back and not only the
+    /// pixels: a pane handed a screen without them takes a paste unbracketed and
+    /// drops every click, on a session that was working before the tab closed.
+    #[test]
+    fn a_snapshot_replays_bracketed_paste_and_the_mouse_protocol() {
+        let mut parser = vt100::Parser::new(10, 40, 100);
+        parser.process(b"\x1b[?2004h\x1b[?1000h");
+
+        let out = parser.screen().state_formatted();
+        assert!(out.windows(8).any(|w| w == b"\x1b[?2004h"));
+        assert!(out.windows(8).any(|w| w == b"\x1b[?1000h"));
+    }
 }

@@ -16,3 +16,6 @@ export const terminalRows = (page) => terminal(page).locator(".xterm-rows");
 
 /** Where a keystroke goes; xterm reads from this rather than the rows. */
 export const terminalInput = (page) => terminal(page).locator(".xterm-helper-textarea");
+
+/** The grid xterm reports mouse positions against: its own box, not the pane's. */
+export const terminalScreen = (page) => terminal(page).locator(".xterm-screen");

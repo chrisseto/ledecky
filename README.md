@@ -103,7 +103,8 @@ Clicking away saves it as a draft. *Send N to
 agent* formats the batch into one message and pastes it into the agent's
 terminal.
 
-**Talking to the agent.** Nothing the server sends is typed at the terminal.
+**Talking to the agent.** Nothing the server sends is typed at the terminal; a
+paste is the one thing that arrives that way, and it is the user's own.
 The opening task is a command-line argument, so it is the user's own prompt and
 the session names itself from it; the client holds it behind the workspace-trust
 dialog and submits it once that is answered. Anything
@@ -314,9 +315,10 @@ whose path it reports by running the `SessionStart` command hook out of its own
 `--settings` — whatever that command is, which is how the real handshake gets
 covered without the stand-in knowing anything about it — a startup window where it has drawn nothing and reported nothing,
 an input box at the bottom of the screen, a modal that owns the keyboard and
-reads a bare Enter as "exit", and the HTTP hooks named in that same
-`--settings`. That makes worktrees, turn snapshots, lane transitions, review
-submission and merge deterministic and free to run.
+reads a bare Enter as "exit", bracketed paste, mouse reporting, OSC 52, and the
+HTTP hooks named in that same `--settings`. That makes worktrees, turn
+snapshots, lane transitions, review submission and merge deterministic and free
+to run.
 
 The startup dialogs are covered by unit tests instead, drawn verbatim from the
 real client: they do **not** number their options. Numbering them is what hid a

@@ -1,8 +1,29 @@
 import { Terminal } from "@xterm/xterm";
+import { AttachAddon } from "@xterm/addon-attach";
+import { Base64, ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
+
+/**
+ * OSC 52, one way only.
+ *
+ * The addon's own provider answers a read out of `navigator.clipboard.readText()`
+ * as readily as it writes, so anything the agent printed could ask for whatever
+ * the user last copied. A copy the agent performs is useful; a read it performs
+ * is a channel out of the page driven by output nobody vetted.
+ */
+const clipboard = {
+  // NB: still an answer, just an empty one. The addon replies either way, and a
+  // client waiting on one should not be left waiting.
+  readText: () => "",
+  writeText: (selection, text) =>
+    selection === "c" ? navigator.clipboard.writeText(text) : undefined,
+};
 
 /** Opens a terminal on `host` and attaches it to the agent behind it. */
 const attach = (host) => {
+  // `stop()` disposes the terminal, and the socket's `close` lands after it.
+  let stopped = false;
+
   const term = new Terminal({
     convertEol: false,
     cursorBlink: true,
@@ -15,6 +36,7 @@ const attach = (host) => {
 
   const fit = new FitAddon();
   term.loadAddon(fit);
+  term.loadAddon(new ClipboardAddon(new Base64(), clipboard));
   term.open(host);
   fit.fit();
 
@@ -28,21 +50,31 @@ const attach = (host) => {
   let sent = `${term.rows}x${term.cols}`;
 
   const socket = new WebSocket(url);
+  // Ahead of the addon's own, which is set from `open` below — a frame must not
+  // arrive as a Blob in the meantime.
   socket.binaryType = "arraybuffer";
 
-  socket.addEventListener("message", (event) => {
-    term.write(new Uint8Array(event.data));
-  });
-  socket.addEventListener("close", () => {
-    term.write("\r\n\x1b[2m-- agent disconnected --\x1b[0m\r\n");
+  // Both directions: keystrokes and pastes over `onData`, and mouse reports in
+  // the default encoding over `onBinary`, which xterm keeps separate because
+  // those carry bytes past 0x7f that are not text.
+  //
+  // NB: from `open` rather than now. A send while the socket is still
+  // CONNECTING *throws* in the addon rather than being dropped, and typing into
+  // a pane that has only just appeared is the ordinary case. No message can be
+  // dispatched ahead of `open` on the same socket, so the replay is not at risk.
+  socket.addEventListener("open", () => {
+    if (!stopped) term.loadAddon(new AttachAddon(socket));
   });
 
-  const encoder = new TextEncoder();
-  term.onData((data) => {
-    if (socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
+  // The addon disposes itself on a close and takes its own handlers with it, so
+  // saying so is ours to do.
+  socket.addEventListener("close", () => {
+    if (!stopped) term.write("\r\n\x1b[2m-- agent disconnected --\x1b[0m\r\n");
   });
 
   const resize = () => {
+    if (stopped) return;
+
     fit.fit();
     const { rows, cols } = term;
     const key = `${rows}x${cols}`;
@@ -64,7 +96,9 @@ const attach = (host) => {
   return {
     resize,
     stop: () => {
+      stopped = true;
       socket.close();
+      // Takes the addons with it; none of them is ours to dispose.
       term.dispose();
     },
   };
