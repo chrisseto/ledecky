@@ -32,7 +32,7 @@
              aria-label="Base branch" placeholder="Search branches…"
              autocomplete="off" spellcheck="false"
              hx-get="/projects/{{ project.id }}/branches"
-             hx-trigger="focus, input changed delay:120ms"
+             hx-trigger="focus, click, input changed delay:120ms"
              hx-target="#branch-menu" hx-swap="outerHTML" hx-sync="this:replace"
              data-branch-field />
       {% include "_branch_menu.html" %}

@@ -103,33 +103,23 @@ document.addEventListener("focusin", (event) => {
   event.target.closest?.("[data-branch-field]")?.select();
 });
 
+// Pressing an option must not take the focus off the field: the blur would
+// close the menu out from under the press, and the click would land on nothing.
+// Holding the focus still is what lets `focusout` mean "gone" and close at once.
+document.addEventListener("mousedown", (event) => {
+  if (event.target.closest?.(".combo-menu")) event.preventDefault();
+});
+
 document.addEventListener("focusout", (event) => {
   const input = event.target.closest?.("[data-branch-field]");
   if (!input) return;
 
-  const menu = menuOf(input);
-  // Late enough for a click on an option to land first.
-  setTimeout(() => {
-    // A swap blurs the field and hands the focus straight back, so a blur alone
-    // is not someone leaving: only a field that no longer has it has been left.
-    if (document.activeElement === input) return;
-
-    if (menu) menu.hidden = true;
-    // Leaving without picking was not a change, and a picker that is its own
-    // form is showing the card's branch rather than editing a draft — so what
-    // was typed has to go. A body morph deliberately keeps what is in an input,
-    // so nothing else would clear it.
-    if (input.closest("[data-branch-submit]")) input.value = input.defaultValue;
-  }, 120);
-});
-
-// A swap re-renders the menu shut, because its being open is the one piece of
-// this the server does not know — and on the drawer's chip an update can land
-// while someone is still choosing. Ask for it again under a field that kept
-// focus; the response is what reopens it, and a menu already open asks nothing.
-document.addEventListener("htmx:after:settle", () => {
-  const input = document.activeElement?.closest?.("[data-branch-field]");
-  if (input && menuOf(input)?.hidden) htmx.trigger(input, "focus");
+  menuOf(input).hidden = true;
+  // Leaving without picking was not a change, and a picker that is its own form
+  // is showing the card's branch rather than editing a draft — so what was
+  // typed has to go. A body morph deliberately keeps what is in an input, so
+  // nothing else would clear it.
+  if (input.closest("[data-branch-submit]")) input.value = input.defaultValue;
 });
 
 document.addEventListener("click", (event) => {
@@ -143,14 +133,7 @@ document.addEventListener("click", (event) => {
   option.closest(".combo-menu").hidden = true;
   // A picker that is its own form applies the choice as it is made; the card
   // form waits to be submitted along with the rest of the draft.
-  const picker = input.closest("[data-branch-submit]");
-  if (picker) {
-    // NB: the pick becomes the input's own default first. Blurring the input is
-    // what got the click here, so the focusout above has already scheduled a
-    // reset, which would put the old branch back for the length of the trip.
-    input.defaultValue = input.value;
-    picker.requestSubmit();
-  }
+  input.closest("[data-branch-submit]")?.requestSubmit();
 });
 
 // ---- review comments --------------------------------------------------------
