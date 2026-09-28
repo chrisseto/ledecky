@@ -88,54 +88,6 @@ document.addEventListener("click", (event) => {
   input.dispatchEvent(new Event("input", { bubbles: true }));
 });
 
-// ---- branch picker ----------------------------------------------------------
-// Which branches match is the server's answer: the field carries `hx-get`, and
-// every keystroke swaps the menu beside it. What is left here is the part no
-// response can express — whether the menu is on screen, and what a pick does.
-
-const menuOf = (input) => input.parentElement.querySelector(".combo-menu");
-
-// `focus` does not bubble; `focusin` is the delegable form of it. Selecting what
-// is in the field is what makes typing replace the branch rather than edit it —
-// the fetch this same focus starts comes back with the whole list, because a
-// value that is already a branch is a selection rather than a search.
-document.addEventListener("focusin", (event) => {
-  event.target.closest?.("[data-branch-field]")?.select();
-});
-
-// Pressing an option must not take the focus off the field: the blur would
-// close the menu out from under the press, and the click would land on nothing.
-// Holding the focus still is what lets `focusout` mean "gone" and close at once.
-document.addEventListener("mousedown", (event) => {
-  if (event.target.closest?.(".combo-menu")) event.preventDefault();
-});
-
-document.addEventListener("focusout", (event) => {
-  const input = event.target.closest?.("[data-branch-field]");
-  if (!input) return;
-
-  menuOf(input).hidden = true;
-  // Leaving without picking was not a change, and a picker that is its own form
-  // is showing the card's branch rather than editing a draft — so what was
-  // typed has to go. A body morph deliberately keeps what is in an input, so
-  // nothing else would clear it.
-  if (input.closest("[data-branch-submit]")) input.value = input.defaultValue;
-});
-
-document.addEventListener("click", (event) => {
-  const option = event.target.closest?.(".combo-menu [data-branch]");
-  if (!option) return;
-
-  const input = option.closest(".combo")?.querySelector("[data-branch-field]");
-  if (!input) return;
-
-  input.value = option.textContent.trim();
-  option.closest(".combo-menu").hidden = true;
-  // A picker that is its own form applies the choice as it is made; the card
-  // form waits to be submitted along with the rest of the draft.
-  input.closest("[data-branch-submit]")?.requestSubmit();
-});
-
 // ---- review comments --------------------------------------------------------
 // Which line is being commented on lives in the pane's query string, so the box
 // arrives from the server already in place. Clicking away is what saves it as a

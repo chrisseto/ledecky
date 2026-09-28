@@ -77,10 +77,10 @@ test("capture the whole flow @shots", async ({ page }) => {
   await page.locator("[data-range-menu] summary").click();
 
   // The base-branch chip is the picker, on a card an agent is already in.
-  await page.getByLabel("Base branch").click();
-  await expect(page.locator(".drawer-card .combo-menu")).toBeVisible();
+  await page.locator(".drawer-card .branch-menu summary").click();
+  await expect(page.locator(".drawer-card #branch-menu")).toBeVisible();
   await shot(page, "09c-branch-picker");
-  await page.locator(".drawer-head h2").click();
+  await page.locator(".drawer-card .branch-menu summary").click();
 
   await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
   await expect(page.locator("#review .comment")).toBeVisible();

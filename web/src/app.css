@@ -485,44 +485,6 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* The chip is the base-branch picker, so it is a form; `.drawer-head form`
-   would otherwise take away the positioning context its menu hangs from. */
-.drawer-head .branch {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  position: relative;
-  flex: none;
-  font-size: 11.5px;
-  color: oklch(0.68 0.012 250);
-  white-space: nowrap;
-}
-.drawer-head .branch input {
-  width: 150px;
-  height: 22px;
-  padding: 0 5px;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-family: var(--mono);
-  text-overflow: ellipsis;
-  cursor: pointer;
-}
-.drawer-head .branch input:hover {
-  border-color: var(--border-control);
-  background: var(--bg-card);
-}
-.drawer-head .branch input:focus {
-  border-color: var(--border-strong);
-  background: var(--bg-card);
-  color: var(--fg-strong);
-  outline: none;
-  cursor: text;
-}
-/* The chip is narrower than a branch name wants; the menu need not be. */
-.drawer-head .branch .combo-menu { min-width: 200px; }
 
 .drawer-error {
   display: flex;
@@ -557,8 +519,8 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 
 /* ---- the card drawer's own chrome ---- */
 
-.lane-menu, .range-menu { position: relative; flex: none; }
-.lane-menu summary, .range-menu summary {
+.lane-menu, .range-menu, .branch-menu { position: relative; flex: none; }
+.lane-menu summary, .range-menu summary, .branch-menu summary {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -576,12 +538,13 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   list-style: none;
 }
 .lane-menu summary::-webkit-details-marker,
-.range-menu summary::-webkit-details-marker { display: none; }
-.lane-menu[open] summary, .range-menu[open] summary {
+.range-menu summary::-webkit-details-marker,
+.branch-menu summary::-webkit-details-marker { display: none; }
+.lane-menu[open] summary, .range-menu[open] summary, .branch-menu[open] summary {
   background: var(--bg-card-hover);
   border-color: var(--border-strong);
 }
-.lane-menu summary .icon, .range-menu summary .icon { width: 9px; height: 9px; }
+.lane-menu summary .icon, .range-menu summary .icon, .branch-menu summary .icon { width: 9px; height: 9px; }
 
 .menu {
   position: absolute;
@@ -713,44 +676,55 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 }
 .modal footer .btn { height: 34px; }
 
-/* The branch field filters its own list; the server sends every branch once. */
-.combo { position: relative; }
-.combo-menu {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
-  z-index: 5;
+/* The branch picker: a search box over a list the server rewrites as it is
+   typed into. In the card form it stands in the page; on a card it is what the
+   chip drops. Both hold the same `#branch-menu`. */
+.combo { display: flex; flex-direction: column; gap: 6px; }
+.combo > span { font-size: 12.5px; font-weight: 600; color: var(--fg-dim); }
+.search { height: 32px; }
+
+.branch-options {
   display: flex;
   flex-direction: column;
   gap: 2px;
   max-height: 168px;
-  margin-top: 4px;
-  padding: 4px;
   overflow-y: auto;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--bg-card);
-  box-shadow: var(--shadow);
 }
-.combo-menu button {
-  height: 28px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--fg-strong);
-  font: inherit;
+.branch-options form { display: block; }
+/* NB: `flex-direction` explicitly. The bare `label` rule above stands these on
+   end for the forms it was written for, and an option is a row. */
+.branch-options .menu-item {
+  flex-direction: row;
   font-family: var(--mono);
   font-size: 12.5px;
-  text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  cursor: pointer;
+  font-weight: 500;
 }
-.combo-menu button:hover { background: oklch(0.3 0.012 250); }
-.combo-menu .empty-match { margin: 0; padding: 6px 8px; font-size: 12px; color: var(--fg-dim); }
+/* NB: out from under the blanket `input` rule above, which is written for text
+   fields and would otherwise make each radio a 36px-tall bordered box. */
+.branch-options input[type="radio"] {
+  appearance: auto;
+  flex: none;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  accent-color: var(--accent);
+}
+.empty-match { margin: 0; padding: 6px 8px; font-size: 12px; color: var(--fg-dim); }
+
+/* In the card form the list stands on the page and needs its own frame; in the
+   chip it is what the menu already frames. */
+.combo > .branch-options {
+  padding: 4px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius);
+  background: var(--bg-deep);
+}
+
+.branch-menu summary { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.branch-menu .menu { min-width: 220px; gap: 4px; }
 
 /* ---- directory autocomplete ---- */
 

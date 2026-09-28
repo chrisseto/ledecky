@@ -640,10 +640,10 @@ test("re-pointing a live card aims the merge elsewhere, not the worktree", async
   const head = worktreeGit(cardId, "rev-parse", "HEAD");
 
   await openCard(page, cardId);
-  const chip = page.getByLabel("Base branch");
+  const chip = page.locator(".branch-menu summary");
   await chip.click();
-  await page.locator(".combo-menu [data-branch]", { hasText: "release" }).click();
-  await expect(chip).toHaveValue("release");
+  await page.locator(".branch-menu").getByRole("button", { name: "release", exact: true }).click();
+  await expect(chip).toContainText("release");
 
   // Renaming the target is not a rebase. The worktree keeps its root, and the
   // anchor the diff is measured from keeps its value — `release` is behind it,
@@ -656,8 +656,8 @@ test("re-pointing a live card aims the merge elsewhere, not the worktree", async
   await expect(page.getByRole("button", { name: "Merge" })).toHaveAttribute("title", /release/);
 
   await chip.click();
-  await page.locator(".combo-menu [data-branch]", { hasText: "main" }).click();
-  await expect(chip).toHaveValue("main");
+  await page.locator(".branch-menu").getByRole("button", { name: "main", exact: true }).click();
+  await expect(chip).toContainText("main");
   expect(baseRef(cardId)).toBe(rooted);
 });
 
@@ -745,5 +745,5 @@ test("a merge already out refuses a change of base", async ({ page }) => {
   expect(await refused.text()).toContain("already waiting to land on release");
 
   await openCard(page, id);
-  await expect(page.getByLabel("Base branch")).toHaveValue("release");
+  await expect(page.locator(".branch-menu summary")).toContainText("release");
 });

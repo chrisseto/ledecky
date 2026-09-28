@@ -265,6 +265,9 @@ pub async fn card_view(
 
     let live = manager.running(id).is_some();
     let review = review::routes::initial(db, settings, cache, id, scope).await?;
+    // The chip's menu opens on what the page already holds, so there is nothing
+    // to wait for; the search box re-renders it from there.
+    let branches = git::branches(&project.repo()).await;
 
     Ok(Shell {
         db,
@@ -274,7 +277,7 @@ pub async fn card_view(
     .render(
         Some(project),
         CARD,
-        context! { live, error, editable => card.editable(), ..review },
+        context! { live, branches, error, editable => card.editable(), ..review },
     )
     .await)
 }
@@ -330,37 +333,39 @@ impl Fields {
     }
 }
 
-/// The base-branch menu, as the field beside it currently reads.
+/// The base branches matching `q`, and how one of them is picked.
+///
+/// `card` says the menu belongs to a card, whose options post themselves at it;
+/// without one they are the card form's own field, and `base_branch` is which
+/// of them a re-filter has to leave checked.
 ///
 /// NB: `git::branches` on every keystroke, the way `project::complete` lists a
 /// directory on every one. Two short-lived git processes against a repository
 /// that is almost certainly warm.
-///
-/// The parameter is named for the field rather than for a search because that
-/// is what htmx sends: a GET from an input carries the input's own value under
-/// its own name.
-#[get("/projects/<id>/branches?<base_branch>")]
+#[get("/projects/<id>/branches?<q>&<card>&<base_branch>")]
 pub async fn branch_menu(
     db: &State<Db>,
     id: i64,
+    q: Option<&str>,
+    card: Option<i64>,
     base_branch: Option<&str>,
 ) -> Result<Tmpl, Status> {
     let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
-    let all = git::branches(&project.repo()).await;
-    let wanted = base_branch.unwrap_or_default().trim().to_lowercase();
+    let wanted = q.unwrap_or_default().trim().to_lowercase();
+    let branches: Vec<String> = git::branches(&project.repo())
+        .await
+        .into_iter()
+        .filter(|b| b.to_lowercase().contains(&wanted))
+        .collect();
 
-    // NB: a value that *is* a branch is a selection rather than a search, so the
-    // whole list comes back. Narrowing to the branch the field already holds
-    // would leave a picker offering only the one thing nobody opens it for.
-    let branches: Vec<String> = match all.iter().any(|b| b.to_lowercase() == wanted) {
-        true => all,
-        false => all
-            .into_iter()
-            .filter(|b| b.to_lowercase().contains(&wanted))
-            .collect(),
-    };
+    // A card's menu posts each option at the card; the form's has nothing to
+    // post to yet, and carries the choice as a radio instead.
+    let post_to = card.map(|card| format!("/cards/{card}/base"));
 
-    Ok(Tmpl("_branch_menu.html", context! { branches }))
+    Ok(Tmpl(
+        "_branch_menu.html",
+        context! { branches, post_to, base_branch },
+    ))
 }
 
 /// Everything `_modal_card.html` renders from. `card` is what makes it an edit
@@ -371,7 +376,6 @@ async fn form_context(
     fields: Fields,
     error: Option<&str>,
 ) -> minijinja::Value {
-    // Only for the default; the menu fetches its own options.
     let branches = git::branches(&project.repo()).await;
     let base_branch = match fields.base_branch.is_empty() {
         true => branches.first().cloned().unwrap_or_default(),
@@ -379,7 +383,7 @@ async fn form_context(
     };
 
     context! {
-        card, error, base_branch,
+        card, error, branches, base_branch,
         task => fields.task,
         permission_mode => fields.permission_mode,
         model => fields.model,

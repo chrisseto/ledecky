@@ -15,18 +15,29 @@ test.beforeAll(async ({ browser }) => {
 test("a new card offers the repository's branches and lands in To Do", async ({ page }) => {
   await page.goto(`${projectUrl}/cards/new`);
 
-  // Branches come from the repository, with the checked-out one first.
-  const branches = page.getByLabel("Base branch");
-  await expect(branches).toHaveValue("main");
-  await branches.click();
-  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main", "release"]);
+  // Branches come from the repository, with the checked-out one first, and the
+  // option is the field: nothing has to be copied into one.
+  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main", "release"]);
+  await expect(page.getByRole("radio", { name: "main", exact: true })).toBeChecked();
 
   // Typing narrows it, and the server is what narrows it: the menu that comes
   // back holds the matches and nothing else.
-  await branches.fill("rel");
-  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["release"]);
-  await branches.fill("nope");
-  await expect(page.locator(".combo-menu .empty-match")).toBeVisible();
+  const search = page.getByLabel("Search branches");
+  await search.fill("rel");
+  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["release"]);
+  await search.fill("nope");
+  await expect(page.locator("#branch-menu .empty-match")).toBeVisible();
+
+  // A re-filter re-renders the options, so the choice has to be carried back
+  // into them — the field sends what is checked along with what is typed.
+  const release = page.getByRole("radio", { name: "release", exact: true });
+  await search.fill("");
+  await release.check();
+  await search.fill("rel");
+  await expect(release).toBeChecked();
+  await search.fill("");
+  await expect(release).toBeChecked();
+  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main", "release"]);
 
   await expect(page.getByLabel("Permissions")).toHaveValue("plan");
 
@@ -296,18 +307,18 @@ test("a card waiting in To Do can have its task rewritten", async ({ page }) => 
   // The form opens on the task exactly as it was typed.
   const form = page.locator(".modal-card");
   await expect(form.getByLabel("Task")).toHaveValue("Draft errand\n\nFirst attempt.");
-  await expect(form.getByLabel("Base branch")).toHaveValue("main");
+  await expect(form.getByRole("radio", { name: "main", exact: true })).toBeChecked();
   await expect(form.getByLabel("Permissions")).toHaveValue("acceptEdits");
 
   await form.getByLabel("Task").fill("Rewritten errand\n\nSecond attempt.");
-  await form.getByLabel("Base branch").fill("release");
+  await form.getByRole("radio", { name: "release", exact: true }).check();
   await form.getByLabel("Permissions").selectOption("plan");
   await form.getByRole("button", { name: "Save" }).click();
 
   // Saving lands back on the card it edited, which is still unnamed and so
   // still standing in its task.
   await expect(page.locator(".drawer-card h2")).toHaveText("Rewritten errand\n\nSecond attempt.");
-  await expect(page.getByLabel("Base branch")).toHaveValue("release");
+  await expect(page.locator(".branch-menu summary")).toContainText("release");
 
   await page.goto(projectUrl);
   await expect(cardIn(page, "todo", "Rewritten errand")).toBeVisible();
@@ -343,17 +354,19 @@ test("the base branch is still a card's to change once it is not", async ({ page
   const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
   await openCard(page, id);
 
-  // The chip is the picker, and it is the card form's: clicking it opens the
-  // same menu, and typing narrows it without going back to the server.
-  const chip = page.getByLabel("Base branch");
-  await expect(chip).toHaveValue("release");
+  // The chip drops the same menu the card form holds, and each option posts
+  // itself — the same gesture as the lane menu beside it.
+  const chip = page.locator(".branch-menu summary");
+  const menu = page.locator(".branch-menu");
+  await expect(chip).toContainText("release");
   await chip.click();
-  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main", "release"]);
-  await chip.fill("mai");
-  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main"]);
+  await expect(menu.locator(".menu-item")).toHaveText(["main", "release"]);
 
-  await page.locator(".combo-menu [data-branch]", { hasText: "main" }).click();
-  await expect(chip).toHaveValue("main");
+  await page.getByLabel("Search branches").fill("mai");
+  await expect(menu.locator(".menu-item")).toHaveText(["main"]);
+
+  await menu.getByRole("button", { name: "main", exact: true }).click();
+  await expect(chip).toContainText("main");
   await page.goto(projectUrl);
   await expect(cardIn(page, "done", "Rewritten errand")).toContainText("main");
 });
@@ -375,8 +388,8 @@ test("a base branch git will not resolve is turned down", async ({ page }) => {
   // again with the reason on it, rather than a status nobody sees.
   git("branch", "doomed");
   await openCard(page, id);
-  await page.getByLabel("Base branch").click();
-  const doomed = page.locator(".combo-menu [data-branch]", { hasText: "doomed" });
+  await page.locator(".branch-menu summary").click();
+  const doomed = page.locator(".branch-menu").getByRole("button", { name: "doomed", exact: true });
   await expect(doomed).toBeVisible();
 
   git("branch", "-D", "doomed");

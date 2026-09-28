@@ -1,16 +1,26 @@
 {#
-  The base-branch menu. Its options are the server's answer to what is in the
-  field, so there is no matching here or on the client.
+  The branches matching what has been typed, and how one is picked.
 
-  Rendered without `branches` — the way the card form and the drawer's chip
-  include it — it is the closed menu a page starts with. Filling it is what the
-  route is for.
+  On a card it is picked by posting it, the way the lane menu moves a card. In
+  the card form there is nothing to post to yet, so the option *is* the field:
+  a radio the form carries when it is submitted.
 #}
-<div class="combo-menu" id="branch-menu"{% if branches is undefined %} hidden{% endif %}>
-  {% for branch in branches | default([]) %}
-    <button class="mono" type="button" data-branch>{{ branch }}</button>
+<div class="branch-options" id="branch-menu">
+  {% for branch in branches %}
+    {% if post_to %}
+      <form method="post" action="{{ post_to }}"
+            hx-post="{{ post_to }}" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
+        <button class="menu-item mono" type="submit" name="base_branch" value="{{ branch }}">
+          {{ branch }}
+        </button>
+      </form>
+    {% else %}
+      <label class="menu-item mono">
+        <input type="radio" name="base_branch" value="{{ branch }}"
+               {% if branch == base_branch %}checked{% endif %} />
+        {{ branch }}
+      </label>
+    {% endif %}
   {% endfor %}
-  {% if branches is defined and not branches %}
-    <p class="empty-match">No branch matches</p>
-  {% endif %}
+  {% if not branches %}<p class="empty-match">No branch matches</p>{% endif %}
 </div>

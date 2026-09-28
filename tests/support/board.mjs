@@ -85,7 +85,7 @@ export async function addProject(page) {
 export async function addCard(page, projectUrl, { title, description, base = "main", permissions, model }) {
   await page.goto(`${projectUrl}/cards/new`);
   await page.getByLabel("Task").fill(description ? `${title}\n\n${description}` : title);
-  await page.getByLabel("Base branch").fill(base);
+  await page.getByRole("radio", { name: base, exact: true }).check();
   if (permissions) await page.getByLabel("Permissions").selectOption(permissions);
   if (model) await page.getByLabel("Model").selectOption(model);
   await page.getByRole("button", { name: "Create", exact: true }).click();
