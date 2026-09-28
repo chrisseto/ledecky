@@ -358,6 +358,24 @@ test("the base branch is still a card's to change once it is not", async ({ page
   await expect(cardIn(page, "done", "Rewritten errand")).toContainText("main");
 });
 
+test("an open branch menu survives an update landing under it", async ({ page }) => {
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
+  await openCard(page, id);
+
+  const options = page.locator(".combo-menu [data-branch]").first();
+  await page.getByLabel("Base branch").click();
+  await expect(options).toBeVisible();
+
+  // A body morph like the ones Start, Stop, Merge and the chip's own submit do.
+  // The menu being open is the one part of it the server does not know, so a
+  // swap renders it shut and something has to ask for it back.
+  await page.evaluate(() =>
+    window.htmx.ajax("GET", location.pathname, { target: "body", swap: "outerMorph" }),
+  );
+  await expect(options).toBeVisible();
+});
+
 test("a base branch git will not resolve is turned down", async ({ page }) => {
   await page.goto(projectUrl);
   const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
