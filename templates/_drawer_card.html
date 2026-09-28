@@ -30,13 +30,12 @@
       {{ icon("git-branch") }}
       <input name="base_branch" class="mono" value="{{ card.base_branch }}"
              aria-label="Base branch" placeholder="Search branches…"
-             autocomplete="off" spellcheck="false" data-branch-filter />
-      <div class="combo-menu" hidden>
-        {% for branch in branches %}
-          <button class="mono" type="button" data-branch>{{ branch }}</button>
-        {% endfor %}
-        <p class="empty-match" hidden>No branch matches</p>
-      </div>
+             autocomplete="off" spellcheck="false"
+             hx-get="/projects/{{ project.id }}/branches"
+             hx-trigger="focus, input changed delay:120ms"
+             hx-target="#branch-menu" hx-swap="outerHTML" hx-sync="this:replace"
+             data-branch-field />
+      {% include "_branch_menu.html" %}
     </form>
 
     <span class="spacer"></span>

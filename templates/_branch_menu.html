@@ -1,0 +1,16 @@
+{#
+  The base-branch menu. Its options are the server's answer to what is in the
+  field, so there is no matching here or on the client.
+
+  Rendered without `branches` — the way the card form and the drawer's chip
+  include it — it is the closed menu a page starts with. Filling it is what the
+  route is for.
+#}
+<div class="combo-menu" id="branch-menu"{% if branches is undefined %} hidden{% endif %}>
+  {% for branch in branches | default([]) %}
+    <button class="mono" type="button" data-branch>{{ branch }}</button>
+  {% endfor %}
+  {% if branches is defined and not branches %}
+    <p class="empty-match">No branch matches</p>
+  {% endif %}
+</div>

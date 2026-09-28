@@ -265,8 +265,6 @@ pub async fn card_view(
 
     let live = manager.running(id).is_some();
     let review = review::routes::initial(db, settings, cache, id, scope).await?;
-    // For the base-branch chip, which is the card form's picker over again.
-    let branches = git::branches(&project.repo()).await;
 
     Ok(Shell {
         db,
@@ -276,7 +274,7 @@ pub async fn card_view(
     .render(
         Some(project),
         CARD,
-        context! { live, branches, error, editable => card.editable(), ..review },
+        context! { live, error, editable => card.editable(), ..review },
     )
     .await)
 }
@@ -332,6 +330,39 @@ impl Fields {
     }
 }
 
+/// The base-branch menu, as the field beside it currently reads.
+///
+/// NB: `git::branches` on every keystroke, the way `project::complete` lists a
+/// directory on every one. Two short-lived git processes against a repository
+/// that is almost certainly warm.
+///
+/// The parameter is named for the field rather than for a search because that
+/// is what htmx sends: a GET from an input carries the input's own value under
+/// its own name.
+#[get("/projects/<id>/branches?<base_branch>")]
+pub async fn branch_menu(
+    db: &State<Db>,
+    id: i64,
+    base_branch: Option<&str>,
+) -> Result<Tmpl, Status> {
+    let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
+    let all = git::branches(&project.repo()).await;
+    let wanted = base_branch.unwrap_or_default().trim().to_lowercase();
+
+    // NB: a value that *is* a branch is a selection rather than a search, so the
+    // whole list comes back. Narrowing to the branch the field already holds
+    // would leave a picker offering only the one thing nobody opens it for.
+    let branches: Vec<String> = match all.iter().any(|b| b.to_lowercase() == wanted) {
+        true => all,
+        false => all
+            .into_iter()
+            .filter(|b| b.to_lowercase().contains(&wanted))
+            .collect(),
+    };
+
+    Ok(Tmpl("_branch_menu.html", context! { branches }))
+}
+
 /// Everything `_modal_card.html` renders from. `card` is what makes it an edit
 /// rather than a new card.
 async fn form_context(
@@ -340,6 +371,7 @@ async fn form_context(
     fields: Fields,
     error: Option<&str>,
 ) -> minijinja::Value {
+    // Only for the default; the menu fetches its own options.
     let branches = git::branches(&project.repo()).await;
     let base_branch = match fields.base_branch.is_empty() {
         true => branches.first().cloned().unwrap_or_default(),
@@ -347,7 +379,7 @@ async fn form_context(
     };
 
     context! {
-        card, error, branches, base_branch,
+        card, error, base_branch,
         task => fields.task,
         permission_mode => fields.permission_mode,
         model => fields.model,

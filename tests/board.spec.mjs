@@ -21,9 +21,12 @@ test("a new card offers the repository's branches and lands in To Do", async ({ 
   await branches.click();
   await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main", "release"]);
 
-  // Typing narrows the list without going back to the server.
+  // Typing narrows it, and the server is what narrows it: the menu that comes
+  // back holds the matches and nothing else.
   await branches.fill("rel");
-  await expect(page.locator(".combo-menu [data-branch]:visible")).toHaveText(["release"]);
+  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["release"]);
+  await branches.fill("nope");
+  await expect(page.locator(".combo-menu .empty-match")).toBeVisible();
 
   await expect(page.getByLabel("Permissions")).toHaveValue("plan");
 
@@ -347,7 +350,7 @@ test("the base branch is still a card's to change once it is not", async ({ page
   await chip.click();
   await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main", "release"]);
   await chip.fill("mai");
-  await expect(page.locator(".combo-menu [data-branch]:visible")).toHaveText(["main"]);
+  await expect(page.locator(".combo-menu [data-branch]")).toHaveText(["main"]);
 
   await page.locator(".combo-menu [data-branch]", { hasText: "main" }).click();
   await expect(chip).toHaveValue("main");
