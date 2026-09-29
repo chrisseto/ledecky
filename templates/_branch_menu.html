@@ -6,6 +6,9 @@
   a radio the form carries when it is submitted.
 #}
 <div class="branch-options" id="branch-menu">
+  {# Said whether or not the list is empty, because the branch already chosen
+     stays in it however little it matches. #}
+  {% if not matched %}<p class="empty-match">No branch matches</p>{% endif %}
   {% for branch in branches %}
     {% if post_to %}
       <form method="post" action="{{ post_to }}"
@@ -22,5 +25,4 @@
       </label>
     {% endif %}
   {% endfor %}
-  {% if not branches %}<p class="empty-match">No branch matches</p>{% endif %}
 </div>

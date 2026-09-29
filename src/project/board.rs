@@ -352,11 +352,23 @@ pub async fn branch_menu(
 ) -> Result<Tmpl, Status> {
     let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
     let wanted = q.unwrap_or_default().trim().to_lowercase();
-    let branches: Vec<String> = git::branches(&project.repo())
-        .await
-        .into_iter()
-        .filter(|b| b.to_lowercase().contains(&wanted))
+    let all = git::branches(&project.repo()).await;
+
+    // An option is shown if it matches, or if it is the one already chosen.
+    //
+    // NB: the second half is not a nicety. In the card form the option *is* the
+    // field carrying the base, so a search that filtered the chosen one away
+    // would submit a card with no base at all — refused on arrival, and from
+    // the outside indistinguishable from the button doing nothing.
+    let branches: Vec<String> = all
+        .iter()
+        .filter(|b| b.to_lowercase().contains(&wanted) || Some(b.as_str()) == base_branch)
+        .cloned()
         .collect();
+
+    // Whether the *search* found anything, which is a different question once
+    // the chosen one is in the list regardless.
+    let matched = all.iter().any(|b| b.to_lowercase().contains(&wanted));
 
     // A card's menu posts each option at the card; the form's has nothing to
     // post to yet, and carries the choice as a radio instead.
@@ -364,7 +376,7 @@ pub async fn branch_menu(
 
     Ok(Tmpl(
         "_branch_menu.html",
-        context! { branches, post_to, base_branch },
+        context! { branches, matched, post_to, base_branch },
     ))
 }
 

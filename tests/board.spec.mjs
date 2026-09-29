@@ -20,24 +20,13 @@ test("a new card offers the repository's branches and lands in To Do", async ({ 
   await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main", "release"]);
   await expect(page.getByRole("radio", { name: "main", exact: true })).toBeChecked();
 
-  // Typing narrows it, and the server is what narrows it: the menu that comes
-  // back holds the matches and nothing else.
+  // The server is what narrows the list — but never past what is chosen, which
+  // here is also the form's only field for the base. The drawer's menu, with no
+  // field to keep, narrows to the matches alone.
   const search = page.getByLabel("Search branches");
-  await search.fill("rel");
-  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["release"]);
   await search.fill("nope");
   await expect(page.locator("#branch-menu .empty-match")).toBeVisible();
-
-  // A re-filter re-renders the options, so the choice has to be carried back
-  // into them — the field sends what is checked along with what is typed.
-  const release = page.getByRole("radio", { name: "release", exact: true });
-  await search.fill("");
-  await release.check();
-  await search.fill("rel");
-  await expect(release).toBeChecked();
-  await search.fill("");
-  await expect(release).toBeChecked();
-  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main", "release"]);
+  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main"]);
 
   await expect(page.getByLabel("Permissions")).toHaveValue("plan");
 
@@ -454,4 +443,24 @@ test("a card cannot be moved into the collected lane by hand", async ({ page }) 
 
   await page.reload();
   await expect(cardIn(page, "todo", "Stays put")).toBeVisible();
+});
+
+test("a search cannot take the chosen branch out of the form", async ({ page }) => {
+  await page.goto(`${projectUrl}/cards/new`);
+  await page.getByLabel("Task").fill("Chosen then searched past");
+  const release = page.getByRole("radio", { name: "release", exact: true });
+  await release.check();
+
+  // The option is the only thing carrying the base, so a search that filtered
+  // it away would leave the form with no branch in it at all — refused on
+  // arrival, with nothing on screen to say the button had done anything. What
+  // is chosen stays, however little it matches.
+  await page.getByLabel("Search branches").fill("nope");
+  await expect(page.locator("#branch-menu .empty-match")).toBeVisible();
+  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["release"]);
+  await expect(release).toBeChecked();
+
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(page).toHaveURL(projectUrl);
+  await expect(cardIn(page, "todo", "Chosen then searched past")).toContainText("release");
 });
