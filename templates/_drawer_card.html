@@ -27,7 +27,8 @@
     {# The lane menu's shape, because it is the same gesture: a chip that says
        what the card is on, and a list that moves it. Each option posts itself,
        so nothing here needs a line of script. #}
-    <details class="branch-menu">
+    <details class="branch-menu"
+             hx-on:toggle="if (this.open) this.querySelector('.search').focus()">
       <summary class="chip mono" title="Change the base branch">
         {{ icon("git-branch") }}{{ card.base_branch }}{{ icon("chevron-down") }}
       </summary>

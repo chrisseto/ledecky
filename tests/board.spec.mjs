@@ -351,7 +351,13 @@ test("the base branch is still a card's to change once it is not", async ({ page
   await chip.click();
   await expect(menu.locator(".menu-item")).toHaveText(["main", "release"]);
 
-  await page.getByLabel("Search branches").fill("mai");
+  // Opening it puts the cursor in the search box, so narrowing is typing rather
+  // than a second click. Waited for: `toggle` is queued rather than raised in
+  // the click, and the options are already on the page, so there is nothing
+  // else here that the focus arriving is slower than. Nothing in this menu is a
+  // field to be kept, so it narrows to the matches alone.
+  await expect(page.getByLabel("Search branches")).toBeFocused();
+  await page.keyboard.type("mai");
   await expect(menu.locator(".menu-item")).toHaveText(["main"]);
 
   await menu.getByRole("button", { name: "main", exact: true }).click();
