@@ -220,9 +220,9 @@ async fn on_stop(
         .unwrap_or_default();
 
     match snapshot(db, settings, card_id, last_message).await {
-        // The turn is a new point in the picker, and its message is what the
-        // pane's footer shows. Nothing else announces it: a commit the agent
-        // made touches only `.git`, which the worktree watcher filters out.
+        // The turn is a new point in the picker. Nothing else announces it:
+        // a commit the agent made touches only `.git`, which the worktree
+        // watcher filters out.
         Ok(()) => changes.card(db, card_id, Kind::Diff).await,
         Err(err) => error!("card {card_id}: snapshotting the turn failed: {err:#}"),
     }

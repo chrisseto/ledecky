@@ -88,18 +88,6 @@
         {% if group.dir %}</details>{% endif %}
       {% endfor %}
     </x-file-tree>
-
-    {% if turn_note or last_message %}
-      <div class="tree-foot">
-        {% if turn_note %}<p class="turn">{{ turn_note }}</p>{% endif %}
-        {% if last_message %}
-          <details class="last-message">
-            <summary>{{ icon("chevron-right") }}Agent's last message</summary>
-            <div class="body">{{ last_message }}</div>
-          </details>
-        {% endif %}
-      </div>
-    {% endif %}
   </nav>
 
   <div class="diff">

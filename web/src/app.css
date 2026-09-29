@@ -824,40 +824,6 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 .modes .mode[aria-disabled] { color: var(--fg-faint); cursor: default; }
 .tree-body { flex: 1; overflow-y: auto; padding: 6px 6px 10px; }
 
-.tree-foot {
-  flex: none;
-  border-top: 1px solid var(--border-soft);
-  font-size: 11.5px;
-  color: var(--fg-dim);
-}
-.tree-foot .turn { margin: 0; padding: 9px 12px; }
-
-.turn + .last-message { border-top: 1px solid var(--border-soft); }
-.last-message summary {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 8px 12px;
-  cursor: pointer;
-  list-style: none;
-}
-.last-message summary::-webkit-details-marker { display: none; }
-.last-message summary:hover { color: var(--fg-strong); }
-.last-message summary .icon { width: 9px; height: 9px; transition: transform 0.12s ease; }
-.last-message[open] summary .icon { transform: rotate(90deg); }
-
-/* Capped and scrollable on purpose: the tree is a flex column whose body does
-   the scrolling, so an unbounded footer would squeeze the file list away. */
-.last-message .body {
-  max-height: 40vh;
-  overflow-y: auto;
-  padding: 0 12px 10px;
-  font-size: 12px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
 .dir summary {
   display: flex;
   align-items: center;

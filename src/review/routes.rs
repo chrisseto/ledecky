@@ -451,23 +451,8 @@ async fn pane(
         files.iter().map(|file| file.deletions).sum::<u32>(),
     );
 
-    // The agent's closing words for the most recent turn — how a failed merge or
-    // an unanswered question surfaces outside the terminal.
-    let last_message = turns
-        .last()
-        .and_then(|t| t.last_assistant_message.clone())
-        .filter(|m| !m.trim().is_empty());
-
-    let turn_note = turns.last().map(|turn| {
-        format!(
-            "Turn {} — {}",
-            turn.n,
-            turn.commit_sha.chars().take(7).collect::<String>()
-        )
-    });
-
     Ok(context! {
-        card, tree, threads, scopes, modes, submitted, stranded, last_message, turn_note,
+        card, tree, threads, scopes, modes, submitted, stranded,
         messages, message_comments,
         drafts => pending,
         files => rendered,

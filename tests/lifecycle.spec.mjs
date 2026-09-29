@@ -196,11 +196,6 @@ test("the review pane stacks every changed file, with scopes for each turn", asy
   ]);
   await expect(review.locator("[data-range-menu] summary")).toContainText("All changes");
   await expect(review.locator(".modes .mode")).toHaveText(["Just this", "Since this"]);
-
-  // The agent's closing message is surfaced outside the terminal, in the tree
-  // footer rather than in the diff column where it used to crowd out the diff.
-  await expect(review.locator(".tree-foot .last-message")).toContainText("applied turn 1");
-  await expect(review.locator(".diff .last-message")).toHaveCount(0);
 });
 
 test("an empty range keeps the picker, so there is a way back out of it", async ({ page }) => {
