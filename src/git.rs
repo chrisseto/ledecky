@@ -296,7 +296,7 @@ async fn run_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<St
 /// nothing, so [`run`] — which bails on any non-zero status — would read a plain
 /// "no" as a failure and mint an error message saying git broke. This asks the
 /// status directly. A rev that does not resolve exits 128 and reads as "no" too,
-/// which is the right answer for the only caller: a guard that refuses to move
+/// which is the right answer for every caller: a guard that refuses to move
 /// anything it cannot prove.
 async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
     Command::new("git")
@@ -310,17 +310,38 @@ async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// Moves `base_ref` up to wherever `worktree` branches from `base_branch` now.
+/// Where `worktree` branches from `base_branch` now, or `None` when the two
+/// share no history.
+///
+/// Always an ancestor of the worktree's `HEAD`, which is what makes a range
+/// starting here well formed however the base ref got where it is. Plain
+/// `merge-base` rather than `--fork-point` so that a worktree which merged
+/// instead of rebasing is read the same way.
+pub async fn fork_point(repo: &Path, worktree: &Path, base_branch: &str) -> Option<String> {
+    // NB: in the worktree, not the repo. `HEAD` is per-worktree, and its own
+    // commits are reachable from nowhere else; the repo's is whatever happens to
+    // be checked out there.
+    let head = rev_parse(worktree, Rev::Head).await?;
+
+    // Back in the repo, where the base branch lives. The object database and
+    // `refs/heads` are shared, so this resolves either way.
+    run(repo, &["merge-base", base_branch, &head])
+        .await
+        .ok()
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Moves `base_ref` to wherever `worktree` branches from `base_branch` now.
 ///
 /// A detached worktree does not contain new upstream commits, so a branch that
 /// merely moves ahead is harmless and this does nothing. What it is for is a
 /// rebase: afterwards the worktree is rooted at a commit `base_ref` has never
 /// heard of, and `base_ref..worktree` would fold every upstream commit into the
-/// range. Plain `merge-base` rather than `--fork-point` so that a worktree which
-/// merged instead of rebasing is read the same way.
+/// range.
 ///
-/// The ref only ever moves *forward*. A rewound branch, or a worktree checked
-/// out at an older commit, would otherwise drag it back.
+/// The ref moves *forward* only, except when it has fallen out of the worktree's
+/// history entirely — see the guard. A rewound branch, or a worktree checked out
+/// at an older commit, must not drag it back.
 ///
 /// Returns the new value when it moved, and `None` otherwise — which is both the
 /// ordinary case and what every failure reads as. Best-effort on purpose:
@@ -332,20 +353,21 @@ pub async fn reconcile_base(
     base_branch: &str,
 ) -> Option<String> {
     let current = rev_parse(repo, Rev::Ref(base_ref)).await?;
-
-    // NB: in the worktree, not the repo. `HEAD` is per-worktree, and its own
-    // commits are reachable from nowhere else; the repo's is whatever happens to
-    // be checked out there.
     let head = rev_parse(worktree, Rev::Head).await?;
+    let candidate = fork_point(repo, worktree, base_branch).await?;
 
-    // Back in the repo, where the base branch lives. The object database and
-    // `refs/heads` are shared, so this resolves either way.
-    let candidate = run(repo, &["merge-base", base_branch, &head])
-        .await
-        .ok()
-        .filter(|sha| !sha.is_empty())?;
+    if candidate == current {
+        return None;
+    }
 
-    if candidate == current || !is_ancestor(repo, &current, &candidate).await {
+    // NB: the two cases one direction cannot tell apart. While the base is still
+    // behind the worktree it is a true description of where that worktree is
+    // rooted, and a branch rewound under it must not drag it back. Once it is
+    // not, the worktree has been rebased off the base entirely — `base..head`
+    // has stopped naming a range, and no later poll could repair it — so the
+    // fork point is followed wherever it went. The second question is only
+    // asked once the first has already said no.
+    if !is_ancestor(repo, &current, &candidate).await && is_ancestor(repo, &current, &head).await {
         return None;
     }
 
@@ -887,6 +909,148 @@ mod tests {
                 .unwrap(),
             started
         );
+    }
+
+    #[tokio::test]
+    async fn fork_point_is_where_a_worktree_branches_from_a_branch() {
+        let (settings, repo) = scratch("fork-point").await;
+        let worktree = settings.worktree_path(1);
+
+        let started = create_worktree(&settings, &repo, &worktree, "main", 1)
+            .await
+            .unwrap();
+        commit(&worktree, "agent.txt", "work\n", "agent work").await;
+        commit(&repo, "upstream.txt", "theirs\n", "upstream work").await;
+
+        // The worktree is detached and does not contain the upstream commit, so
+        // where it branches from is still where it started.
+        assert_eq!(
+            fork_point(&repo, &worktree, "main").await,
+            Some(started.clone())
+        );
+
+        // Whatever it answers is reachable from the worktree, which is what
+        // makes a range starting there well formed.
+        let head = run(&worktree, &["rev-parse", "HEAD"]).await.unwrap();
+        assert!(is_ancestor(&repo, &started, &head).await);
+    }
+
+    /// What the refusal in `set_base` rests on: there is no range to offer.
+    #[tokio::test]
+    async fn a_branch_sharing_no_history_has_no_fork_point() {
+        let (settings, repo) = scratch("unrelated").await;
+        let worktree = settings.worktree_path(1);
+        create_worktree(&settings, &repo, &worktree, "main", 1)
+            .await
+            .unwrap();
+
+        // A root commit of its own: same object database, no common ancestor.
+        let tree = run(&repo, &["hash-object", "-t", "tree", "/dev/null"])
+            .await
+            .unwrap();
+        let orphan = run(&repo, &["commit-tree", &tree, "-m", "unrelated"])
+            .await
+            .unwrap();
+        run(&repo, &["branch", "orphan", &orphan]).await.unwrap();
+
+        assert_eq!(fork_point(&repo, &worktree, "orphan").await, None);
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "orphan").await,
+            None
+        );
+    }
+
+    /// The wedge the forward-only rule used to leave: once a rebase puts the
+    /// worktree somewhere the base is not an ancestor of, `base..head` stops
+    /// naming a range and no later poll could have repaired it.
+    #[tokio::test]
+    async fn a_worktree_rebased_off_the_base_re_derives_it() {
+        let (settings, repo) = scratch("rebased-off").await;
+        let worktree = settings.worktree_path(1);
+
+        // `side` forks before the commit the card is cut from and goes its own
+        // way, so the base starts on a branch of history the worktree is about
+        // to leave and the move below has to go somewhere that is not ahead of
+        // it.
+        let forked = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        run(&repo, &["branch", "side", &forked]).await.unwrap();
+        let started = commit(&repo, "a.txt", "two\n", "second").await;
+
+        assert_eq!(
+            create_worktree(&settings, &repo, &worktree, "main", 1)
+                .await
+                .unwrap(),
+            started
+        );
+        commit(&worktree, "agent.txt", "work\n", "agent work").await;
+
+        run(&repo, &["checkout", "-q", "side"]).await.unwrap();
+        let sidework = commit(&repo, "side.txt", "theirs\n", "side work").await;
+        run(&repo, &["checkout", "-q", "main"]).await.unwrap();
+
+        // Only the card's own commit is replayed, onto a branch that never had
+        // `started` on it.
+        run(&worktree, &["rebase", "--onto", "side", &started])
+            .await
+            .unwrap();
+        let head = run(&worktree, &["rev-parse", "HEAD"]).await.unwrap();
+        // The premise: the base is no longer in the worktree's history at all,
+        // and the fork point is not ahead of it either.
+        assert!(!is_ancestor(&repo, &started, &head).await);
+        assert!(!is_ancestor(&repo, &started, &sidework).await);
+
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "side").await,
+            Some(sidework.clone())
+        );
+        assert_eq!(
+            run(&repo, &["rev-parse", &settings.base_ref(1)])
+                .await
+                .unwrap(),
+            sidework
+        );
+
+        // And the range it leaves is the card's work, nothing else.
+        let listed = commits(&repo, &settings.base_ref(1), &head).await;
+        let subjects: Vec<_> = listed.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["agent work"]);
+    }
+
+    /// The same repair when the branch itself was rewritten under the card,
+    /// which is what a force-push looks like from here.
+    #[tokio::test]
+    async fn a_worktree_rebased_onto_a_rewritten_upstream_follows_it() {
+        let (settings, repo) = scratch("force-pushed").await;
+        let worktree = settings.worktree_path(1);
+
+        let started = create_worktree(&settings, &repo, &worktree, "main", 1)
+            .await
+            .unwrap();
+        commit(&worktree, "agent.txt", "work\n", "agent work").await;
+
+        // Upstream lands something, the card rebases onto it, then upstream
+        // rewrites that commit and the card rebases again.
+        commit(&repo, "upstream.txt", "theirs\n", "upstream work").await;
+        run(&worktree, &["rebase", "main"]).await.unwrap();
+        reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await;
+
+        run(&repo, &["reset", "--hard", "-q", &started])
+            .await
+            .unwrap();
+        let rewritten = commit(&repo, "upstream.txt", "theirs, again\n", "upstream work").await;
+        run(&worktree, &["rebase", "--onto", "main", "HEAD~1"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
+            Some(rewritten.clone())
+        );
+
+        let head = run(&worktree, &["rev-parse", "HEAD"]).await.unwrap();
+        let listed = commits(&repo, &settings.base_ref(1), &head).await;
+        let subjects: Vec<_> = listed.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["agent work"]);
     }
 
     #[tokio::test]

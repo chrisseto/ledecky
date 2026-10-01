@@ -550,6 +550,12 @@ pub struct BaseForm {
 /// A refusal is the drawer again with the reason on it, under the status it
 /// deserves; htmx swaps a 4xx body, so the chip says what went wrong instead of
 /// quietly springing back.
+///
+/// The worktree keeps its root and `base_ref` its value: this re-aims
+/// `reconcile_base` and the merge, it does not move anything. It does restage,
+/// though, because reconciliation only runs while a head is being produced — so
+/// without it the redirect below would re-render inside a memo younger than
+/// `head_ttl` and show the branch the card used to have.
 #[post("/cards/<id>/base", data = "<form>")]
 pub async fn set_base(
     db: &State<Db>,
@@ -601,6 +607,13 @@ pub async fn set_base(
         Status::InternalServerError
     })?;
 
+    // After the write, so this reconciles against the branch just chosen rather
+    // than the one it replaced. `restage` answers `None` for a card with no
+    // worktree — one that has not started, or one torn down — which is also
+    // every card that has no base ref to re-aim.
+    review::turn::restage(db, cache, settings, id).await;
+
+    changes.card_in(card.project_id, id, Kind::Diff);
     changes.project(card.project_id, Kind::Board);
     Ok(Ok(Redirect::to(format!("/cards/{id}"))))
 }

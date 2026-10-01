@@ -231,11 +231,27 @@ impl Scope {
                 Some((from, head.to_owned()))
             }
 
-            (Anchor::Turn(n), mode) => {
-                let to = at(*n)?;
-                // Turn 1 has no predecessor, so it is measured from the base.
-                let from = at(n - 1).unwrap_or(base);
-                Some((from, mode.end(to, head)))
+            (Anchor::Turn(n), Mode::Just) => {
+                let turn = turns.iter().find(|t| t.n == *n)?;
+                // NB: the parent the snapshot was taken against, not wherever
+                // the card's base has since got to. A turn and its own parent
+                // are the same era, so the range survives a rebase moving the
+                // base out from under it — whereas the base would pair a
+                // post-rebase tree with a pre-rebase one and render every
+                // upstream file as a deletion. Empty for a turn recorded
+                // without one; an empty rev reaches `git diff` as a bare
+                // argument.
+                let from = Some(turn.parent_sha.clone())
+                    .filter(|sha| !sha.is_empty())
+                    .unwrap_or(base);
+                Some((from, turn.commit_sha.clone()))
+            }
+
+            // Ends at the live head, so both ends have to be the era the
+            // worktree is in now — the card's base, not the turn's.
+            (Anchor::Turn(n), Mode::Since) => {
+                at(*n)?;
+                Some((at(n - 1).unwrap_or(base), head.to_owned()))
             }
 
             (Anchor::Commit(sha), mode) => {
@@ -375,12 +391,28 @@ mod tests {
         .unwrap()
     }
 
+    /// Where the cards in these fixtures were cut from, as a resolved sha —
+    /// which is what `turns.parent_sha` holds, not a ref name.
+    const BASE_AT_TURN_1: &str = "base0ff";
+
+    /// One of a chain, parented the way `Turn::snapshot` records it: on the
+    /// previous turn, or on the base the card was cut from for turn 1.
     fn turn(n: i64, sha: &str) -> Turn {
+        let parent = match n {
+            1 => BASE_AT_TURN_1.to_owned(),
+            n => format!("sha{}", n - 1),
+        };
+        rooted(n, sha, &parent)
+    }
+
+    /// The same, with the parent named — for a turn taken against a base the
+    /// card has since moved off.
+    fn rooted(n: i64, sha: &str, parent: &str) -> Turn {
         Turn {
             id: n,
             n,
             commit_sha: sha.into(),
-            parent_sha: String::new(),
+            parent_sha: parent.into(),
             last_assistant_message: None,
             created_at: format!("2026-09-17 12:0{n}:00"),
             // Turn 1 at 20, turn 2 at 40 — so a commit at 30 falls between them.
@@ -547,12 +579,46 @@ mod tests {
         let range =
             |n| scope(Mode::Just, Anchor::Turn(n)).revisions(&settings, 7, &turns, &[], Some("h"));
 
-        // Turn 1 has no predecessor, so it is measured from the base.
+        // Turn 1 has no predecessor but the base it was cut from, which it
+        // recorded at the time rather than reading back now.
+        assert_eq!(range(1), Some((BASE_AT_TURN_1.into(), "sha1".into())));
+        assert_eq!(range(2), Some(("sha1".into(), "sha2".into())));
+    }
+
+    /// The rebase case: the card's base has moved on, and the snapshot has not.
+    /// Reaching for the card's base here would pair a post-rebase tree with a
+    /// pre-rebase one and render every upstream file as a deletion.
+    #[test]
+    fn a_turn_is_measured_from_the_base_it_was_taken_against() {
+        let turns = [rooted(1, "sha1", "oldbase")];
+
         assert_eq!(
-            range(1),
+            scope(Mode::Just, Anchor::Turn(1)).revisions(&settings(), 7, &turns, &[], Some("h")),
+            Some(("oldbase".into(), "sha1".into()))
+        );
+    }
+
+    /// `Since` ends at the live head, so both of its ends have to be the era the
+    /// worktree is in now — the card's base, not the turn's.
+    #[test]
+    fn since_a_turn_keeps_measuring_from_the_cards_own_base() {
+        let turns = [rooted(1, "sha1", "oldbase")];
+
+        assert_eq!(
+            scope(Mode::Since, Anchor::Turn(1)).revisions(&settings(), 7, &turns, &[], Some("h")),
+            Some(("refs/ledecky/7/base".into(), "h".into()))
+        );
+    }
+
+    /// An empty parent would reach `git diff` as a bare argument.
+    #[test]
+    fn a_turn_with_no_recorded_parent_falls_back_to_the_card_base() {
+        let turns = [rooted(1, "sha1", "")];
+
+        assert_eq!(
+            scope(Mode::Just, Anchor::Turn(1)).revisions(&settings(), 7, &turns, &[], Some("h")),
             Some(("refs/ledecky/7/base".into(), "sha1".into()))
         );
-        assert_eq!(range(2), Some(("sha1".into(), "sha2".into())));
     }
 
     #[test]

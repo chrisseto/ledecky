@@ -734,6 +734,31 @@ test("a rebase keeps upstream commits out of the card's diff", async ({ page }) 
   await expect(fileSection(page, "main.rs")).toBeVisible();
 });
 
+test("a turn taken before a rebase is still measured from its own base", async ({ page }) => {
+  // The turns above were snapshotted against the base the card started from,
+  // and the rebase has since moved that base out from under them. Reaching for
+  // the card's base here would pair a post-rebase tree with a pre-rebase one and
+  // render every upstream file as a deletion.
+  await openCard(page, cardId);
+
+  const review = page.locator("#review");
+  const menu = review.locator("[data-range-menu]");
+
+  await menu.locator("summary").click();
+  await menu.getByText("Turn 1", { exact: true }).click();
+  await review.locator(".modes a.mode", { hasText: "Just this" }).click();
+  await expect(menu.locator("summary")).toContainText("Turn 1");
+
+  await expect(fileSection(page, "upstream.txt")).toHaveCount(0);
+  await expect(fileSection(page, "main.rs")).toBeVisible();
+
+  // Back to the default, so the serial tests after this one find the pane as
+  // they left it.
+  await menu.locator("summary").click();
+  await menu.getByText("What this card is based on").click();
+  await expect(menu.locator("summary")).toContainText("All changes");
+});
+
 test("re-pointing a live card aims the merge elsewhere, not the worktree", async ({ page }) => {
   const rooted = baseRef(cardId);
   const head = worktreeGit(cardId, "rev-parse", "HEAD");
