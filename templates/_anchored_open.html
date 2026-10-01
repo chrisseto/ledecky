@@ -1,0 +1,4 @@
+{# The block on its own, and the pane's refetch URL corrected to say whether a
+   box is open. No counts: opening or closing one changes nothing to tally. #}
+{% include "_anchored.html" %}
+{% with oob = true %}{% include "_pane_source.html" %}{% endwith %}

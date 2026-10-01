@@ -23,6 +23,7 @@ pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
         routes::diff_pane,
         routes::add_comment,
+        routes::anchored_block,
         routes::delete_comment,
         routes::discard_comments,
         routes::toggle_viewed,

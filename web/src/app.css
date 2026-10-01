@@ -2,9 +2,9 @@
 
 /* Came from unpoly's stylesheet, which this replaced; several things here
    still lean on it:
-   `.compose`, `.combo-menu`, `.empty-match` and `#tab-stat` are all shown and
-   hidden by the attribute alone, against rules that set `display` themselves.
-   Doubling the selector is what outweighs them. */
+   `.combo-menu`, `.empty-match`, `#tab-stat`, `.badge` and `#pane-stale` are
+   all shown and hidden by the attribute alone, against rules that set `display`
+   themselves. Doubling the selector is what outweighs them. */
 [hidden][hidden] { display: none !important; }
 
 /* Custom elements are inline by default; these stand in for the divs they
@@ -856,6 +856,7 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 .file-node.viewed { color: oklch(0.56 0.012 250); }
 .file-node.viewed .name { text-decoration: line-through; }
 .file-node .tick { width: 11px; flex: none; color: oklch(0.74 0.08 150); font-size: 11px; }
+.file-node:not(.viewed) .tick { visibility: hidden; }
 .file-node .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .badge {
@@ -869,7 +870,34 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 
 .diff { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
-/* Sticks to the top of the scroller so the file being read is always named. */
+/*
+ * Off-screen files are not laid out at all.
+ *
+ * Every file in the range is stacked in one scroller, so without this the pane
+ * lays out and paints every line of every file whether or not anyone can see
+ * it. `--rows` is the line count the server rendered; `lh` is what turns it
+ * into a height, so the stylesheet keeps owning how tall a line is rather than
+ * restating it. `auto` then remembers the real height once the file has been
+ * on screen, and the guess stops mattering.
+ *
+ * A closed file needs no guess at all — a `<details>` does not render what it
+ * is hiding, so there is nothing here to skip.
+ *
+ * NB: the floor and the `var()` fallback are both load-bearing. A box with no
+ * intrinsic height never becomes relevant, so it never lays out, so it stays at
+ * no height — it would vanish for good, which is what a held-back or binary
+ * file would do on `--rows: 0`. And a `var()` that does not resolve makes the
+ * whole declaration invalid, dropping containment silently and costing the
+ * entire optimisation with nothing to notice.
+ */
+.hunks {
+  content-visibility: auto;
+  contain-intrinsic-height: auto max(60px, calc(var(--rows, 20) * 1lh));
+}
+
+/* Sticks to the top of the scroller so the file being read is always named.
+   It is the file's `<summary>`, so clicking it is what folds the file away. */
+summary.file-head { list-style: none; cursor: pointer; }
 .file-head {
   position: sticky;
   top: 0;
@@ -884,15 +912,16 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   font-family: var(--sans);
   font-size: 12.5px;
 }
+summary.file-head::-webkit-details-marker { display: none; }
 .file:first-child .file-head, .commits:first-child .file-head:first-child { border-top: none; }
 .file .empty { margin: 0; padding: 20px; text-align: center; font-family: var(--sans); }
-.file-head form { display: contents; }
 .file-head .sha { color: var(--fg-strong); font-weight: 600; }
 .file-head .path { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-strong); font-weight: 600; }
 
 .viewed {
   display: flex;
   align-items: center;
+  flex: none;
   gap: 6px;
   height: 22px;
   padding: 0 7px 0 5px;
@@ -904,7 +933,6 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   font-size: 11.5px;
   font-weight: 600;
   white-space: nowrap;
-  cursor: pointer;
 }
 .viewed .box {
   display: grid;
@@ -917,8 +945,10 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   font-size: 9px;
 }
 .viewed .box .icon { width: 9px; height: 9px; }
-.viewed.on { border-color: oklch(0.62 0.08 150 / 0.5); background: oklch(0.62 0.08 150 / 0.14); color: var(--accent-text); }
-.viewed.on .box { border-color: oklch(0.74 0.08 150); background: oklch(0.74 0.08 150); color: oklch(0.18 0.012 250); }
+/* Ticked is folded: the disclosure is the state, so nothing has to carry a
+   class for it. */
+.file:not([open]) .viewed { border-color: oklch(0.62 0.08 150 / 0.5); background: oklch(0.62 0.08 150 / 0.14); color: var(--accent-text); }
+.file:not([open]) .viewed .box { border-color: oklch(0.74 0.08 150); background: oklch(0.74 0.08 150); color: oklch(0.18 0.012 250); }
 
 .collapsed { display: grid; place-items: center; padding: 20px; background: var(--bg-sunken); font-family: var(--sans); }
 .collapsed .btn { border-style: dashed; color: var(--fg-dim); }
@@ -934,24 +964,36 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 }
 .lines > .empty { margin: 28px auto; max-width: 420px; font-family: var(--sans); }
 
+/*
+ * Four boxes and two pseudo-elements, rather than six boxes.
+ *
+ * Every line of every file is on the page at once, so a span that only ever
+ * holds a constant is the diff's length in elements — to parse, to lay out, and
+ * for the morph to walk on each update. The gutter `+` and the diff sign are
+ * both constants, so they are drawn rather than sent.
+ */
 .line {
   display: grid;
   grid-template-columns: 22px 44px 44px 14px minmax(0, 1fr);
   cursor: pointer;
 }
 .line:hover { background: var(--bg-card-hover); }
-.line .add { text-align: center; color: oklch(0.42 0.012 250); user-select: none; }
-.line:hover .add { color: var(--accent-text); }
+.line::before { content: "+"; text-align: center; color: oklch(0.42 0.012 250); user-select: none; }
+.line:hover::before { color: var(--accent-text); }
 .line .n { text-align: right; padding-right: 8px; color: oklch(0.48 0.012 250); user-select: none; }
-.line .sign { user-select: none; }
-.line .code { white-space: pre-wrap; word-break: break-word; padding-right: 14px; }
+/* NB: both of these need the row as well as the column. `::after` is last in
+   box order but belongs in column 4, and a definite column alone would put it
+   on a second row — auto-placement moves the cursor down when a column goes
+   backwards. A definite row *and* column is placed before auto-flow runs. */
+.line::after { grid-area: 1 / 4; content: ""; user-select: none; }
+.line .code { grid-area: 1 / 5; white-space: pre-wrap; word-break: break-word; padding-right: 14px; }
 
+/* These follow `.line::after` on purpose: same specificity, so source order is
+   what lets a changed line's sign win over the empty one. */
 .l-added { background: oklch(0.62 0.08 150 / 0.12); box-shadow: inset 2px 0 0 var(--accent-line); }
-.l-added .sign { color: oklch(0.74 0.08 150); }
-.l-added .sign::before { content: "+"; }
+.l-added::after { content: "+"; color: oklch(0.74 0.08 150); }
 .l-removed { background: oklch(0.6 0.1 30 / 0.14); box-shadow: inset 2px 0 0 var(--del-line); }
-.l-removed .sign { color: oklch(0.72 0.08 30); }
-.l-removed .sign::before { content: "−"; }
+.l-removed::after { content: "−"; color: oklch(0.72 0.08 30); }
 .line.commenting { box-shadow: inset 2px 0 0 var(--accent); background: var(--bg-card-hover); }
 /* The subject of a commit message. */
 .file-head + .l-message .code { font-weight: 600; }
@@ -977,7 +1019,7 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
 
 /* ---- review comments ---- */
 
-.thread, .compose:not([hidden]) { margin: 6px 14px 10px 110px; }
+.thread, .compose { margin: 6px 14px 10px 110px; }
 
 .comment {
   display: flex;
@@ -1023,10 +1065,38 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   background: var(--bg-raised);
 }
 .batch form { display: contents; }
+/* The tally is its own element so it can be replaced out of band without
+   taking the staleness light with it; it lays out as if it were not there. */
+.batch-state { display: contents; }
 .batch-label { font-size: 12.5px; font-weight: 600; color: var(--fg-dim); }
-.batch.pending { background: oklch(0.7 0.08 80 / 0.08); }
-.batch.pending .batch-label { color: var(--warn-text); }
+.batch:has(.pending) { background: oklch(0.7 0.08 80 / 0.08); }
+.pending .batch-label { color: var(--warn-text); }
 .batch-label .aside { font-weight: 500; color: var(--fg-dim); }
+
+/* Hidden until the stream says the diff has moved. The pane no longer redraws
+   itself on a worktree write, so this is what says so. */
+.stale {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  /* Ahead of the tally rather than past the send button: it is the first thing
+     to know about, and the spacer would otherwise strand it in the corner. */
+  order: -1;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid oklch(0.7 0.08 80 / 0.4);
+  border-radius: 3px;
+  background: oklch(0.7 0.08 80 / 0.16);
+  color: var(--warn-text);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.stale:hover { background: oklch(0.7 0.08 80 / 0.26); }
+.stale .icon { width: 11px; height: 11px; }
 
 /* ---- diff syntax tokens ---- */
 /*

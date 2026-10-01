@@ -1,0 +1,13 @@
+{# The card-wide tally under the diff, and the light beside it. Rendered only
+   with the pane; a fragment that changes a count sends `_batch_state.html`
+   alone, so the light it does not know about is left alone. #}
+<footer class="batch">
+  {% with oob = false %}{% include "_batch_state.html" %}{% endwith %}
+
+  {# Lit by the stream, put out by the redraw it asks for. Not server state: the
+     server does not know what this browser has already been shown. #}
+  <button class="stale" id="pane-stale" type="button" hidden
+          hx-on="diff-{{ card.id }} from:body -> this.hidden = false">
+    {{ icon("refresh-cw") }} The agent has written — refresh
+  </button>
+</footer>

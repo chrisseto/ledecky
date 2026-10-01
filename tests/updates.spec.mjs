@@ -17,6 +17,8 @@ import {
   openAgent,
   openCard,
   pollsOfPath,
+  refreshDiff,
+  staleDiff,
 } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
@@ -103,8 +105,11 @@ test("a write in one worktree leaves another card's open pane alone", async ({ p
   await expect.poll(() => additions(page, second)).toBe(elsewhere + 1);
   expect(mine).toHaveLength(settled);
 
-  // And its own still reaches it, so the filter is not simply deaf.
+  // And its own still reaches it, so the filter is not simply deaf. The pane
+  // offers the redraw rather than taking it, so the fetch is the click's.
+  await expect(staleDiff(page)).toBeHidden();
   editWorktree(first, "mine.txt", "about the open card\n");
+  await refreshDiff(page);
   await expect(page.locator(`#review .file[data-path="mine.txt"]`)).toBeVisible();
   expect(mine).toHaveLength(settled + 1);
 });

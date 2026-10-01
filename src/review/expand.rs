@@ -21,9 +21,9 @@ pub struct FileExpansion {
 /// that no longer exist.
 ///
 /// Files are keyed by path, not by their position in the diff. The default
-/// range ends at the live worktree and the pane polls it, so a file appearing
-/// upstream would otherwise slide every open hunk onto a different file while
-/// someone is reading it. The DOM ids and the tree's jump links stay positional
+/// range ends at the live worktree and moves with it, so a file appearing
+/// upstream would otherwise slide every open hunk onto a different file between
+/// one redraw and the next. The DOM ids and the tree's jump links stay positional
 /// — they are rebuilt on every render and never outlive it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Expansion {

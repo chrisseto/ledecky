@@ -1,0 +1,38 @@
+{# Everything under the diff that counts comments. Comes back out of band beside
+   whatever fragment changed it, which is why it is separable from the footer
+   around it — `#pane-stale` lives out there, and replacing that would put the
+   staleness light out. #}
+<div class="batch-state {% if drafts %}pending{% endif %}" id="batch-state"{% if oob %} hx-swap-oob="outerHTML"{% endif %}>
+  <span class="batch-label">
+    {% if drafts %}
+      {{ drafts }} comment{{ "" if drafts == 1 else "s" }} pending
+      {# The count is card-wide, so say when some of it is not on screen. #}
+      {% if stranded %}<span class="aside">· {{ stranded }} on another range</span>{% endif %}
+    {% elif submitted %}
+      {{ submitted }} sent · add comments to send a batch
+    {% else %}
+      Click a line to comment
+    {% endif %}
+  </span>
+
+  <span class="spacer"></span>
+
+  {% if drafts %}
+    <form method="post" action="/cards/{{ card.id }}/comments/discard"
+          hx-post="/cards/{{ card.id }}/comments/discard" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
+      <input type="hidden" name="scope" value="{{ scope }}" />
+      <input type="hidden" name="expand" value="{{ expand }}" />
+      <button class="btn" type="submit">Discard</button>
+    </form>
+  {% endif %}
+
+  <form method="post" action="/cards/{{ card.id }}/review"
+        hx-post="/cards/{{ card.id }}/review" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
+    <input type="hidden" name="scope" value="{{ scope }}" />
+    <input type="hidden" name="expand" value="{{ expand }}" />
+    <button class="btn accent" type="submit" {% if not drafts %}disabled{% endif %}>
+      {{ icon("send") }}
+      {% if drafts %}Send {{ drafts }} to agent{% else %}Send to agent{% endif %}
+    </button>
+  </form>
+</div>

@@ -89,37 +89,56 @@ document.addEventListener("click", (event) => {
 });
 
 // ---- review comments --------------------------------------------------------
-// Which line is being commented on lives in the pane's query string, so the box
-// arrives from the server already in place. Clicking away is what saves it as a
-// draft; an empty box was a change of mind.
+// A box and the comments under it are one block against one line, asked for and
+// swapped on its own. Clicking away is what saves it as a draft; an empty box
+// was a change of mind. Which line is open is also in the pane's own fetch URL,
+// so the stream's resync brings it back rather than morphing it away.
 
-// NB: one listener for every line, rather than an `hx-get` on each. The pane
-// holds every line of every file at once, and htmx processes each element it
-// finds — so per-line attributes cost the whole diff's length on every comment,
-// expansion, tick and update, and put four attributes per line on the wire.
-// Issued from `.lines` so it joins the pane's own request queue.
+// NB: one listener for every line, rather than an `hx-get` on each. Only the
+// action attributes make htmx initialise an element, and `hx-get` is one — so
+// per-line it is the whole diff's length in attributes and in elements to wire
+// up on every swap.
 //
-// NB: delegated from `document` like the rest of this file rather than an
-// `hx-on:click` on the pane. That attribute is evaluated in global scope, so it
-// would need this body inlined in the template or a function hung on `window`.
+// NB: this could be an `hx-on:click` on `.lines`, which gets `event`, `this`
+// and htmx's own API — it is not global scope. It stays here because the body
+// is long enough that an attribute would hide the two sweeps in it.
 document.addEventListener("click", (event) => {
   const line = event.target.closest?.("#review .line");
   if (!line) return;
 
-  const review = line.closest(".review");
-  const key = `${line.dataset.file}#${line.dataset.anchor}`;
-  // Clicking the line whose box is open is how it closes again: the same view
-  // with one query parameter dropped.
-  const base = review.dataset.commentBase;
-  const url = line.classList.contains("commenting")
-    ? base
-    : `${base}&comment=${encodeURIComponent(key)}`;
+  // The path is the section's, not the line's: repeating it on every line is
+  // the diff's length in attributes for something the enclosing file already
+  // says. A line outside one has no anchor to build, so there is nothing to ask
+  // for — better than posting a comment against the path `undefined`.
+  const file = line.closest("[data-path]");
+  if (!file) return;
 
-  htmx.ajax("GET", url, {
-    target: "#review",
-    swap: "outerMorph",
-    source: line.closest(".lines"),
-  });
+  const review = line.closest(".review");
+  const key = `${file.dataset.path}#${line.dataset.anchor}`;
+
+  // A line's comments and its open box are one block, rendered only for the
+  // lines that have either — so it is there to swap or it is not there yet.
+  const block = line.nextElementSibling?.matches(".anchored")
+    ? line.nextElementSibling
+    : null;
+  // Clicking the line whose box is open is how it closes again.
+  const open = !block?.querySelector(".compose");
+
+  const url =
+    `/cards/${review.dataset.card}/comments/at` +
+    `?key=${encodeURIComponent(key)}` +
+    `&scope=${encodeURIComponent(review.dataset.scope)}` +
+    `&expand=${encodeURIComponent(review.dataset.expand)}` +
+    (open ? "&open=true" : "");
+
+  // The highlight used to come with the server's copy of the line. The line is
+  // not being redrawn any more, so it is set here.
+  for (const lit of document.querySelectorAll("#review .line.commenting")) {
+    lit.classList.remove("commenting");
+  }
+  line.classList.toggle("commenting", open);
+
+  htmx.ajax("GET", url, block ? { target: block, swap: "outerHTML" } : { target: line, swap: "afterend" });
 });
 
 // NB: closing the box blurs it either way, and a blur is what saves — so both

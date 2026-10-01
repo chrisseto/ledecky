@@ -19,7 +19,13 @@ pnpm e2e tests/lifecycle.spec.mjs # one file, while iterating on it
 pnpm e2e -g "rewritten"           # one test
 pnpm e2e:trace                    # retries once with a trace + HTML report
 pnpm e2e:shots                    # screenshots.spec, which is documentation
+pnpm e2e:perf                     # perf.spec, which counts what a big diff costs
 ```
+
+Those are three Playwright *projects*, not three ways of running one file:
+`chromium` is the ordinary loop and excludes the other two by tag, and each
+script is just `--project=<name>`. Running `playwright test` with no project
+runs all three, so reach for the scripts.
 
 The whole suite is ~20s on four workers, so run it. Narrow to a file while
 iterating on that file, not to save wall clock.

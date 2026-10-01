@@ -1,0 +1,7 @@
+{# What a comment landing or leaving changes: the line's own block, and the
+   tally under the diff. The tree's badges are recounted from the page — see
+   `#review`'s `after:swap` — because a commit's badge sums every commit and
+   this answer knows about one line. #}
+{% include "_anchored.html" %}
+{% if source %}{% with oob = true %}{% include "_pane_source.html" %}{% endwith %}{% endif %}
+{% with oob = true %}{% include "_batch_state.html" %}{% endwith %}

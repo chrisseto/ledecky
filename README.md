@@ -71,9 +71,12 @@ commit would carry a timestamp and so change on every read, defeating both the
 diff cache and the pane's ETag. `refs/ledecky/<card>/working` holds it so `gc`
 cannot prune it mid-read, and it goes away with the worktree.
 
-A range that ends at the worktree keeps up on its own: the watcher notices the
-write and the pane redraws by morphing, so a comment being typed keeps its text
-and its place rather than having to hold the update off.
+A range that ends at the worktree notices when it moves, and says so rather than
+acting on it: the watcher announces the write and the pane lights a button
+offering the redraw. Reading a diff is not something to move out from under
+someone — a redraw takes the open comment box, the range picker and the scroll
+position with it, and none of that is the agent's to disturb mid-sentence. So
+the pane goes stale visibly and waits to be asked.
 
 **Review.** The diff is rendered by piping `git diff` through [delta][] at full
 context. Full context is what makes highlighting correct: a block comment or
@@ -97,8 +100,10 @@ it is keyed by path rather than by position in the diff, so a file appearing
 upstream mid-update cannot slide it onto a different one. Ticking *Viewed* folds a
 file away, and that much is remembered per card.
 
-Click any diff line to comment; which line is open lives in the pane's query
-string like everything else, so an update redraws the box where it already was.
+Click any diff line to comment; the box and whatever has already been said
+about that line are one block, asked for and swapped on their own rather than
+by redrawing the pane around them. Which line is open is in the pane's own fetch
+URL too, so the stream's resync brings the box back instead of morphing it away.
 Clicking away saves it as a draft. *Send N to
 agent* formats the batch into one message and pastes it into the agent's
 terminal.
@@ -160,6 +165,9 @@ showing something stale.
 Updates are applied by morphing, so an element keeps its identity: a card that
 did not change keeps its live node, each lane keeps its scroll position, and a
 comment half-typed into the review pane keeps both its text and its place. The
+review pane is the one fragment that does not redraw itself when its event
+lands — it offers instead, for the reasons above; the stream's own resync still
+applies on its own, because that is a correction rather than news. The
 terminal carries `hx-morph-skip` because xterm builds that subtree on the client
 and the server knows nothing about it. Responses still carry an `ETag` over
 their own bytes, which now saves the bytes rather than the redraw.

@@ -6,10 +6,11 @@
     "icons": "node web/scripts/icons.mjs",
     "build": "pnpm icons && esbuild web/src/app.js --bundle --minify --format=iife --outfile=static/app.js && esbuild web/src/app.css --bundle --minify --loader:.woff2=file --outfile=static/app.css",
     "watch": "pnpm icons && esbuild web/src/app.js web/src/app.css --bundle --sourcemap --format=iife --loader:.woff2=file --outdir=static --watch",
-    "e2e": "playwright test",
+    "e2e": "playwright test --project=chromium",
     "e2e:ui": "playwright test --ui",
-    "e2e:trace": "E2E_DEBUG=1 playwright test --retries=1 --trace=on",
-    "e2e:shots": "E2E_SHOTS=1 playwright test --grep @shots"
+    "e2e:trace": "E2E_DEBUG=1 playwright test --project=chromium --retries=1 --trace=on",
+    "e2e:shots": "playwright test --project=shots",
+    "e2e:perf": "playwright test --project=perf --workers=1"
   },
   "dependencies": {
     "@fontsource-variable/manrope": "^5.3.0",

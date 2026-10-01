@@ -1,22 +1,27 @@
 {#
-  Redrawn only when the worktree actually moves, and by morphing — so the diff
-  stays where it was scrolled to, and a comment being typed keeps its text and
-  its place. `hx-get` is this same view, so an update never changes the range.
+  Redrawn when the reader asks, and by morphing — so the diff stays where it was
+  scrolled to. A worktree write only lights `#pane-stale`; see `_batch.html`.
 
-  One request queue for the whole pane, keyed on `#review`: a click replaces
-  whatever is in flight, and the pane's own update *drops* rather than replaces
-  — it was issued against the range the reader has just left, and letting it
-  land would undo the click. Nothing is lost by dropping it: the click's own
-  response is rendered after the change that announced itself.
+  What still swaps the whole pane is navigation: the range, the mode, an
+  expansion. Those share one queue keyed on `#review`, so a second click
+  replaces whatever the first had in flight rather than racing it.
 #}
 <div class="review" id="review" data-card="{{ card.id }}"
      data-scope="{{ scope }}" data-expand="{{ expand }}"
-     data-comment-base="{{ comment_base }}"
      data-additions="{{ additions }}" data-deletions="{{ deletions }}"
      data-has-diff="{{ 1 if has_diff else 0 }}"
-     hx-get="{{ source }}"
-     hx-trigger="diff-{{ card.id }} from:body, reload from:body"
-     hx-swap="outerMorph" hx-sync="#review:drop">
+     {# Every badge counts the comments its section is showing. Recounted here
+        rather than sent back, because a reply is about one line and a commit's
+        badge sums every commit — and because it is the same sum either way. A
+        class lookup per section, never a geometry read. #}
+     hx-on::after:swap="for (const n of this.querySelectorAll('.file-node')) {
+                          const section = this.querySelector(n.getAttribute('href'));
+                          const badge = n.querySelector('.badge');
+                          if (!section || !badge) continue;
+                          const seen = section.querySelectorAll('.comment').length;
+                          badge.textContent = seen;
+                          badge.hidden = !seen;
+                        }">
   <nav class="tree">
     <div class="tree-head">
       {# One list of points in history, newest first; the toggle beside it picks
@@ -56,9 +61,8 @@
         <a class="file-node mono" href="#commits">
           <span class="tick"></span>
           <span class="name">{{ messages | length }} commit{{ "" if messages | length == 1 else "s" }}</span>
-          {% if message_comments %}
-            <span class="badge" title="comments">{{ message_comments }}</span>
-          {% endif %}
+          <span class="badge" title="comments"
+                {% if not message_comments %}hidden{% endif %}>{{ message_comments }}</span>
         </a>
       {% endif %}
       {% for group in tree %}
@@ -73,11 +77,13 @@
         {% for node in group.files %}
           <a class="file-node mono {% if node.viewed %}viewed{% endif %}"
              href="#file-{{ node.index }}" title="{{ node.path }}">
-            <span class="tick">{% if node.viewed %}{{ icon("check") }}{% endif %}</span>
+            {# Always drawn, hidden by CSS until the file is ticked: the class is
+               toggled client-side when a file folds, and an icon that was never
+               rendered could not come back with it. #}
+            <span class="tick">{{ icon("check") }}</span>
             <span class="name">{{ node.name }}</span>
-            {% if node.comments %}
-              <span class="badge" title="comments">{{ node.comments }}</span>
-            {% endif %}
+            <span class="badge" id="badge-{{ node.index }}" title="comments"
+                  {% if not node.comments %}hidden{% endif %}>{{ node.comments }}</span>
             <span class="stat">
               <span class="adds">+{{ node.additions }}</span>
               <span class="dels">−{{ node.deletions }}</span>
@@ -93,10 +99,8 @@
   <div class="diff">
     {# The pane's one scroller. Morph matches it by id and never replaces it,
        which is what holds the scroll position; the tree scrolls to it too. #}
-    {# A click on a line asks for that line's box; the handler builds the view
-       from `data-comment-base` and the line's own anchor. The request is issued
-       from here so it takes its place in the pane's queue — see `app.js` for
-       why the lines do not carry it themselves. #}
+    {# A click on a line asks for that line's own block and swaps it in place —
+       see `app.js` for why the lines do not carry that request themselves. #}
     <div class="lines" id="diff-lines" hx-sync="#review:replace">
       {% if messages %}
         <section class="commits" id="commits">
@@ -104,25 +108,42 @@
             <header class="file-head">
               <span class="sha mono" title="{{ commit.sha }}">{{ commit.short }}</span>
             </header>
-            {% with path = commit.sha %}
-              {% for line in commit.lines %}{% include "_line.html" %}{% endfor %}
-            {% endwith %}
+            {# `data-path` because a line's click reads its path off the nearest
+               ancestor carrying one, which for a diff line is its file. #}
+            <div class="commit" data-path="{{ commit.sha }}">
+              {% with path = commit.sha %}
+                {% for line in commit.lines %}{% include "_line.html" %}{% endfor %}
+              {% endwith %}
+            </div>
           {% endfor %}
         </section>
       {% endif %}
       {% for file in files %}
-        <section class="file" id="file-{{ file.index }}" data-path="{{ file.path }}">
-          <header class="file-head">
-            <form method="post" action="/cards/{{ card.id }}/viewed"
-                  hx-post="/cards/{{ card.id }}/viewed" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
-              <input type="hidden" name="file_path" value="{{ file.path }}" />
-              <input type="hidden" name="scope" value="{{ scope }}" />
-              <input type="hidden" name="expand" value="{{ expand }}" />
-              <button class="viewed {% if file.viewed %}on{% endif %}" type="submit"
-                      title="Mark this file as read">
-                <span class="box">{{ icon("check") }}</span> Viewed
-              </button>
-            </form>
+        {# Folding is the browser's own, and the post is only what makes it
+           outlive the page: a 204, never a pane. It says which way the fold went
+           rather than asking for a flip, so a redraw replaying a `toggle`
+           re-asserts what is already stored instead of undoing it. #}
+        <details class="file" id="file-{{ file.index }}" data-path="{{ file.path }}"
+                 {% if file.viewed %}data-viewed{% else %}open{% endif %}
+                 hx-post="/cards/{{ card.id }}/viewed"
+                 {# NB: only when the fold disagrees with what the server last
+                    rendered. A morph re-inserts these, and an inserted open
+                    `<details>` fires `toggle` with nothing having changed —
+                    unfiltered, every redraw posts a tick nobody made. #}
+                 hx-trigger="toggle[this.open === this.hasAttribute('data-viewed')]"
+                 hx-vals="js:{file_path: this.dataset.path, viewed: !this.open}"
+                 hx-swap="none"
+                 {# Caught up once it lands, so the filter above keeps comparing
+                    against what the server knows rather than what we hope. #}
+                 hx-on::after:request="this.toggleAttribute('data-viewed', !this.open)"
+                 {# NB: per file, not once on the tree. `toggle` does not bubble,
+                    so a `from:` binding would catch only the files that existed
+                    when it was wired, and the morph keeps `#review` itself. #}
+                 hx-on:toggle="document.querySelector(`.file-node[href='#${this.id}']`)?.classList.toggle('viewed', !this.open)">
+          <summary class="file-head" title="Mark this file as read">
+            <span class="viewed">
+              <span class="box">{{ icon("check") }}</span> Viewed
+            </span>
 
             <span class="path mono">{{ file.path }}</span>
 
@@ -137,21 +158,14 @@
               <span class="adds">+{{ file.additions }}</span>
               <span class="dels">−{{ file.deletions }}</span>
             </span>
-          </header>
+          </summary>
 
-          {% if file.viewed %}
-            <div class="collapsed">
-              <form method="post" action="/cards/{{ card.id }}/viewed"
-                    hx-post="/cards/{{ card.id }}/viewed" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
-                <input type="hidden" name="file_path" value="{{ file.path }}" />
-                <input type="hidden" name="scope" value="{{ scope }}" />
-                <input type="hidden" name="expand" value="{{ expand }}" />
-                <button class="btn" type="submit">
-                  {{ icon("check") }} Viewed — collapsed. Click to reopen.
-                </button>
-              </form>
-            </div>
-          {% elif file.held_back %}
+          {# What `content-visibility` skips, and the only thing that needs a
+             height guessed for it. `--rows` is set by `app.js` from the lines
+             already here. The summary stays outside, so it keeps rendering and
+             keeps sticking. #}
+          <div class="hunks">
+          {% if file.held_back %}
             <div class="collapsed">
               <a class="btn" href="{{ file.show_href }}"
                  hx-get="{{ file.show_href }}" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
@@ -173,12 +187,15 @@
                 </div>
               {% else %}
                 {% for line in segment.lines %}
-                  {% with path = file.path %}{% include "_line.html" %}{% endwith %}
+                  {% with path = file.path %}
+                    {% include "_line.html" %}
+                  {% endwith %}
                 {% endfor %}
               {% endif %}
             {% endfor %}
           {% endif %}
-        </section>
+          </div>
+        </details>
       {% else %}
         <p class="empty">
           {% if has_history %}
@@ -190,40 +207,8 @@
       {% endfor %}
     </div>
 
-    <footer class="batch {% if drafts %}pending{% endif %}">
-      <span class="batch-label">
-        {% if drafts %}
-          {{ drafts }} comment{{ "" if drafts == 1 else "s" }} pending
-          {# The count is card-wide, so say when some of it is not on screen. #}
-          {% if stranded %}<span class="aside">· {{ stranded }} on another range</span>{% endif %}
-        {% elif submitted %}
-          {{ submitted }} sent · add comments to send a batch
-        {% else %}
-          Click a line to comment
-        {% endif %}
-      </span>
-
-      <span class="spacer"></span>
-
-      {% if drafts %}
-        <form method="post" action="/cards/{{ card.id }}/comments/discard"
-              hx-post="/cards/{{ card.id }}/comments/discard" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
-          <input type="hidden" name="scope" value="{{ scope }}" />
-          <input type="hidden" name="expand" value="{{ expand }}" />
-          <button class="btn" type="submit">Discard</button>
-        </form>
-      {% endif %}
-
-      <form method="post" action="/cards/{{ card.id }}/review"
-            hx-post="/cards/{{ card.id }}/review" hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace">
-        <input type="hidden" name="scope" value="{{ scope }}" />
-        <input type="hidden" name="expand" value="{{ expand }}" />
-        <button class="btn accent" type="submit" {% if not drafts %}disabled{% endif %}>
-          {{ icon("send") }}
-          {% if drafts %}Send {{ drafts }} to agent{% else %}Send to agent{% endif %}
-        </button>
-      </form>
-    </footer>
+    {% with oob = false %}{% include "_batch.html" %}{% endwith %}
+    {% with oob = false %}{% include "_pane_source.html" %}{% endwith %}
   </div>
 </div>
 

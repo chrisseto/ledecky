@@ -20,8 +20,15 @@
     <script src="/static/app.js" defer></script>
   </head>
   {# One connection per board. Every fragment below listens for the named
-     events it carries, so nothing else opens one of its own. #}
-  <body {% if project %}hx-sse:connect="/events?project={{ project.id }}"{% endif %}>
+     events it carries, so nothing else opens one of its own.
+
+     `--rows` sizes a file the diff has deliberately not laid out — see
+     `content-visibility` in `app.css`. NB: here rather than on `#review`
+     because `after:process` fires on what was processed, which is the body on
+     first load and the fragment on every swap after it — and scoped to that
+     fragment, because a board this busy processes a dozen of them per redraw. #}
+  <body {% if project %}hx-sse:connect="/events?project={{ project.id }}"{% endif %}
+        hx-on::after:process="for (const h of event.target.querySelectorAll?.('.hunks') ?? []) h.style.setProperty('--rows', h.querySelectorAll('.line').length)">
     <header class="top">
       <span class="brand">ledecky</span>
 

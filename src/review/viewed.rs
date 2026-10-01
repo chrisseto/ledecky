@@ -20,33 +20,22 @@ impl Viewed {
         rows.into_iter().collect()
     }
 
-    /// Ticks the file, or unticks it if it was already ticked.
-    pub async fn toggle(db: &Db, card_id: i64, file_path: &str) {
-        // NB: in a transaction. Whether to insert is decided by what the delete
-        // found, so two clicks landing together would otherwise both delete
-        // nothing and both insert.
-        let Ok(mut tx) = db.pool().begin().await else {
-            return;
+    /// Says whether a file has been read.
+    ///
+    /// NB: sets rather than flips, so the caller says which way it went. The
+    /// browser folds the file itself and reports the state it landed on, and an
+    /// update that re-asserts what is already stored has to be harmless —
+    /// nothing here can tell a reader's click from a redraw replaying one.
+    pub async fn set(db: &Db, card_id: i64, file_path: &str, viewed: bool) {
+        let query = match viewed {
+            true => sqlx::query(
+                "INSERT INTO review_viewed (card_id, file_path) VALUES (?1, ?2)
+                 ON CONFLICT (card_id, file_path) DO NOTHING",
+            ),
+            false => sqlx::query("DELETE FROM review_viewed WHERE card_id = ?1 AND file_path = ?2"),
         };
 
-        let removed =
-            sqlx::query("DELETE FROM review_viewed WHERE card_id = ?1 AND file_path = ?2")
-                .bind(card_id)
-                .bind(file_path)
-                .execute(&mut *tx)
-                .await
-                .map(|done| done.rows_affected())
-                .unwrap_or(0);
-
-        if removed == 0 {
-            let _ = sqlx::query("INSERT INTO review_viewed (card_id, file_path) VALUES (?1, ?2)")
-                .bind(card_id)
-                .bind(file_path)
-                .execute(&mut *tx)
-                .await;
-        }
-
-        let _ = tx.commit().await;
+        let _ = query.bind(card_id).bind(file_path).execute(db.pool()).await;
     }
 }
 
@@ -75,14 +64,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_toggles_on_and_back_off() {
+    async fn a_file_ticks_on_and_back_off() {
         let db = memory_db().await;
         let card = card(&db).await;
 
-        Viewed::toggle(&db, card, "src/main.rs").await;
+        Viewed::set(&db, card, "src/main.rs", true).await;
         assert!(Viewed::for_card(&db, card).await.contains("src/main.rs"));
 
-        Viewed::toggle(&db, card, "src/main.rs").await;
+        Viewed::set(&db, card, "src/main.rs", false).await;
+        assert!(Viewed::for_card(&db, card).await.is_empty());
+    }
+
+    /// A redraw can report a state the store already holds; saying it twice has
+    /// to mean the same as saying it once.
+    #[tokio::test]
+    async fn setting_the_same_state_twice_changes_nothing() {
+        let db = memory_db().await;
+        let card = card(&db).await;
+
+        Viewed::set(&db, card, "src/main.rs", true).await;
+        Viewed::set(&db, card, "src/main.rs", true).await;
+        assert_eq!(Viewed::for_card(&db, card).await.len(), 1);
+
+        Viewed::set(&db, card, "src/main.rs", false).await;
+        Viewed::set(&db, card, "src/main.rs", false).await;
         assert!(Viewed::for_card(&db, card).await.is_empty());
     }
 
@@ -91,7 +96,7 @@ mod tests {
         let db = memory_db().await;
         let (one, two) = (card(&db).await, card(&db).await);
 
-        Viewed::toggle(&db, one, "src/main.rs").await;
+        Viewed::set(&db, one, "src/main.rs", true).await;
 
         assert_eq!(Viewed::for_card(&db, one).await.len(), 1);
         assert!(Viewed::for_card(&db, two).await.is_empty());

@@ -49,9 +49,6 @@ export const AGENT_TIMINGS = {
 
 export default defineConfig({
   testDir: "tests",
-  // `screenshots.spec` is documentation-by-screenshot rather than assertions, so
-  // it is not part of the ordinary loop. `pnpm e2e:shots` runs it.
-  grepInvert: process.env.E2E_SHOTS ? undefined : /@shots/,
   outputDir: "tests/.artifacts",
   // Per *file*, not per test: every spec keeps its `mode: "serial"` ordering and
   // its `beforeAll` + module-level card id, while separate files run at once.
@@ -80,7 +77,19 @@ export default defineConfig({
     viewport: { width: 1440, height: 900 },
   },
 
-  projects: [{ name: "chromium", use: { browserName: "chromium" } }],
+  // Three suites, not three ways of running one. `chromium` is the ordinary
+  // loop; the other two are excluded from it rather than the other way round,
+  // because neither is assertions about behaviour — one is documentation by
+  // screenshot, the other seeds a deliberately slow diff.
+  //
+  // NB: named projects rather than an environment variable, so `--project` is
+  // the only switch and `playwright test --project=shots` works without going
+  // through a package script.
+  projects: [
+    { name: "chromium", use: { browserName: "chromium" }, grepInvert: /@shots|@perf/ },
+    { name: "shots", use: { browserName: "chromium" }, grep: /@shots/ },
+    { name: "perf", use: { browserName: "chromium" }, grep: /@perf/ },
+  ],
 
   // `global-setup` makes the run's test root and builds the binary once; the
   // servers themselves are per-worker fixtures, and teardown takes the root

@@ -196,6 +196,10 @@ pub fn stream(
         // pane's own `reload` resync renders it `Fresh`, staging the worktree
         // itself, so it is current either way. Naming a card here to reach it
         // would be the fan-out the line above exists to avoid.
+        //
+        // NB: a card's own `diff-<id>` no longer redraws its pane either — it
+        // lights the button that offers the redraw. Reaching a reader mid-diff
+        // is not something an event gets to do.
         if !stale.is_empty() {
             announce.project(project, Kind::Diff);
         }

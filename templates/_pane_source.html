@@ -1,0 +1,15 @@
+{# What the pane refetches, and the only thing that still redraws it unasked.
+
+   `reload` is the stream's resync — a page drawn before the stream came up, or
+   a client that lagged — so it is a correctness fix rather than news, and it
+   applies on its own. A worktree write only lights `#pane-stale`, which asks
+   from here when it is clicked.
+
+   Its own element rather than an attribute on `#review`, so a fragment can
+   correct the URL out of band: which line has a box open is part of it, and a
+   resync that did not carry it would morph the box away mid-sentence. #}
+<div id="pane-source" hidden
+     hx-get="{{ source }}"
+     hx-trigger="reload from:body, click from:#pane-stale"
+     hx-target="#review" hx-swap="outerMorph" hx-sync="#review:replace"
+     {%- if oob %} hx-swap-oob="outerHTML"{% endif %}></div>

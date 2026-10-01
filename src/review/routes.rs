@@ -23,9 +23,9 @@ use crate::tmpl::Tmpl;
 
 /// Rendered lines beyond which a file is held back behind a button.
 ///
-/// Every file in the range is on the page at once and the whole pane re-renders
-/// on each comment, expansion and tick, so one regenerated lockfile would
-/// otherwise put megabytes on the wire every time.
+/// Every file in the range is on the page at once, and an expansion still
+/// re-renders the whole pane, so one regenerated lockfile would otherwise put
+/// megabytes on the wire for a change that touched one hunk elsewhere.
 const MAX_LINES: usize = 2000;
 
 /// One anchor in the picker: a point in the card's history and the link that
@@ -402,7 +402,11 @@ async fn pane(
             // Asking for a big file once is enough; the expansion carries it.
             let held_back = (!ticked && !opened.shown() && length > MAX_LINES).then_some(length);
 
-            let segments: Vec<SegmentView> = match ticked || held_back.is_some() || file.binary {
+            // NB: a ticked file is still rendered in full. It is a closed
+            // `<details>`, so the browser neither lays it out nor paints it,
+            // and the reader gets it back without asking the server — which is
+            // the point. Eliding it here would make reopening a round trip.
+            let segments: Vec<SegmentView> = match held_back.is_some() || file.binary {
                 true => Vec::new(),
                 false => diff
                     .segments
@@ -475,6 +479,10 @@ async fn pane(
         comment_file => anchored.as_ref().map(|a| a.0.clone()),
         comment_side => anchored.as_ref().map(|a| a.1.clone()),
         comment_line => anchored.as_ref().map(|a| a.2.clone()),
+        // Closing the box swaps its own block, so this is the one link out of
+        // the pane that does not lead back to the pane.
+        cancel_href => view.comment
+            .map(|key| anchored_href(id, key, false, &scope_key, Some(&expand_key))),
         // Carries the open box, so an update redraws it rather than dropping it.
         source => rocket::uri!(diff_pane(
             id = id,
@@ -571,6 +579,143 @@ impl ViewForm {
     }
 }
 
+/// The comment counts a fragment has to report, without going near the diff.
+///
+/// Everything here comes out of the database and the card's turns, so a comment
+/// landing costs no `git diff` and no delta — the point of answering with a
+/// fragment rather than the pane.
+struct Counts {
+    here: Vec<Comment>,
+    drafts: i64,
+    stranded: i64,
+    submitted: usize,
+}
+
+async fn counts_for(db: &Db, id: i64, scope_key: &str) -> Result<Counts, Status> {
+    let scope = Scope::parse(Some(scope_key));
+    let turns = Turn::for_card(db, id).await;
+    let here = Comment::find_in_range(
+        db,
+        id,
+        viewing_turn(&scope, &turns),
+        scope.snapshot_turn().is_some(),
+    )
+    .await
+    .map_err(|err| failed(id, "reading the comments", err))?;
+    let drafts = Comment::draft_count(db, id)
+        .await
+        .map_err(|err| failed(id, "counting the drafts", err))?;
+
+    let showing = here.iter().filter(|c| c.is_draft()).count();
+    Ok(Counts {
+        drafts,
+        stranded: drafts - showing as i64,
+        submitted: here.len() - showing,
+        here,
+    })
+}
+
+/// `<path>#<side>:<line>` split back into what the comment form posts.
+fn split_key(key: &str) -> Option<(String, String, String)> {
+    let (path, anchor) = key.rsplit_once('#')?;
+    let (side, line) = anchor.split_once(':')?;
+    Some((path.to_owned(), side.to_owned(), line.to_owned()))
+}
+
+/// One line's comments, and the box when it is being written in.
+///
+/// Rendered on its own so opening, saving, cancelling and removing each swap
+/// the block they are about rather than the whole pane — see `_anchored.html`.
+fn anchored(
+    id: i64,
+    key: &str,
+    open: bool,
+    scope: &str,
+    expand: Option<&str>,
+    counts: &Counts,
+    source: Option<String>,
+) -> minijinja::Value {
+    let parts = split_key(key);
+    let thread: Vec<Comment> = counts
+        .here
+        .iter()
+        .filter(|c| c.anchor() == key)
+        .cloned()
+        .collect();
+    let expand_key = expand.unwrap_or_default().to_owned();
+
+    minijinja::context! {
+        card => minijinja::context! { id => id },
+        key => key,
+        open => open,
+        thread => thread,
+        comment_file => parts.as_ref().map(|p| p.0.clone()),
+        comment_side => parts.as_ref().map(|p| p.1.clone()),
+        comment_line => parts.as_ref().map(|p| p.2.clone()),
+        scope => scope,
+        expand => expand_key,
+        cancel_href => anchored_href(id, key, false, scope, expand),
+        source => source,
+        drafts => counts.drafts,
+        stranded => counts.stranded,
+        submitted => counts.submitted,
+    }
+}
+
+/// What the pane refetches when the stream says the diff moved.
+///
+/// Carries the open box, so a redraw brings it back rather than dropping it —
+/// which is why a fragment that opens or closes one sends a new copy.
+fn pane_source(id: i64, scope: &str, expand: Option<&str>, comment: Option<&str>) -> String {
+    rocket::uri!(diff_pane(
+        id = id,
+        scope = Some(scope),
+        expand = Some(expand.unwrap_or_default()),
+        comment = comment,
+    ))
+    .to_string()
+}
+
+/// Built here rather than in a template, like every other link out of the pane.
+fn anchored_href(id: i64, key: &str, open: bool, scope: &str, expand: Option<&str>) -> String {
+    rocket::uri!(anchored_block(
+        id = id,
+        key = key,
+        scope = Some(scope),
+        expand = Some(expand.unwrap_or_default()),
+        open = open.then_some(true),
+    ))
+    .to_string()
+}
+
+/// The box for one line, or the line's thread once it is closed again.
+#[get("/cards/<id>/comments/at?<key>&<scope>&<expand>&<open>")]
+pub async fn anchored_block(
+    db: &State<Db>,
+    id: i64,
+    key: String,
+    scope: Option<String>,
+    expand: Option<String>,
+    open: Option<bool>,
+) -> Result<Tmpl, Status> {
+    let scope = scope.unwrap_or_default();
+    let open = open.unwrap_or(false);
+    let counts = counts_for(db, id, &scope).await?;
+    let source = pane_source(id, &scope, expand.as_deref(), open.then_some(key.as_str()));
+    Ok(Tmpl(
+        "_anchored_open.html",
+        anchored(
+            id,
+            &key,
+            open,
+            &scope,
+            expand.as_deref(),
+            &counts,
+            Some(source),
+        ),
+    ))
+}
+
 #[derive(rocket::FromForm)]
 pub struct CommentForm {
     file_path: String,
@@ -583,13 +728,7 @@ pub struct CommentForm {
 }
 
 #[post("/cards/<id>/comments", data = "<form>")]
-pub async fn add_comment(
-    db: &State<Db>,
-    settings: &State<Settings>,
-    cache: &State<DiffCache>,
-    id: i64,
-    form: Form<CommentForm>,
-) -> Result<Tmpl, Status> {
+pub async fn add_comment(db: &State<Db>, id: i64, form: Form<CommentForm>) -> Result<Tmpl, Status> {
     let body = form.body.trim();
     if !body.is_empty() {
         let turns = Turn::for_card(db, id).await;
@@ -606,30 +745,52 @@ pub async fn add_comment(
         .map_err(|_| Status::InternalServerError)?;
     }
 
-    let view = View {
-        scope: Some(&form.scope),
-        expand: form.expand.as_deref(),
-        comment: None,
-    };
+    let key = format!("{}#{}:{}", form.file_path, form.side, form.line);
+    let counts = counts_for(db, id, &form.scope).await?;
+    let source = pane_source(id, &form.scope, form.expand.as_deref(), None);
     Ok(Tmpl(
-        "_review.html",
-        pane(db, settings, cache, id, view).await?,
+        "_anchored_reply.html",
+        anchored(
+            id,
+            &key,
+            false,
+            &form.scope,
+            form.expand.as_deref(),
+            &counts,
+            Some(source),
+        ),
     ))
+}
+
+#[derive(rocket::FromForm)]
+pub struct DeleteCommentForm {
+    key: String,
+    #[field(default = String::new())]
+    scope: String,
+    expand: Option<String>,
 }
 
 #[post("/cards/<id>/comments/<comment_id>/delete", data = "<form>")]
 pub async fn delete_comment(
     db: &State<Db>,
-    settings: &State<Settings>,
-    cache: &State<DiffCache>,
     id: i64,
     comment_id: i64,
-    form: Form<ViewForm>,
+    form: Form<DeleteCommentForm>,
 ) -> Result<Tmpl, Status> {
     Comment::delete_draft(db, id, comment_id).await;
+
+    let counts = counts_for(db, id, &form.scope).await?;
     Ok(Tmpl(
-        "_review.html",
-        pane(db, settings, cache, id, form.view()).await?,
+        "_anchored_reply.html",
+        anchored(
+            id,
+            &form.key,
+            false,
+            &form.scope,
+            form.expand.as_deref(),
+            &counts,
+            None,
+        ),
     ))
 }
 
@@ -653,31 +814,18 @@ pub async fn discard_comments(
 #[derive(rocket::FromForm)]
 pub struct ViewedForm {
     file_path: String,
-    #[field(default = String::new())]
-    scope: String,
-    expand: Option<String>,
+    viewed: bool,
 }
 
-/// Ticks a file off, or puts it back.
+/// Records whether a file has been read.
+///
+/// Answers nothing on purpose. The fold already happened in the browser — this
+/// is only what makes it outlive the page — so returning a pane would redraw
+/// every line of every other file to say something the reader can already see.
 #[post("/cards/<id>/viewed", data = "<form>")]
-pub async fn toggle_viewed(
-    db: &State<Db>,
-    settings: &State<Settings>,
-    cache: &State<DiffCache>,
-    id: i64,
-    form: Form<ViewedForm>,
-) -> Result<Tmpl, Status> {
-    Viewed::toggle(db, id, &form.file_path).await;
-
-    let view = View {
-        scope: Some(&form.scope),
-        expand: form.expand.as_deref(),
-        comment: None,
-    };
-    Ok(Tmpl(
-        "_review.html",
-        pane(db, settings, cache, id, view).await?,
-    ))
+pub async fn toggle_viewed(db: &State<Db>, id: i64, form: Form<ViewedForm>) -> Status {
+    Viewed::set(db, id, &form.file_path, form.viewed).await;
+    Status::NoContent
 }
 
 /// Hands every draft comment to the agent as one message and marks them sent.

@@ -23,8 +23,16 @@ export class FileTree extends HTMLElement {
     this.addEventListener("click", this.onClick);
 
     // The file being read is the first one not yet scrolled past, which is what
-    // the sticky header is showing. Derived from geometry rather than from the
-    // entries, because any one entry only reports its own file.
+    // the sticky header is showing. The observer is only the trigger — the
+    // answer is measured, because a section can cross the whole scrollport
+    // between two callbacks without reporting intersecting at either end, which
+    // leaves anything derived from the entries stale and wrong.
+    //
+    // NB: the root is pulled in a pixel at the top on purpose. A file scrolled
+    // exactly to the top leaves its predecessor's bottom edge flush with the
+    // scroller's, and a flush edge still counts as intersecting — so without
+    // this the tree names the file just left rather than the one arrived at.
+    // It is the same fudge the geometry this replaced carried as `top + 1`.
     this.observer = new IntersectionObserver(() => this.mark(), {
       root: this.lines,
       threshold: [0, 1],
@@ -39,25 +47,40 @@ export class FileTree extends HTMLElement {
 
   watch() {
     this.observer?.disconnect();
-    for (const section of this.lines?.querySelectorAll(".file") ?? []) {
-      this.observer?.observe(section);
-    }
+
+    this.sections = [...(this.lines?.querySelectorAll(".file") ?? [])];
+    // Looked up once here rather than per callback, and rebuilt on each settle
+    // because a morph may have replaced the nodes these point at.
+    this.nodes = new Map(
+      this.sections.map((section) => [section, this.querySelector(`[href="#${section.id}"]`)]),
+    );
+    // NB: cleared, not kept. `selected` is ours — the server never renders it,
+    // so every morph strips it off. Forgetting which file was being read is
+    // what makes the next callback put the highlight back rather than decide
+    // nothing has changed.
+    this.reading = null;
+
+    for (const section of this.sections) this.observer?.observe(section);
   }
 
   mark() {
-    const sections = [...(this.lines?.querySelectorAll(".file") ?? [])];
-    if (!sections.length) return;
+    if (!this.sections?.length) return;
 
+    // NB: reads only, in one pass, so this is one layout flush however many
+    // files it walks — not one per file.
     const top = this.lines.getBoundingClientRect().top;
     const reading =
-      sections.find((section) => section.getBoundingClientRect().bottom > top + 1) ??
-      sections[sections.length - 1];
+      this.sections.find((section) => section.getBoundingClientRect().bottom > top + 1) ??
+      this.sections.at(-1);
 
-    const nodeFor = (section) => this.querySelector(`[href="#${section.id}"]`);
-    for (const section of sections) {
-      nodeFor(section)?.classList.toggle("selected", section === reading);
-    }
-    if (reading) nodeFor(reading)?.scrollIntoView({ block: "nearest" });
+    // Everything below is a write, and only when the answer moved — which is
+    // what keeps that flush from being followed by another.
+    if (reading === this.reading) return;
+
+    this.nodes.get(this.reading)?.classList.remove("selected");
+    this.nodes.get(reading)?.classList.add("selected");
+    this.reading = reading;
+    this.nodes.get(reading)?.scrollIntoView({ block: "nearest" });
   }
 
   disconnectedCallback() {

@@ -21,7 +21,9 @@ import {
   openAgent,
   openCard,
   pollsOfPath,
+  refreshDiff,
   removeInWorktree,
+  staleDiff,
   turnRefs,
   worktreeGit,
   worktreeOf,
@@ -294,24 +296,31 @@ test("a commit's message is on screen, and takes comments like a diff line", asy
   await expect(commits.locator(".comment")).toHaveCount(0);
 });
 
-test("the pane keeps up with the worktree on its own", async ({ page }) => {
+test("the pane says when the worktree has moved, and redraws when asked", async ({ page }) => {
   const refetches = pollsOfPath(page, `/cards/${cardId}/diff`);
   await openCard(page, cardId);
   await expect(page.locator("#review .file").first()).toBeVisible();
+  await expect(staleDiff(page)).toBeHidden();
 
   editWorktree(cardId, "later.txt", "arrived while the drawer was open\n");
 
-  // No reload: the worktree watcher announces the write and the pane fetches
-  // itself in answer.
-  await expect(fileSection(page, "later.txt")).toBeVisible();
+  // No reload, and no redraw either: the watcher announces the write, and the
+  // pane offers the redraw rather than taking it. Nothing on screen moves until
+  // the reader says so.
+  await expect(staleDiff(page)).toBeVisible();
+  await expect(fileSection(page, "later.txt")).toHaveCount(0);
+  expect(refetches).toHaveLength(1);
 
-  // One fetch per change rather than one per tick. A second write moves the
-  // pane again, and the single fetch between the two is the whole contract:
-  // nothing arrives that a change did not ask for.
-  const afterFirst = refetches.length;
+  await refreshDiff(page);
+  await expect(fileSection(page, "later.txt")).toBeVisible();
+  expect(refetches).toHaveLength(2);
+
+  // And the light comes back on for the next one, which is what says the watch
+  // outlived the redraw rather than being a one-off.
   editWorktree(cardId, "later-still.txt", "and another\n");
+  await refreshDiff(page);
   await expect(fileSection(page, "later-still.txt")).toBeVisible();
-  expect(refetches).toHaveLength(afterFirst + 1);
+  expect(refetches).toHaveLength(3);
 });
 
 test("work in a directory the agent just made announces itself too", async ({ page }) => {
@@ -322,12 +331,14 @@ test("work in a directory the agent just made announces itself too", async ({ pa
   // Nothing git ignores is watched, so a new directory has to be picked up as
   // it arrives — and the file inside it lands before the watch on it does.
   editWorktree(cardId, "pkg/arrived.txt", "written into a directory that did not exist\n");
+  await refreshDiff(page);
   await expect(fileSection(page, "pkg/arrived.txt")).toBeVisible();
 
   // And it is watched from then on rather than merely swept up the once: a
-  // second write to the same directory moves the pane by itself, and only once.
+  // second write to the same directory lights it again, and only once.
   const afterFirst = refetches.length;
   editWorktree(cardId, "pkg/again.txt", "and again, into one that now exists\n");
+  await refreshDiff(page);
   await expect(fileSection(page, "pkg/again.txt")).toBeVisible();
   expect(refetches).toHaveLength(afterFirst + 1);
 });
@@ -338,6 +349,7 @@ test("a directory replaced wholesale is watched again", async ({ page }) => {
 
   // Watched for certain before it is replaced: the write has to have landed.
   editWorktree(cardId, "swap/first.txt", "a directory to take away again\n");
+  await refreshDiff(page);
   await expect(fileSection(page, "swap/first.txt")).toBeVisible();
 
   // Deleted and remade inside one burst. The descriptor was on the old inode,
@@ -345,12 +357,14 @@ test("a directory replaced wholesale is watched again", async ({ page }) => {
   // directory being there under the same name says nothing about that.
   removeInWorktree(cardId, "swap");
   editWorktree(cardId, "swap/remade.txt", "the directory was replaced under it\n");
+  await refreshDiff(page);
   await expect(fileSection(page, "swap/remade.txt")).toBeVisible();
 
   // And it is the new directory that is watched, rather than the burst that
   // replaced it having swept the file up the once.
   const afterRemake = refetches.length;
   editWorktree(cardId, "swap/once-more.txt", "still keeping up\n");
+  await refreshDiff(page);
   await expect(fileSection(page, "swap/once-more.txt")).toBeVisible();
   expect(refetches).toHaveLength(afterRemake + 1);
 });
@@ -364,16 +378,44 @@ test("a comment being written survives an update to the diff", async ({ page }) 
   const textarea = page.locator(".compose textarea");
   await textarea.fill("half a thought");
 
-  // The box is anchored in the pane's own URL, so the update this write
-  // triggers redraws it in place rather than arriving without it. Morphing is
-  // what keeps the half-typed text.
   editWorktree(cardId, "during-comment.txt", "written while a comment was open\n");
-  await expect(fileSection(page, "during-comment.txt")).toBeVisible();
 
+  // The write is announced and nothing else happens. This is the whole reason
+  // the pane stopped redrawing itself: a box being typed into is not something
+  // to move out from under someone.
+  await expect(staleDiff(page)).toBeVisible();
   await expect(textarea).toHaveValue("half a thought");
-  // Stronger than a sleep ever was: the pane did not merely leave the text
-  // alone, it redrew underneath it and the box came back with it.
   await expect(page.locator(".compose")).toBeVisible();
+
+  // NB: filed the ordinary way before taking the redraw. Clicking the light is
+  // also clicking away, which files the draft and swaps the block out from
+  // under the pointer — so the click lands on whatever moved into its place.
+  await page.locator("#review .batch-label").click();
+  await expect(page.locator("#review .comment", { hasText: "half a thought" })).toBeVisible();
+
+  // And the redraw brings the file with it, leaving the draft where it was.
+  await refreshDiff(page);
+  await expect(fileSection(page, "during-comment.txt")).toBeVisible();
+  await expect(page.locator("#review .comment", { hasText: "half a thought" })).toBeVisible();
+});
+
+test("the redraw can be taken with a comment half-written", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = page.locator("#review .line").first();
+  await line.click();
+  await page.locator(".compose textarea").fill("mid sentence");
+
+  editWorktree(cardId, "while-typing.txt", "written while a comment was open\n");
+  await expect(staleDiff(page)).toBeVisible();
+
+  // NB: taking the redraw from inside the box is the awkward case. The click
+  // blurs the textarea, blurring files the draft, and that answer swaps the
+  // block — all while the pointer is still down on the button. Both requests
+  // have to land, and the light has to go out.
+  await refreshDiff(page);
+  await expect(fileSection(page, "while-typing.txt")).toBeVisible();
+  await expect(page.locator("#review .comment", { hasText: "mid sentence" })).toBeVisible();
 });
 
 test("Escape throws a comment away rather than filing it", async ({ page }) => {
@@ -409,10 +451,15 @@ test("the tree jumps to a file instead of reloading the pane", async ({ page }) 
 
   await page.locator('.file-node[href="#file-1"]').click();
   await expect.poll(top).toBeGreaterThan(0);
+  // The tree names the file being read, and it follows the scroller rather
+  // than the click — so this is also what says the observer behind it is still
+  // wired up. Nothing else in the suite looks at `selected`.
+  await expect(page.locator(".file-node.selected")).toHaveAttribute("href", "#file-1");
 
   // And back up to the top, where the card's commits sit above its files.
   await page.locator('.file-node[href="#commits"]').click();
   await expect.poll(top).toBe(0);
+  await expect(page.locator(".file-node.selected")).toHaveAttribute("href", "#file-0");
 
   // Both jumps were scrolls, not navigations: the tree left the URL alone.
   expect(page.url()).toBe(url);
@@ -429,8 +476,9 @@ test("every link out of the pane carries a usable query", async ({ page }) => {
   expect(hrefs.filter((href) => href.includes("amp;"))).toEqual([]);
 
   // The pane refetches this one, so a dropped parameter would reset the range
-  // on every update rather than just on a click.
-  const source = await page.locator("#review").getAttribute("hx-get");
+  // on every update rather than just on a click. It is an element of its own so
+  // a fragment can correct it out of band — see `_pane_source.html`.
+  const source = await page.locator("#pane-source").getAttribute("hx-get");
   expect(source).not.toContain("amp;");
   expect(source).toContain("scope=");
 });
@@ -481,30 +529,63 @@ test("a folded hunk opens a gap at a time and stays open around a comment", asyn
   const whole = await lines.count();
 
   // And the widened view survives a comment landing on it.
+  //
+  // NB: named rather than "a comment is on screen". Drafts outlive the test
+  // that wrote them — the batch is card-wide and deliberately not cleared
+  // between them — so anything counting on being the only one is a flake
+  // waiting for the run where it is not.
   await comment(page, lines.first(), "still wide?");
-  await expect(page.locator("#review .comment")).toBeVisible();
+  await expect(page.locator("#review .comment", { hasText: "still wide?" })).toBeVisible();
   await expect(lines).toHaveCount(whole);
 });
 
 test("a file can be ticked off, which folds it away until it is untucked", async ({ page }) => {
+  const panes = pollsOfPath(page, `/cards/${cardId}/diff`);
+  const ticks = pollsOfPath(page, `/cards/${cardId}/viewed`);
   await openCard(page, cardId);
 
   const main = fileSection(page, "main.rs");
-  await main.getByRole("button", { name: "Viewed" }).click();
-  await expect(main.locator(".collapsed")).toBeVisible();
+  const readme = fileSection(page, "README.md");
+  await expect(main.locator(".line").first()).toBeVisible();
+  // The stream opens with a resync, so the pane fetches itself once on its own.
+  // Count from after that rather than racing it.
+  await expect.poll(() => panes.length).toBeGreaterThan(0);
+  const drawn = panes.length;
+
+  // A file is a `<details>` and its header is the `<summary>`, so this is the
+  // browser's own disclosure — the path is a plain span, and clicking it works
+  // the summary the way clicking anywhere else on the header does.
+  await main.locator(".file-head .path").click();
+
+  await expect(main.locator(".line").first()).toBeHidden();
   await expect(page.locator("#review .file-node.viewed")).toHaveText([/main\.rs/]);
   // The other file is untouched by the tick.
-  await expect(fileSection(page, "README.md").locator(".line").first()).toBeVisible();
+  await expect(readme.locator(".line").first()).toBeVisible();
 
-  // The tick outlives the fragment it was made on.
+  // And the point of doing it this way. The tick is persisted — so the server
+  // was spoken to, and waiting for that is what gives the next line its teeth —
+  // but it answered 204 and the pane never redrew. A redraw here would be the
+  // whole diff over the wire to say something already on screen.
+  await expect.poll(() => ticks.length).toBe(1);
+  expect(panes.length).toBe(drawn);
+
+  // The tick still outlives the fragment it was made on — it is persisted
+  // behind the fold rather than rendered by it.
   await page.reload();
-  await expect(main.locator(".collapsed")).toBeVisible();
+  await expect(main.locator(".line").first()).toBeHidden();
+  await expect(readme.locator(".line").first()).toBeVisible();
 
-  await main.getByRole("button", { name: /Viewed — collapsed/ }).click();
+  await main.locator(".file-head .path").click();
   await expect(main.locator(".line").first()).toBeVisible();
+
+  // NB: and wait for that one to persist too. The fold is reported behind the
+  // reader's back, so a test that walks away with the write still in flight
+  // leaves the next one to open a card that is about to fold itself.
+  await expect.poll(() => ticks.length).toBe(2);
 });
 
 test("the lines carry no request of their own, and still open their box", async ({ page }) => {
+  const panes = pollsOfPath(page, `/cards/${cardId}/diff`);
   await openCard(page, cardId);
 
   const line = fileSection(page, "main.rs").locator(".line.l-added").first();
@@ -515,6 +596,17 @@ test("the lines carry no request of their own, and still open their box", async 
   // anchor.
   await expect(page.locator("#review .line[hx-get]")).toHaveCount(0);
 
+  // The same argument for the path and for the two cells that only ever held a
+  // constant: the enclosing section already says which file this is, and the
+  // gutter `+` and the diff sign are drawn by the stylesheet.
+  await expect(page.locator("#review .line[data-file]")).toHaveCount(0);
+  await expect(page.locator("#review .line .add, #review .line .sign")).toHaveCount(0);
+  await expect(line.locator("> *")).toHaveCount(3);
+
+  // The stream opens with a resync, so the pane fetches itself once on its own.
+  await expect.poll(() => panes.length).toBeGreaterThan(0);
+  const drawn = panes.length;
+
   await line.click();
   await expect(page.locator("#review .compose textarea")).toBeVisible();
 
@@ -522,6 +614,18 @@ test("the lines carry no request of their own, and still open their box", async 
   // to carry.
   await line.click();
   await expect(page.locator("#review .compose")).toHaveCount(0);
+
+  // A box is one line's business, so none of that redrew the pane. It is what
+  // keeps an open range menu open, and a comment off the diff's critical path:
+  // the whole thing used to come back over the wire to show one textarea.
+  await comment(page, line, "and this lands the same way");
+  await expect(page.locator("#review .comment", { hasText: "and this lands" })).toBeVisible();
+  expect(panes.length).toBe(drawn);
+
+  // The count beside it still moved, out of band with the block.
+  await expect(page.locator("#review .batch-label")).toContainText("pending");
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(page.locator("#review .comment", { hasText: "and this lands" })).toHaveCount(0);
 });
 
 test("a review comment goes back to the agent and produces its own turn", async ({ page }) => {

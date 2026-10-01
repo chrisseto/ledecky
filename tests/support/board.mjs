@@ -116,6 +116,23 @@ export async function openAgent(page, cardId) {
   await expect(terminalRows(page)).toBeVisible();
 }
 
+/**
+ * The light that says the worktree has moved under the open pane.
+ *
+ * The diff does not redraw itself on a write any more — a redraw would take an
+ * open comment box, the range menu and the scroll position with it — so this is
+ * what the stream lights instead.
+ */
+export const staleDiff = (page) => page.locator("#pane-stale");
+
+/** Waits for the stream to report the move, then takes the redraw it offers. */
+export async function refreshDiff(page) {
+  const stale = staleDiff(page);
+  await expect(stale).toBeVisible();
+  await stale.click();
+  await expect(stale).toBeHidden();
+}
+
 /** The stacked diff renders every changed file; this is one of them. */
 export const fileSection = (page, path) => page.locator(`#review .file[data-path="${path}"]`);
 
@@ -123,14 +140,11 @@ export const fileSection = (page, path) => page.locator(`#review .file[data-path
 export async function comment(page, line, body) {
   await line.click();
   await page.locator(".compose textarea").fill(body);
-  // Blur is the save; the section's own header is the nearest thing that is not
-  // a line and cannot scroll out from under the click.
-  const file = await line.getAttribute("data-file");
-  await page
-    .locator(`#review section:has(> .line[data-file="${file}"])`)
-    .locator(".file-head .path, .file-head .sha")
-    .first()
-    .click();
+  // Blur is the save. Not the section's own header any more — a file's is the
+  // disclosure's `<summary>`, so clicking it would fold the file away and tick
+  // it viewed. The batch footer is the nearest thing that is neither a line nor
+  // a control, and it cannot scroll out from under the click.
+  await page.locator(".batch-label").click();
 }
 
 /**
