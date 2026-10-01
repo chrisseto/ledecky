@@ -22,6 +22,10 @@ pub struct Turn {
     pub n: i64,
     pub commit_sha: String,
     pub parent_sha: String,
+    /// The card's base when this snapshot was taken, for telling whether a range
+    /// reaching from here to the live head would cross a rebase. `None` for a
+    /// turn recorded before it was kept, which places no era either way.
+    pub base_sha: Option<String>,
     pub last_assistant_message: Option<String>,
     pub created_at: String,
     /// `created_at` in unix seconds, which is what orders a turn against one of
@@ -29,9 +33,18 @@ pub struct Turn {
     pub at: i64,
 }
 
+/// Where a snapshot sits: the commit it recorded, the one it follows, and the
+/// base the card was on at the time.
+struct Lineage<'a> {
+    commit_sha: &'a str,
+    parent_sha: &'a str,
+    base_sha: Option<&'a str>,
+}
+
 impl Turn {
-    const COLUMNS: &'static str = "id, n, commit_sha, parent_sha, last_assistant_message, \
-         created_at, CAST(strftime('%s', created_at) AS INTEGER) AS at";
+    const COLUMNS: &'static str = "id, n, commit_sha, parent_sha, base_sha, \
+         last_assistant_message, created_at, \
+         CAST(strftime('%s', created_at) AS INTEGER) AS at";
 
     pub async fn for_card(db: &Db, card_id: i64) -> Vec<Self> {
         sqlx::query_as(sql(format!(
@@ -74,20 +87,21 @@ impl Turn {
         settings: &Settings,
         card_id: i64,
         n: i64,
-        commit_sha: &str,
-        parent_sha: &str,
+        lineage: Lineage<'_>,
         message: &str,
     ) -> sqlx::Result<()> {
         let inserted = sqlx::query(
             "INSERT INTO turns
-                 (card_id, n, ref_name, commit_sha, parent_sha, last_assistant_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (card_id, n, ref_name, commit_sha, parent_sha, base_sha,
+                  last_assistant_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(card_id)
         .bind(n)
         .bind(settings.turn_ref(card_id, n))
-        .bind(commit_sha)
-        .bind(parent_sha)
+        .bind(lineage.commit_sha)
+        .bind(lineage.parent_sha)
+        .bind(lineage.base_sha)
         .bind(message)
         .execute(db.pool())
         .await?;
@@ -112,11 +126,16 @@ impl Turn {
         message: &str,
     ) -> anyhow::Result<Option<Self>> {
         let n = Self::next_number(db, card_id).await;
+        let base = settings.base_ref(card_id);
         let parent = match Self::latest(db, card_id).await {
             Some(turn) => turn.commit_sha,
-            None => settings.base_ref(card_id),
+            None => base.clone(),
         };
         let parent_sha = git::run(repo, &["rev-parse", &parent]).await?;
+        // Every turn, not just the first: after a rebase the chain still parents
+        // on its predecessor, so the parent alone no longer says which era the
+        // snapshot belongs to.
+        let base_sha = git::rev_parse(repo, git::Rev::Ref(&base)).await;
 
         let Some(sha) =
             git::snapshot_turn(settings, repo, worktree, card_id, n, &parent_sha).await?
@@ -124,7 +143,12 @@ impl Turn {
             return Ok(None);
         };
 
-        Self::record(db, settings, card_id, n, &sha, &parent_sha, message).await?;
+        let lineage = Lineage {
+            commit_sha: &sha,
+            parent_sha: &parent_sha,
+            base_sha: base_sha.as_deref(),
+        };
+        Self::record(db, settings, card_id, n, lineage, message).await?;
         Ok(Self::latest(db, card_id).await)
     }
 }
@@ -136,6 +160,7 @@ impl<'r> FromRow<'r, SqliteRow> for Turn {
             n: row.try_get("n")?,
             commit_sha: row.try_get("commit_sha")?,
             parent_sha: row.try_get("parent_sha")?,
+            base_sha: row.try_get("base_sha")?,
             last_assistant_message: row.try_get("last_assistant_message")?,
             created_at: row.try_get("created_at")?,
             at: row.try_get("at")?,
@@ -347,14 +372,78 @@ mod tests {
         let settings = settings();
 
         assert_eq!(Turn::next_number(&db, card_id).await, 1);
-        Turn::record(&db, &settings, card_id, 1, "sha1", "base", "first")
-            .await
-            .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            1,
+            Lineage {
+                commit_sha: "sha1",
+                parent_sha: "base",
+                base_sha: None,
+            },
+            "first",
+        )
+        .await
+        .unwrap();
         assert_eq!(Turn::next_number(&db, card_id).await, 2);
-        Turn::record(&db, &settings, card_id, 2, "sha2", "sha1", "second")
-            .await
-            .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            2,
+            Lineage {
+                commit_sha: "sha2",
+                parent_sha: "sha1",
+                base_sha: None,
+            },
+            "second",
+        )
+        .await
+        .unwrap();
         assert_eq!(Turn::next_number(&db, card_id).await, 3);
+    }
+
+    /// What tells a later range whether it would reach across a rebase; the
+    /// parent says this for the first turn of a chain and nothing after it.
+    #[tokio::test]
+    async fn a_turn_records_the_base_it_was_taken_against() {
+        let db = memory_db().await;
+        let card_id = card(&db).await;
+        let settings = settings();
+
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            1,
+            Lineage {
+                commit_sha: "sha1",
+                parent_sha: "base",
+                base_sha: Some("base"),
+            },
+            "first",
+        )
+        .await
+        .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            2,
+            Lineage {
+                commit_sha: "sha2",
+                parent_sha: "sha1",
+                base_sha: Some("base"),
+            },
+            "second",
+        )
+        .await
+        .unwrap();
+
+        let turns = Turn::for_card(&db, card_id).await;
+        let eras: Vec<_> = turns.iter().map(|t| t.base_sha.as_deref()).collect();
+        assert_eq!(eras, [Some("base"), Some("base")]);
     }
 
     #[tokio::test]
@@ -370,9 +459,20 @@ mod tests {
         )
         .unwrap();
 
-        Turn::record(&db, &settings, card_id, 1, "sha1", "base", "")
-            .await
-            .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            1,
+            Lineage {
+                commit_sha: "sha1",
+                parent_sha: "base",
+                base_sha: None,
+            },
+            "",
+        )
+        .await
+        .unwrap();
 
         let ref_name: String = sqlx::query_scalar("SELECT ref_name FROM turns WHERE card_id = ?1")
             .bind(card_id)
@@ -390,12 +490,34 @@ mod tests {
 
         assert!(Turn::latest(&db, card_id).await.is_none());
 
-        Turn::record(&db, &settings, card_id, 1, "sha1", "base", "first")
-            .await
-            .unwrap();
-        Turn::record(&db, &settings, card_id, 2, "sha2", "sha1", "second")
-            .await
-            .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            1,
+            Lineage {
+                commit_sha: "sha1",
+                parent_sha: "base",
+                base_sha: None,
+            },
+            "first",
+        )
+        .await
+        .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            card_id,
+            2,
+            Lineage {
+                commit_sha: "sha2",
+                parent_sha: "sha1",
+                base_sha: None,
+            },
+            "second",
+        )
+        .await
+        .unwrap();
 
         let latest = Turn::latest(&db, card_id).await.unwrap();
         assert_eq!(latest.n, 2);
@@ -424,9 +546,20 @@ mod tests {
         .await
         .unwrap();
 
-        Turn::record(&db, &settings, a, 1, "sha-a", "base", "")
-            .await
-            .unwrap();
+        Turn::record(
+            &db,
+            &settings,
+            a,
+            1,
+            Lineage {
+                commit_sha: "sha-a",
+                parent_sha: "base",
+                base_sha: None,
+            },
+            "",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(Turn::for_card(&db, a).await.len(), 1);
         assert!(Turn::for_card(&db, b).await.is_empty());

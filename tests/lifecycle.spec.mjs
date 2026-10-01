@@ -735,9 +735,9 @@ test("a rebase keeps upstream commits out of the card's diff", async ({ page }) 
 });
 
 test("a turn taken before a rebase is still measured from its own base", async ({ page }) => {
-  // The turns above were snapshotted against the base the card started from,
-  // and the rebase has since moved that base out from under them. Reaching for
-  // the card's base here would pair a post-rebase tree with a pre-rebase one and
+  // The turns above were snapshotted against the base the card started from, and
+  // the rebase has since moved that base out from under them. Reaching for the
+  // card's base here would pair a post-rebase tree with a pre-rebase one and
   // render every upstream file as a deletion.
   await openCard(page, cardId);
 
@@ -757,6 +757,56 @@ test("a turn taken before a rebase is still measured from its own base", async (
   await menu.locator("summary").click();
   await menu.getByText("What this card is based on").click();
   await expect(menu.locator("summary")).toContainText("All changes");
+});
+
+test("a range reaching from before a rebase to the live head is not offered", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const review = page.locator("#review");
+  const menu = review.locator("[data-range-menu]");
+  const since = review.locator(".modes", { hasText: "Since this" });
+
+  // Turn 2 is measured from turn 1, which the rebase left in the era before it —
+  // so "since" would read the upstream delta as the card's own additions. Turn 1
+  // measures from the base either way and keeps both.
+  await menu.locator("summary").click();
+  await menu.getByText("Turn 2", { exact: true }).click();
+  await expect(menu.locator("summary")).toContainText("Turn 2");
+  await expect(since.locator("span.mode")).toHaveAttribute("aria-disabled", "true");
+  await expect(since.locator("a.mode", { hasText: "Since this" })).toHaveCount(0);
+
+  // And asking for it by hand lands on the exact range beside it rather than on
+  // a blank pane with no picker to escape from.
+  await page.goto(`/cards/${cardId}?scope=since-turn-2`);
+  await expect(menu.locator("summary")).toContainText("Turn 2");
+  await expect(menu).not.toHaveAttribute("hidden", "");
+  await expect(fileSection(page, "upstream.txt")).toHaveCount(0);
+
+  await menu.locator("summary").click();
+  await menu.getByText("What this card is based on").click();
+  await expect(menu.locator("summary")).toContainText("All changes");
+});
+
+test("uncommitted work is not offered against a turn from before a rebase", async ({ page }) => {
+  // Dirty the worktree: ordinarily that is exactly what puts the row on the
+  // list, measured from the newest turn. That turn is now an era behind the
+  // head, so there is nothing honest to measure and the row goes.
+  editWorktree(cardId, "after-rebase.txt", "written after the rebase\n");
+
+  await openCard(page, cardId);
+  const review = page.locator("#review");
+  const menu = review.locator("[data-range-menu]");
+
+  await expect(fileSection(page, "after-rebase.txt")).toBeVisible();
+  await menu.locator("summary").click();
+  await expect(menu.locator(".menu-item.anchor-live")).toHaveCount(0);
+  await menu.locator("summary").click();
+
+  // Put the worktree back for the tests after this one, and take the redraw
+  // rather than wait for one: the pane offers it, it does not apply it.
+  removeInWorktree(cardId, "after-rebase.txt");
+  await refreshDiff(page);
+  await expect(fileSection(page, "after-rebase.txt")).toHaveCount(0);
 });
 
 test("re-pointing a live card aims the merge elsewhere, not the worktree", async ({ page }) => {

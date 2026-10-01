@@ -239,6 +239,14 @@ async fn pane(
 
     let turns = Turn::for_card(db, id).await;
     let viewed = Viewed::for_card(db, id).await;
+    let repo = project.repo();
+
+    // Where the base stands now, which says whether the card's newest turns are
+    // in the era its worktree is. A range measured from one that is not would
+    // reach across a rebase, so the key off the query string is settled onto one
+    // that does not before anything — the comments below included — reads it.
+    let base_at = git::rev_parse(&repo, git::Rev::Ref(&settings.base_ref(id))).await;
+    let scope = scope.settle(&turns, base_at.as_deref());
 
     // A comment belongs to the point in history it was written against, so only
     // the range that ends there asks for it.
@@ -256,7 +264,6 @@ async fn pane(
         .await
         .map_err(|err| failed(id, "counting the drafts", err))?;
 
-    let repo = project.repo();
     let worktree = card.worktree_path.as_ref().map(PathBuf::from);
     let head = turn::live_head(
         cache,
@@ -308,30 +315,34 @@ async fn pane(
     )
     .await;
 
-    let scopes: Vec<_> = Scope::menu(&turns, &commits, head.as_deref(), settled.as_deref())
-        .into_iter()
-        .map(|entry| {
-            // Keep the mode across a change of anchor where it still means
-            // something; the ends of the list each only offer one.
-            let mode = match entry.anchor.offers(scope.mode) {
-                true => scope.mode,
-                false => scope.mode.other(),
-            };
-            let candidate = Scope {
-                anchor: entry.anchor,
-                mode,
-            };
+    let scopes: Vec<_> = Scope::menu(
+        &turns,
+        &commits,
+        head.as_deref(),
+        settled.as_deref(),
+        base_at.as_deref(),
+    )
+    .into_iter()
+    .map(|entry| {
+        // Keep the mode across a change of anchor where it still means
+        // something; the ends of the list each only offer one, and a turn
+        // whose `since` would cross a rebase offers only the other.
+        let candidate = Scope {
+            anchor: entry.anchor,
+            mode: scope.mode,
+        }
+        .settle(&turns, base_at.as_deref());
 
-            Choice {
-                label: entry.label,
-                kind: entry.kind,
-                // Changing the range renumbers nothing now that expansion is
-                // keyed by path, so what is open survives the move.
-                href: link(&candidate.key(), &expand_key),
-                selected: candidate == scope,
-            }
-        })
-        .collect();
+        Choice {
+            label: entry.label,
+            kind: entry.kind,
+            // Changing the range renumbers nothing now that expansion is
+            // keyed by path, so what is open survives the move.
+            href: link(&candidate.key(), &expand_key),
+            selected: candidate == scope,
+        }
+    })
+    .collect();
 
     let modes: Vec<_> = Mode::ALL
         .iter()
@@ -344,7 +355,7 @@ async fn pane(
                 label: mode.label(),
                 href: link(&candidate.key(), &expand_key),
                 selected: *mode == scope.mode,
-                available: scope.anchor.offers(*mode),
+                available: candidate.offers(&turns, base_at.as_deref()),
             }
         })
         .collect();
@@ -364,7 +375,14 @@ async fn pane(
 
     // The parse is independent of what is on screen and cached, so opening a
     // hunk is a re-slice rather than another run of git and delta.
-    let range = scope.revisions(settings, id, &turns, &commits, head.as_deref());
+    let range = scope.revisions(
+        settings,
+        id,
+        &turns,
+        &commits,
+        head.as_deref(),
+        base_at.as_deref(),
+    );
     let files = match &range {
         Some((from, to)) => cache.get(&repo, from, to).await.map_err(|err| {
             error!("card {id}: diffing {from}..{to}: {err:#}");

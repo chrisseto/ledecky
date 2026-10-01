@@ -201,6 +201,67 @@ impl Scope {
         }
     }
 
+    /// Whether a point recorded against `base_sha` belongs to the era the card is
+    /// in now.
+    ///
+    /// Unknown either side reads as "yes": a turn snapshotted before the base was
+    /// kept places no era, and refusing its ranges on that would hide history
+    /// nothing is wrong with.
+    fn current_era(base_sha: Option<&str>, base_at: Option<&str>) -> bool {
+        match (base_sha, base_at) {
+            (Some(taken), Some(now)) => taken == now,
+            _ => true,
+        }
+    }
+
+    /// The turn a range beginning before `point` is measured from, if it is a
+    /// turn rather than the card's base.
+    fn measured_from<'a>(&self, turns: &'a [Turn]) -> Option<&'a Turn> {
+        match (&self.anchor, self.mode) {
+            (Anchor::Live, _) => turns.last(),
+            (Anchor::Turn(n), Mode::Since) => turns.iter().find(|t| t.n == n - 1),
+            _ => None,
+        }
+    }
+
+    /// Whether this range reaches across a rebase: from a turn taken against a
+    /// base the card has since left, to a head that is past it.
+    ///
+    /// Only the ranges ending at the live head can do this. The rest have both
+    /// ends recorded at once, so they stay internally consistent whatever the
+    /// base does afterwards.
+    pub fn spans_a_rebase(&self, turns: &[Turn], base_at: Option<&str>) -> bool {
+        self.measured_from(turns)
+            .is_some_and(|turn| !Self::current_era(turn.base_sha.as_deref(), base_at))
+    }
+
+    /// Whether a mode says anything about this anchor *for this card* — the
+    /// structural rule of [`Anchor::offers`], and then whether the range it names
+    /// would straddle a rebase.
+    pub fn offers(&self, turns: &[Turn], base_at: Option<&str>) -> bool {
+        self.anchor.offers(self.mode) && !self.spans_a_rebase(turns, base_at)
+    }
+
+    /// The range a reader asking for this one should land on instead.
+    ///
+    /// A straddling `Since` has an exact `Just` beside it, so the toggle flips.
+    /// `Live` has no such partner — it is the straddle — so it falls back to the
+    /// whole card, which is also the row [`Scope::menu`] stops offering.
+    pub fn settle(self, turns: &[Turn], base_at: Option<&str>) -> Self {
+        if self.offers(turns, base_at) {
+            return self;
+        }
+
+        let flipped = Self {
+            anchor: self.anchor.clone(),
+            mode: self.mode.other(),
+        };
+        match flipped.offers(turns, base_at) {
+            true => flipped,
+            false => Self::default(),
+        }
+    }
+
     /// The pair of revisions to diff, or `None` when there is nothing yet.
     ///
     /// Pure: `head` is resolved by the caller, which is the only part of this
@@ -212,6 +273,7 @@ impl Scope {
         turns: &[Turn],
         commits: &[Commit],
         head: Option<&str>,
+        base_at: Option<&str>,
     ) -> Option<(String, String)> {
         let base = settings.base_ref(card_id);
         let head = head?;
@@ -222,13 +284,24 @@ impl Scope {
                 .map(|t| t.commit_sha.clone())
         };
 
+        // NB: the ranges ending at the live head measure from the point before
+        // them, and a rebase can leave that point in an era the head has moved
+        // past — where the diff would read the upstream delta as the card's own
+        // additions. Measuring from the base instead says less than was asked
+        // for, which is the honest answer; `settle` and `menu` are what keep a
+        // reader from asking.
+        let straddles = self.spans_a_rebase(turns, base_at);
+
         match (&self.anchor, self.mode) {
             (Anchor::Base, _) => Some((base, head.to_owned())),
 
             // The worktree against the last thing that was recorded of it.
             (Anchor::Live, _) => {
-                let from = turns.last().map(|t| t.commit_sha.clone()).unwrap_or(base);
-                Some((from, head.to_owned()))
+                let from = match straddles {
+                    true => None,
+                    false => turns.last().map(|t| t.commit_sha.clone()),
+                };
+                Some((from.unwrap_or(base), head.to_owned()))
             }
 
             (Anchor::Turn(n), Mode::Just) => {
@@ -251,7 +324,11 @@ impl Scope {
             // worktree is in now — the card's base, not the turn's.
             (Anchor::Turn(n), Mode::Since) => {
                 at(*n)?;
-                Some((at(n - 1).unwrap_or(base), head.to_owned()))
+                let from = match straddles {
+                    true => None,
+                    false => at(n - 1),
+                };
+                Some((from.unwrap_or(base), head.to_owned()))
             }
 
             (Anchor::Commit(sha), mode) => {
@@ -307,17 +384,26 @@ impl Scope {
     /// `settled` is the tree of the last thing recorded of the card — its
     /// newest turn, or its base when it has none. `head` is compared against it
     /// to decide whether the worktree holds anything not captured yet.
+    /// `base_at` is the card's base as it stands, which says whether its newest
+    /// turn is still in the era the worktree is.
     pub fn menu(
         turns: &[Turn],
         commits: &[Commit],
         head: Option<&str>,
         settled: Option<&str>,
+        base_at: Option<&str>,
     ) -> Vec<Entry> {
         let mut out = Vec::new();
 
-        // Only when the worktree holds something no turn has recorded;
-        // otherwise this would just be another name for the top of the list.
-        if head.is_some() && head != settled {
+        // Only when the worktree holds something no turn has recorded, and only
+        // while there is a turn in this era to measure it from: across a rebase
+        // the range falls back to the base, and the row would just be another
+        // name for the bottom of the list. The next snapshot brings it back.
+        let live = Scope {
+            anchor: Anchor::Live,
+            mode: Mode::Just,
+        };
+        if head.is_some() && head != settled && !live.spans_a_rebase(turns, base_at) {
             out.push(Entry {
                 anchor: Anchor::Live,
                 label: "Uncommitted work".into(),
@@ -395,6 +481,9 @@ mod tests {
     /// which is what `turns.parent_sha` holds, not a ref name.
     const BASE_AT_TURN_1: &str = "base0ff";
 
+    /// A base a card has since moved off, as a rebase leaves behind.
+    const OLD_BASE: &str = "oldbase";
+
     /// One of a chain, parented the way `Turn::snapshot` records it: on the
     /// previous turn, or on the base the card was cut from for turn 1.
     fn turn(n: i64, sha: &str) -> Turn {
@@ -402,17 +491,27 @@ mod tests {
             1 => BASE_AT_TURN_1.to_owned(),
             n => format!("sha{}", n - 1),
         };
-        rooted(n, sha, &parent)
+        rooted(n, sha, &parent, Some(BASE_AT_TURN_1))
     }
 
-    /// The same, with the parent named — for a turn taken against a base the
-    /// card has since moved off.
-    fn rooted(n: i64, sha: &str, parent: &str) -> Turn {
+    /// One of a chain taken before the card's base moved: same parentage, but an
+    /// era the card has left.
+    fn stale(n: i64, sha: &str) -> Turn {
+        let parent = match n {
+            1 => OLD_BASE.to_owned(),
+            n => format!("sha{}", n - 1),
+        };
+        rooted(n, sha, &parent, Some(OLD_BASE))
+    }
+
+    /// The same, with the parent and the era named.
+    fn rooted(n: i64, sha: &str, parent: &str, base: Option<&str>) -> Turn {
         Turn {
             id: n,
             n,
             commit_sha: sha.into(),
             parent_sha: parent.into(),
+            base_sha: base.map(str::to_owned),
             last_assistant_message: None,
             created_at: format!("2026-09-17 12:0{n}:00"),
             // Turn 1 at 20, turn 2 at 40 — so a commit at 30 falls between them.
@@ -528,7 +627,9 @@ mod tests {
         let commits = [commit("c0ffee1", Some("sha-parent"), 20)];
         let head = Some("worktree-tree");
 
-        let range = |scope: Scope| scope.revisions(&settings, 7, &turns, &commits, head);
+        let range = |scope: Scope| {
+            scope.revisions(&settings, 7, &turns, &commits, head, Some(BASE_AT_TURN_1))
+        };
 
         assert_eq!(
             range(scope(Mode::Since, Anchor::Base)),
@@ -554,7 +655,14 @@ mod tests {
         let turns = [turn(1, "sha1"), turn(2, "sha2")];
         let commits = [commit("c0ffee1", None, 10)];
         let range = |anchor| {
-            scope(Mode::Since, anchor).revisions(&settings, 7, &turns, &commits, Some("h"))
+            scope(Mode::Since, anchor).revisions(
+                &settings,
+                7,
+                &turns,
+                &commits,
+                Some("h"),
+                Some(BASE_AT_TURN_1),
+            )
         };
 
         assert_eq!(range(Anchor::Turn(2)), Some(("sha1".into(), "h".into())));
@@ -567,7 +675,14 @@ mod tests {
     #[test]
     fn uncommitted_work_is_measured_from_the_base_when_no_turn_has_landed() {
         assert_eq!(
-            scope(Mode::Just, Anchor::Live).revisions(&settings(), 7, &[], &[], Some("tree")),
+            scope(Mode::Just, Anchor::Live).revisions(
+                &settings(),
+                7,
+                &[],
+                &[],
+                Some("tree"),
+                Some(BASE_AT_TURN_1)
+            ),
             Some(("refs/ledecky/7/base".into(), "tree".into()))
         );
     }
@@ -576,8 +691,16 @@ mod tests {
     fn a_turn_on_its_own_spans_its_predecessor_to_itself() {
         let settings = settings();
         let turns = [turn(1, "sha1"), turn(2, "sha2")];
-        let range =
-            |n| scope(Mode::Just, Anchor::Turn(n)).revisions(&settings, 7, &turns, &[], Some("h"));
+        let range = |n| {
+            scope(Mode::Just, Anchor::Turn(n)).revisions(
+                &settings,
+                7,
+                &turns,
+                &[],
+                Some("h"),
+                Some(BASE_AT_TURN_1),
+            )
+        };
 
         // Turn 1 has no predecessor but the base it was cut from, which it
         // recorded at the time rather than reading back now.
@@ -590,11 +713,18 @@ mod tests {
     /// pre-rebase one and render every upstream file as a deletion.
     #[test]
     fn a_turn_is_measured_from_the_base_it_was_taken_against() {
-        let turns = [rooted(1, "sha1", "oldbase")];
+        let turns = [rooted(1, "sha1", OLD_BASE, Some(OLD_BASE))];
 
         assert_eq!(
-            scope(Mode::Just, Anchor::Turn(1)).revisions(&settings(), 7, &turns, &[], Some("h")),
-            Some(("oldbase".into(), "sha1".into()))
+            scope(Mode::Just, Anchor::Turn(1)).revisions(
+                &settings(),
+                7,
+                &turns,
+                &[],
+                Some("h"),
+                Some(BASE_AT_TURN_1)
+            ),
+            Some((OLD_BASE.into(), "sha1".into()))
         );
     }
 
@@ -602,10 +732,17 @@ mod tests {
     /// worktree is in now — the card's base, not the turn's.
     #[test]
     fn since_a_turn_keeps_measuring_from_the_cards_own_base() {
-        let turns = [rooted(1, "sha1", "oldbase")];
+        let turns = [rooted(1, "sha1", OLD_BASE, Some(OLD_BASE))];
 
         assert_eq!(
-            scope(Mode::Since, Anchor::Turn(1)).revisions(&settings(), 7, &turns, &[], Some("h")),
+            scope(Mode::Since, Anchor::Turn(1)).revisions(
+                &settings(),
+                7,
+                &turns,
+                &[],
+                Some("h"),
+                Some(BASE_AT_TURN_1)
+            ),
             Some(("refs/ledecky/7/base".into(), "h".into()))
         );
     }
@@ -613,10 +750,17 @@ mod tests {
     /// An empty parent would reach `git diff` as a bare argument.
     #[test]
     fn a_turn_with_no_recorded_parent_falls_back_to_the_card_base() {
-        let turns = [rooted(1, "sha1", "")];
+        let turns = [rooted(1, "sha1", "", None)];
 
         assert_eq!(
-            scope(Mode::Just, Anchor::Turn(1)).revisions(&settings(), 7, &turns, &[], Some("h")),
+            scope(Mode::Just, Anchor::Turn(1)).revisions(
+                &settings(),
+                7,
+                &turns,
+                &[],
+                Some("h"),
+                Some(BASE_AT_TURN_1)
+            ),
             Some(("refs/ledecky/7/base".into(), "sha1".into()))
         );
     }
@@ -630,7 +774,8 @@ mod tests {
                 7,
                 &[],
                 &commits,
-                Some("h")
+                Some("h"),
+                Some(BASE_AT_TURN_1)
             ),
             Some(("dad1234".into(), "c0ffee1".into()))
         );
@@ -646,7 +791,8 @@ mod tests {
                 7,
                 &[],
                 &commits,
-                Some("h")
+                Some("h"),
+                Some(BASE_AT_TURN_1)
             ),
             Some((EMPTY_TREE.into(), "c0ffee1".into()))
         );
@@ -659,11 +805,25 @@ mod tests {
         let head = Some("h");
 
         assert_eq!(
-            scope(Mode::Just, Anchor::Turn(9)).revisions(&settings, 7, &turns, &[], head),
+            scope(Mode::Just, Anchor::Turn(9)).revisions(
+                &settings,
+                7,
+                &turns,
+                &[],
+                head,
+                Some(BASE_AT_TURN_1)
+            ),
             None
         );
         assert_eq!(
-            scope(Mode::Since, Anchor::Turn(9)).revisions(&settings, 7, &turns, &[], head),
+            scope(Mode::Since, Anchor::Turn(9)).revisions(
+                &settings,
+                7,
+                &turns,
+                &[],
+                head,
+                Some(BASE_AT_TURN_1)
+            ),
             None
         );
         assert_eq!(
@@ -672,16 +832,118 @@ mod tests {
                 7,
                 &turns,
                 &[],
-                head
+                head,
+                Some(BASE_AT_TURN_1)
             ),
             None
         );
     }
 
+    /// A rebase leaves every turn on the chain in the old era, because each one
+    /// parents on its predecessor rather than on the base.
+    #[test]
+    fn uncommitted_work_falls_back_to_the_base_across_a_rebase() {
+        let turns = [stale(1, "sha1"), stale(2, "sha2")];
+
+        // In the era it was taken in, this reads from the newest turn.
+        assert_eq!(
+            scope(Mode::Just, Anchor::Live).revisions(
+                &settings(),
+                7,
+                &turns,
+                &[],
+                Some("h"),
+                Some(OLD_BASE)
+            ),
+            Some(("sha2".into(), "h".into()))
+        );
+
+        // Once the base has moved past it, measuring from it would read the
+        // upstream delta as the card's own additions.
+        assert_eq!(
+            scope(Mode::Just, Anchor::Live).revisions(
+                &settings(),
+                7,
+                &turns,
+                &[],
+                Some("h"),
+                Some(BASE_AT_TURN_1)
+            ),
+            Some(("refs/ledecky/7/base".into(), "h".into()))
+        );
+    }
+
+    /// `Since turn 1` is `base..head` whatever happens, so only the turns with a
+    /// predecessor can straddle.
+    #[test]
+    fn since_a_turn_straddles_only_once_it_has_a_predecessor_to_miss() {
+        let turns = [stale(1, "sha1"), stale(2, "sha2")];
+        let spans =
+            |n| scope(Mode::Since, Anchor::Turn(n)).spans_a_rebase(&turns, Some(BASE_AT_TURN_1));
+
+        assert!(!spans(1));
+        assert!(spans(2));
+
+        // And nothing with both ends recorded at once ever does.
+        for mode in Mode::ALL {
+            assert!(!scope(*mode, Anchor::Base).spans_a_rebase(&turns, Some(BASE_AT_TURN_1)));
+        }
+        assert!(!scope(Mode::Just, Anchor::Turn(2)).spans_a_rebase(&turns, Some(BASE_AT_TURN_1)));
+    }
+
+    #[test]
+    fn a_straddling_range_settles_onto_one_that_is_exact() {
+        let turns = [stale(1, "sha1"), stale(2, "sha2")];
+        let era = Some(BASE_AT_TURN_1);
+
+        // The toggle has an exact partner, so it flips rather than falling back.
+        assert_eq!(
+            scope(Mode::Since, Anchor::Turn(2)).settle(&turns, era),
+            scope(Mode::Just, Anchor::Turn(2))
+        );
+
+        // `Live` is the straddle itself; there is nothing beside it.
+        assert_eq!(
+            scope(Mode::Just, Anchor::Live).settle(&turns, era),
+            Scope::default()
+        );
+
+        // And a range that was already exact is left alone.
+        let fine = scope(Mode::Just, Anchor::Turn(1));
+        assert_eq!(fine.clone().settle(&turns, era), fine);
+    }
+
+    #[test]
+    fn the_live_row_goes_while_the_turn_behind_it_is_from_another_era() {
+        let turns = [stale(1, "sha1")];
+        let rows = |era| {
+            Scope::menu(&turns, &[], Some("dirty-tree"), Some("clean-tree"), era)
+                .first()
+                .map(|e| e.anchor.clone())
+        };
+
+        assert_eq!(rows(Some(OLD_BASE)), Some(Anchor::Live));
+        assert_eq!(rows(Some(BASE_AT_TURN_1)), Some(Anchor::Turn(1)));
+    }
+
+    /// Turns snapshotted before the base was recorded place no era, and refusing
+    /// their ranges on that would hide history nothing is wrong with.
+    #[test]
+    fn a_turn_that_recorded_no_era_is_not_refused() {
+        let turns = [rooted(1, "sha1", "base0ff", None)];
+        let scoped = scope(Mode::Since, Anchor::Turn(1));
+
+        assert!(!scoped.spans_a_rebase(&turns, Some("anything-at-all")));
+        assert!(scoped.offers(&turns, Some("anything-at-all")));
+
+        // The same when it is the card's base that cannot be resolved.
+        assert!(!scope(Mode::Just, Anchor::Live).spans_a_rebase(&[stale(1, "sha1")], None));
+    }
+
     #[test]
     fn a_card_with_no_head_has_nothing_to_show() {
         assert_eq!(
-            Scope::default().revisions(&settings(), 7, &[], &[], None),
+            Scope::default().revisions(&settings(), 7, &[], &[], None, Some(BASE_AT_TURN_1)),
             None
         );
     }
@@ -694,7 +956,13 @@ mod tests {
             commit("aaaaaaa", Some("x"), 10),
         ];
 
-        let menu = Scope::menu(&turns, &commits, Some("live-tree"), Some("turn-2-tree"));
+        let menu = Scope::menu(
+            &turns,
+            &commits,
+            Some("live-tree"),
+            Some("turn-2-tree"),
+            Some(BASE_AT_TURN_1),
+        );
         let keys: Vec<_> = menu.iter().map(|e| e.anchor.key()).collect();
 
         // Turns sit at 20 and 40, commits at 30 and 10 — so the commits are not
@@ -723,24 +991,42 @@ mod tests {
     fn the_live_row_is_dropped_once_a_turn_has_captured_it() {
         let turns = [turn(1, "sha1")];
 
-        let captured = Scope::menu(&turns, &[], Some("shared-tree"), Some("shared-tree"));
+        let captured = Scope::menu(
+            &turns,
+            &[],
+            Some("shared-tree"),
+            Some("shared-tree"),
+            Some(BASE_AT_TURN_1),
+        );
         assert!(captured.iter().all(|e| e.anchor != Anchor::Live));
 
-        let dirty = Scope::menu(&turns, &[], Some("other-tree"), Some("shared-tree"));
+        let dirty = Scope::menu(
+            &turns,
+            &[],
+            Some("other-tree"),
+            Some("shared-tree"),
+            Some(BASE_AT_TURN_1),
+        );
         assert_eq!(dirty.first().map(|e| &e.anchor), Some(&Anchor::Live));
     }
 
     #[test]
     fn a_clean_worktree_with_no_turns_is_not_uncommitted_work() {
         // Nothing has happened yet: the worktree still matches the base.
-        let menu = Scope::menu(&[], &[], Some("base-tree"), Some("base-tree"));
+        let menu = Scope::menu(
+            &[],
+            &[],
+            Some("base-tree"),
+            Some("base-tree"),
+            Some(BASE_AT_TURN_1),
+        );
         assert_eq!(menu.len(), 1);
         assert_eq!(menu[0].anchor, Anchor::Base);
     }
 
     #[test]
     fn a_card_with_nothing_at_all_still_offers_where_it_started() {
-        let menu = Scope::menu(&[], &[], None, None);
+        let menu = Scope::menu(&[], &[], None, None, Some(BASE_AT_TURN_1));
         assert_eq!(menu.len(), 1);
         assert_eq!(menu[0].anchor, Anchor::Base);
     }
@@ -755,7 +1041,7 @@ mod tests {
             at: 1,
         }];
 
-        let menu = Scope::menu(&[], &commits, None, None);
+        let menu = Scope::menu(&[], &commits, None, None, Some(BASE_AT_TURN_1));
         assert_eq!(
             menu[0].label,
             "abc1234 review: stack every file in the diff and e…"

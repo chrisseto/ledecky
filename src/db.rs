@@ -13,6 +13,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/004_review_viewed.sql"),
     include_str!("../migrations/005_session_titles.sql"),
     include_str!("../migrations/006_awaiting_user.sql"),
+    include_str!("../migrations/007_turn_base.sql"),
 ];
 
 /// One connection, behind a pool.
