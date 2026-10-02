@@ -139,7 +139,65 @@ impl Comment {
             .await
     }
 
-    pub async fn create(
+    /// The draft on one line of the range that ends at `turn`.
+    ///
+    /// NB: the turn clause is the null-safe clause that `find_in_range` uses
+    /// for a working range. A box therefore finds the row that the pane
+    /// rendered it from.
+    ///
+    /// Ordered by id, which is the order of writing. If a line has two drafts,
+    /// this returns the one that the thread shows first.
+    async fn draft_at(
+        db: &DB,
+        card_id: i64,
+        turn: Option<i64>,
+        file_path: &str,
+        line: i64,
+        side: Side,
+    ) -> sqlx::Result<Option<Self>> {
+        sqlx::query_as(sql(Self::select(
+            "WHERE card_id = ?1 AND state = 'draft'
+               AND (turn_id IS ?2 OR turn_id IS NULL)
+               AND file_path = ?3 AND line = ?4 AND side = ?5
+             ORDER BY id",
+        )))
+        .bind(card_id)
+        .bind(turn)
+        .bind(file_path)
+        .bind(line)
+        .bind(side.as_str())
+        .fetch_optional(db.pool())
+        .await
+    }
+
+    /// Writes the text of a line's box. That text is the whole draft.
+    ///
+    /// An empty box is not a comment. A save of an empty box therefore deletes
+    /// the draft on that line.
+    pub async fn save_draft(
+        db: &DB,
+        card_id: i64,
+        turn: Option<i64>,
+        file_path: &str,
+        line: i64,
+        side: Side,
+        body: &str,
+    ) -> sqlx::Result<()> {
+        let draft = Self::draft_at(db, card_id, turn, file_path, line, side).await?;
+
+        match (draft, body.is_empty()) {
+            (Some(draft), false) => Self::update_draft(db, card_id, draft.id, body).await?,
+            (Some(draft), true) => Self::delete_draft(db, card_id, draft.id).await,
+            (None, false) => {
+                Self::create(db, card_id, turn, file_path, line, side, body).await?;
+            }
+            (None, true) => {}
+        }
+
+        Ok(())
+    }
+
+    async fn create(
         db: &DB,
         card_id: i64,
         turn_id: Option<i64>,
@@ -165,8 +223,26 @@ impl Comment {
         Ok(id)
     }
 
+    /// Changes the text of a draft. The draft keeps the turn it belongs to.
+    ///
+    /// The `state` test is the test that `delete_draft` also makes. The agent
+    /// has a copy of a comment that was sent, so that comment is a record and
+    /// must not change.
+    async fn update_draft(db: &DB, card_id: i64, id: i64, body: &str) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE comments SET body = ?3 WHERE id = ?1 AND card_id = ?2 AND state = 'draft'",
+        )
+        .bind(id)
+        .bind(card_id)
+        .bind(body)
+        .execute(db.pool())
+        .await?;
+
+        Ok(())
+    }
+
     /// Drafts can be withdrawn; anything already sent to the agent cannot.
-    pub async fn delete_draft(db: &DB, card_id: i64, id: i64) {
+    async fn delete_draft(db: &DB, card_id: i64, id: i64) {
         let _ =
             sqlx::query("DELETE FROM comments WHERE id = ?1 AND card_id = ?2 AND state = 'draft'")
                 .bind(id)
@@ -490,6 +566,64 @@ mod tests {
         let sent = all(&db, card_id).await;
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(|c| c.state == Comment::SUBMITTED));
+    }
+
+    #[tokio::test]
+    async fn only_drafts_can_be_rewritten() {
+        let db = memory_db().await;
+        let card_id = card(&db).await;
+
+        let id = Comment::create(&db, card_id, None, "a.rs", 1, Side::New, "frist")
+            .await
+            .unwrap();
+        Comment::update_draft(&db, card_id, id, "first")
+            .await
+            .unwrap();
+        assert_eq!(all(&db, card_id).await[0].body, "first");
+
+        Comment::mark_submitted(&db, card_id, None).await;
+        Comment::update_draft(&db, card_id, id, "second thoughts")
+            .await
+            .unwrap();
+
+        // The agent received the first text, so the record keeps that text.
+        assert_eq!(all(&db, card_id).await[0].body, "first");
+    }
+
+    #[tokio::test]
+    async fn a_line_holds_one_draft() {
+        let db = memory_db().await;
+        let card_id = card(&db).await;
+        let save = async |body| {
+            Comment::save_draft(&db, card_id, None, "a.rs", 1, Side::New, body)
+                .await
+                .unwrap()
+        };
+
+        // The box is the draft, so a second save changes the same row.
+        save("frist").await;
+        let first = all(&db, card_id).await;
+        save("first").await;
+        let again = all(&db, card_id).await;
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, first[0].id);
+        assert_eq!(again[0].body, "first");
+
+        // A save of an empty box deletes the draft. The same save with no
+        // draft present does nothing.
+        save("").await;
+        assert!(all(&db, card_id).await.is_empty());
+        save("").await;
+        assert!(all(&db, card_id).await.is_empty());
+
+        // A comment that was sent is a record, so a new draft goes beside it.
+        save("sent").await;
+        Comment::mark_submitted(&db, card_id, None).await;
+        save("second round").await;
+        assert_eq!(all(&db, card_id).await.len(), 2);
+        let drafts = Comment::drafts(&db, card_id).await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].body, "second round");
     }
 
     #[tokio::test]

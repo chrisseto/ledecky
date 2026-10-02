@@ -13,12 +13,17 @@
      {# Every badge counts the comments its section is showing. Recounted here
         rather than sent back, because a reply is about one line and a commit's
         badge sums every commit — and because it is the same sum either way. A
-        class lookup per section, never a geometry read. #}
+        class lookup per section, never a geometry read.
+
+        A box that contains text is also a comment. The count includes it, so
+        the badge agrees with the screen before the server receives the text. #}
      hx-on::after:swap="for (const n of this.querySelectorAll('.file-node')) {
                           const section = this.querySelector(n.getAttribute('href'));
                           const badge = n.querySelector('.badge');
                           if (!section || !badge) continue;
-                          const seen = section.querySelectorAll('.comment').length;
+                          const seen = section.querySelectorAll(
+                            '.comment, .compose:has(textarea:not(:placeholder-shown))',
+                          ).length;
                           badge.textContent = seen;
                           badge.hidden = !seen;
                         }">
@@ -208,7 +213,7 @@
     </div>
 
     {% with oob = false %}{% include "_batch.html" %}{% endwith %}
-    {% with oob = false %}{% include "_pane_source.html" %}{% endwith %}
+    {% include "_pane_source.html" %}
   </div>
 </div>
 

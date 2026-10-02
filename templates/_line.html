@@ -6,15 +6,14 @@
 {# Four boxes, not six: the gutter `+` and the diff sign are drawn by `.line`'s
    own pseudo-elements, and the path is read off the nearest ancestor carrying
    one rather than repeated here. #}
-<div class="line l-{{ line.kind }} {% if comment == key %}commenting{% endif %}"
-     data-anchor="{{ line.anchor }}">
+<div class="line l-{{ line.kind }}" data-anchor="{{ line.anchor }}">
   <span class="n">{{ line.old_line if line.old_line else "" }}</span>
   <span class="n">{{ line.new_line if line.new_line else "" }}</span>
   <span class="code">{% if line.html is defined %}{{ line.html | safe }}{% else %}{{ line.text }}{% endif %}</span>
 </div>
 
-{% if comment == key or threads[key] %}
-  {% with key = key, open = comment == key, thread = threads[key] %}
+{% if sent[key] or boxes[key] %}
+  {% with key = key, sent = sent[key], box = boxes[key] %}
     {% include "_anchored.html" %}
   {% endwith %}
 {% endif %}

@@ -7,12 +7,14 @@ import {
   addCard,
   addedLines,
   addProject,
+  anchoredTo,
   baseRef,
   cardDirOf,
   cardIn,
   cardRefs,
   comment,
   commitInRepo,
+  draftBox,
   editWorktree,
   fileSection,
   git,
@@ -23,6 +25,7 @@ import {
   pollsOfPath,
   refreshDiff,
   removeInWorktree,
+  saveSettled,
   showTab,
   staleDiff,
   turnRefs,
@@ -289,12 +292,12 @@ test("a commit's message is on screen, and takes comments like a diff line", asy
   const body = commits.locator(".line", { hasText: "Why it prints first." });
 
   await comment(page, body, "Say what it prints.");
-  await expect(commits.locator(".comment-draft", { hasText: "Say what it prints." })).toBeVisible();
+  await expect(draftBox(body)).toHaveValue("Say what it prints.");
   await expect(review.locator('.file-node[href="#commits"] .badge')).toHaveText("1");
   await expect(review.locator(".batch-label")).toContainText("1 comment pending");
 
   await page.getByRole("button", { name: "Discard" }).click();
-  await expect(commits.locator(".comment")).toHaveCount(0);
+  await expect(commits.locator(".compose")).toHaveCount(0);
 });
 
 test("the pane says when the worktree has moved, and redraws when asked", async ({ page }) => {
@@ -376,7 +379,7 @@ test("a comment being written survives an update to the diff", async ({ page }) 
   const line = page.locator("#review .line").first();
   await line.click();
 
-  const textarea = page.locator(".compose textarea");
+  const textarea = draftBox(line);
   await textarea.fill("half a thought");
 
   editWorktree(cardId, "during-comment.txt", "written while a comment was open\n");
@@ -386,18 +389,13 @@ test("a comment being written survives an update to the diff", async ({ page }) 
   // to move out from under someone.
   await expect(staleDiff(page)).toBeVisible();
   await expect(textarea).toHaveValue("half a thought");
-  await expect(page.locator(".compose")).toBeVisible();
+  await saveSettled(page);
 
-  // NB: filed the ordinary way before taking the redraw. Clicking the light is
-  // also clicking away, which files the draft and swaps the block out from
-  // under the pointer — so the click lands on whatever moved into its place.
-  await page.locator("#review .batch-label").click();
-  await expect(page.locator("#review .comment", { hasText: "half a thought" })).toBeVisible();
-
-  // And the redraw brings the file with it, leaving the draft where it was.
+  // The redraw adds the new file and keeps the box, with its text. The box is
+  // the draft itself, not a copy of it.
   await refreshDiff(page);
   await expect(fileSection(page, "during-comment.txt")).toBeVisible();
-  await expect(page.locator("#review .comment", { hasText: "half a thought" })).toBeVisible();
+  await expect(textarea).toHaveValue("half a thought");
 });
 
 test("the redraw can be taken with a comment half-written", async ({ page }) => {
@@ -405,32 +403,18 @@ test("the redraw can be taken with a comment half-written", async ({ page }) => 
 
   const line = page.locator("#review .line").first();
   await line.click();
-  await page.locator(".compose textarea").fill("mid sentence");
+  await draftBox(line).fill("mid sentence");
 
   editWorktree(cardId, "while-typing.txt", "written while a comment was open\n");
   await expect(staleDiff(page)).toBeVisible();
 
-  // NB: taking the redraw from inside the box is the awkward case. The click
-  // blurs the textarea, blurring files the draft, and that answer swaps the
-  // block — all while the pointer is still down on the button. Both requests
-  // have to land, and the light has to go out.
+  // NB: a redraw that starts in the box is the difficult case. The click
+  // removes the focus from the textarea, the blur sends the text that the
+  // throttle holds, and the browser fetches the pane again. The save must
+  // complete first, or the redraw shows a box without the last word.
   await refreshDiff(page);
   await expect(fileSection(page, "while-typing.txt")).toBeVisible();
-  await expect(page.locator("#review .comment", { hasText: "mid sentence" })).toBeVisible();
-});
-
-test("Escape throws a comment away rather than filing it", async ({ page }) => {
-  await openCard(page, cardId);
-
-  await page.locator("#review .line").first().click();
-  await page.locator(".compose textarea").fill("thought better of it");
-
-  // Blurring is what files a draft, and Escape blurs on its way out — so the
-  // box closing is not on its own proof that the text went with it.
-  await page.keyboard.press("Escape");
-
-  await expect(page.locator(".compose")).toHaveCount(0);
-  await expect(page.locator("#review .comment", { hasText: "thought better of it" })).toHaveCount(0);
+  await expect(draftBox(page.locator("#review .line").first())).toHaveValue("mid sentence");
 });
 
 test("the tree jumps to a file instead of reloading the pane", async ({ page }) => {
@@ -536,7 +520,7 @@ test("a folded hunk opens a gap at a time and stays open around a comment", asyn
   // between them — so anything counting on being the only one is a flake
   // waiting for the run where it is not.
   await comment(page, lines.first(), "still wide?");
-  await expect(page.locator("#review .comment", { hasText: "still wide?" })).toBeVisible();
+  await expect(draftBox(lines.first())).toHaveValue("still wide?");
   await expect(lines).toHaveCount(whole);
 });
 
@@ -609,45 +593,47 @@ test("the lines carry no request of their own, and still open their box", async 
   const drawn = panes.length;
 
   await line.click();
-  await expect(page.locator("#review .compose textarea")).toBeVisible();
+  await expect(draftBox(line)).toBeVisible();
+  // The box is empty, and it does not contain the word "none". The text comes
+  // from an `Option`, and minijinja renders a none value as that word.
+  await expect(draftBox(line)).toHaveValue("");
 
-  // And the same line again closes it, which is the toggle the attribute used
-  // to carry.
+  // A second click on the same line closes an empty box. A box that contains
+  // text is the draft of the line, and it stays open.
   await line.click();
-  await expect(page.locator("#review .compose")).toHaveCount(0);
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(0);
 
   // A box is one line's business, so none of that redrew the pane. It is what
   // keeps an open range menu open, and a comment off the diff's critical path:
   // the whole thing used to come back over the wire to show one textarea.
   await comment(page, line, "and this lands the same way");
-  await expect(page.locator("#review .comment", { hasText: "and this lands" })).toBeVisible();
+  await expect(draftBox(line)).toHaveValue("and this lands the same way");
   expect(panes.length).toBe(drawn);
 
   // The count beside it still moved, out of band with the block.
   await expect(page.locator("#review .batch-label")).toContainText("pending");
   await page.getByRole("button", { name: "Discard" }).click();
-  await expect(page.locator("#review .comment", { hasText: "and this lands" })).toHaveCount(0);
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(0);
 });
 
 test("a review comment goes back to the agent and produces its own turn", async ({ page }) => {
   await openCard(page, cardId);
 
-  // Clicking a diff line opens the compose box beneath it; clicking away saves.
-  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
+  // A click on a diff line opens the box below it. The box saves its own text.
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, line, "Say hello instead.");
 
-  const draft = page.locator("#review .comment", { hasText: "Say hello instead." });
-  // Exactly one: saving is a blur, and `up.submit` swapping the pane fires
-  // another on the outgoing box — which used to post the comment twice.
-  await expect(draft).toHaveCount(1);
-  await expect(draft).toBeVisible();
-  await expect(draft.locator(".tag")).toHaveText("draft");
+  // One box only. The box sends its text against the line, not against a new
+  // comment, so two saves change one draft instead of writing two.
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(1);
+  await expect(draftBox(line)).toHaveValue("Say hello instead.");
   await expect(page.locator("#review .batch-label")).toContainText("pending");
 
   await page.getByRole("button", { name: /Send \d+ to agent/ }).click();
 
   // Feedback already given is not feedback to give: every working range ends at
   // the live head, so sending takes the batch off the screen it was written on.
-  await expect(page.locator("#review .comment")).toHaveCount(0);
+  await expect(page.locator("#review .compose, #review .comment")).toHaveCount(0);
   await expectTurns(2);
 
   // Scoping to the second turn shows only what the review round added.
@@ -662,23 +648,196 @@ test("a review comment goes back to the agent and produces its own turn", async 
   await menu.locator(".menu-item.anchor-turn", { hasText: "Turn 1" }).click();
   await page.locator("#review .modes a.mode", { hasText: "Just this" }).click();
 
-  await expect(draft).toHaveCount(1);
-  await expect(draft.locator(".tag")).toHaveText("sent to agent");
-  await expect(draft.getByRole("button", { name: "Remove" })).toHaveCount(0);
+  // The comment is a record, so the pane shows it as text and gives no box.
+  const sent = page.locator("#review .comment", { hasText: "Say hello instead." });
+  await expect(sent).toHaveCount(1);
+  await expect(sent.locator(".tag")).toHaveText("sent to agent");
+  await expect(page.locator("#review .compose")).toHaveCount(0);
+});
+
+test("a pending comment stays in its box and saves as it is typed", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, line, "Say hullo instead.");
+
+  // The box gives the turn that the server rendered it for. Without that
+  // value, a new turn moves the row that the next save looks for, and the save
+  // writes a second comment on the line.
+  await expect(anchoredTo(line).locator('input[name="turn"]')).toHaveCount(1);
+
+  // The box remains, and it holds the text. To change the comment, the user
+  // types in it again.
+  const textarea = draftBox(line);
+  await expect(textarea).toHaveValue("Say hullo instead.");
+  await textarea.fill("Say hello instead, properly.");
+
+  // No click here. The throttle sends the text.
+  await saveSettled(page);
+
+  // The server renders the draft as the box that holds it, so the redraw shows
+  // the box again, with its text.
+  editWorktree(cardId, "during-edit.txt", "written while a comment was open\n");
+  await refreshDiff(page);
+  await expect(fileSection(page, "during-edit.txt")).toBeVisible();
+  await expect(draftBox(line)).toHaveValue("Say hello instead, properly.");
+
+  // A change writes the same row, so the batch is the same size. The line also
+  // has no second box.
+  await expect(page.locator("#review .batch-label")).toContainText("1 comment pending");
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(1);
+
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(0);
+});
+
+test("two lines hold two boxes, each saving its own", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const lines = fileSection(page, "main.rs").locator(".line.l-added");
+  const [first, second] = [lines.nth(0), lines.nth(1)];
+
+  await comment(page, first, "This one.");
+  await comment(page, second, "And this other one.");
+
+  // Two boxes are open at the same time. The save identifies the line, so text
+  // in one box must not reach the other.
+  await expect(draftBox(first)).toHaveValue("This one.");
+  await expect(draftBox(second)).toHaveValue("And this other one.");
+  await expect(page.locator("#review .batch-label")).toContainText("2 comments pending");
+
+  await draftBox(second).fill("And this other one, reworded.");
+  await page.locator(".batch-label").click();
+  await saveSettled(page);
+
+  // The server renders the pane again from the database, so these values are
+  // the values that the server has.
+  await openCard(page, cardId);
+  await expect(draftBox(first)).toHaveValue("This one.");
+  await expect(draftBox(second)).toHaveValue("And this other one, reworded.");
+  await expect(page.locator("#review .batch-label")).toContainText("2 comments pending");
+
+  // A delete of one box keeps the other box.
+  await anchoredTo(first).getByRole("button", { name: "Remove" }).click();
+  await expect(anchoredTo(first).locator(".compose")).toHaveCount(0);
+  await expect(draftBox(second)).toHaveValue("And this other one, reworded.");
+
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(page.locator("#review .compose")).toHaveCount(0);
+});
+
+test("a second box takes the caret, and the first stops asking for it", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const lines = fileSection(page, "main.rs").locator(".line.l-added");
+  const [first, second] = [lines.nth(0), lines.nth(1)];
+
+  await comment(page, first, "the first one");
+
+  // The cursor goes to the box that opens now. htmx focuses an `autofocus`
+  // element in the content that it inserts, so an older box on the page cannot
+  // take the cursor from a new one.
+  await second.click();
+  await expect(draftBox(second)).toBeFocused();
+
+  await page.keyboard.type("the second one");
+  await expect(draftBox(second)).toHaveValue("the second one");
+  await expect(draftBox(first)).toHaveValue("the first one");
+
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(page.locator("#review .compose")).toHaveCount(0);
+});
+
+test("a save that does not land says so, and the retry lands it", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+
+  // One save completes first. The retry button must still work after a save
+  // that completes, not only after a failure of the first save.
+  await comment(page, line, "lands");
+
+  // The server now refuses every save on this line, so the box holds text that
+  // the server does not have. The box must show this state, because the user
+  // has no other way to see it.
+  const saves = `**/cards/${cardId}/comments`;
+  await page.route(saves, (route) =>
+    route.request().method() === "POST" ? route.fulfill({ status: 500 }) : route.fallback(),
+  );
+  await draftBox(line).fill("this will not land");
+
+  const box = anchoredTo(line).locator(".compose");
+  await expect(box.getByText("Not saved")).toBeVisible();
+
+  // The text is still in the box, so a retry is sufficient to recover.
+  await page.unroute(saves);
+  await box.getByRole("button", { name: "retry" }).click();
+  await saveSettled(page);
+
+  await expect(box.getByText("Not saved")).toBeHidden();
+  await expect(page.locator("#review .batch-label")).toContainText("1 comment pending");
+
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(page.locator("#review .compose")).toHaveCount(0);
+});
+
+test("emptying the box withdraws the comment", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, line, "On reflection, no.");
+
+  // An empty box is not a comment, so the save of an empty box deletes it.
+  await draftBox(line).fill("");
+  await page.locator(".batch-label").click();
+  await expect(page.locator("#review .batch-label")).toContainText("Click a line to comment");
+
+  // The box stays, and the control below it still works. The control
+  // identifies the line, so it does not need a draft.
+  await expect(draftBox(line)).toBeVisible();
+  await anchoredTo(line).getByRole("button", { name: "Remove" }).click();
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(0);
+});
+
+test("a pending comment can be withdrawn on its own", async ({ page }) => {
+  await openCard(page, cardId);
+
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, line, "And again, no.");
+
+  // The request is a `DELETE`, so the line and the range are query parameters;
+  // htmx reads no form for a `DELETE`. The URL identifies the line, because the
+  // browser has no comment id.
+  await anchoredTo(line).getByRole("button", { name: "Remove" }).click();
+
+  await expect(anchoredTo(line).locator(".compose")).toHaveCount(0);
+  // Only the block of that line changes, and the response also contains the
+  // comment count below the diff.
+  await expect(page.locator("#review .batch-label")).toContainText("Click a line to comment");
+  await expect(page.locator("#review [data-range-menu] summary")).toContainText("All changes");
+
+  // The line also stops being the line with an open box. If the fetch URL of
+  // the pane named it, the next redraw would open an empty box on that line and
+  // move the cursor to it.
+  editWorktree(cardId, "after-remove.txt", "written after a comment was withdrawn\n");
+  await refreshDiff(page);
+  await expect(fileSection(page, "after-remove.txt")).toBeVisible();
+  await expect(page.locator("#review .compose")).toHaveCount(0);
 });
 
 test("drafts can be thrown away in one go", async ({ page }) => {
   await openCard(page, cardId);
 
-  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Second thoughts.");
-  await expect(page.locator("#review .comment-draft")).toBeVisible();
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, line, "Second thoughts.");
+  await expect(draftBox(line)).toBeVisible();
 
   await page.getByRole("button", { name: "Discard" }).click();
 
-  await expect(page.locator("#review .comment-draft")).toHaveCount(0);
-  // The round before this one was sent, and sent comments live on their own
+  await expect(page.locator("#review .compose")).toHaveCount(0);
+  // The rounds before this one were sent, and sent comments live on their own
   // turn rather than on the range the card is at now.
-  await expect(page.locator("#review .comment-submitted")).toHaveCount(0);
+  await expect(page.locator("#review .comment")).toHaveCount(0);
 });
 
 test("a comment left on an older turn stays there", async ({ page }) => {
@@ -692,8 +851,8 @@ test("a comment left on an older turn stays there", async ({ page }) => {
   await review.locator(".modes a.mode", { hasText: "Just this" }).click();
 
   await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Old news.");
-  const draft = review.locator(".comment", { hasText: "Old news." });
-  await expect(draft).toHaveCount(1);
+  const draft = draftBox(fileSection(page, "main.rs").locator(".line.l-added").first());
+  await expect(draft).toHaveValue("Old news.");
 
   // Back at the head of the card it is not on screen — but the count is
   // card-wide, so it is not lost either.

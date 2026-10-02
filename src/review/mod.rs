@@ -22,9 +22,9 @@ pub use viewed::Viewed;
 pub fn routes() -> Vec<rocket::Route> {
     rocket::routes![
         routes::diff_pane,
-        routes::add_comment,
+        routes::save_comment,
         routes::anchored_block,
-        routes::delete_comment,
+        routes::discard_draft,
         routes::discard_comments,
         routes::toggle_viewed,
         routes::submit_review,

@@ -195,15 +195,46 @@ export async function refreshDiff(page) {
 /** The stacked diff renders every changed file; this is one of them. */
 export const fileSection = (page, path) => page.locator(`#review .file[data-path="${path}"]`);
 
-/** Types a review comment on a diff line and clicks away, which saves it. */
+/**
+ * The block of one diff line: its comments, and its box.
+ *
+ * Scoped to the line, not to the pane, because each line that has a draft also
+ * has a box. `.compose` alone can therefore match more than one element. The
+ * block is always the next element after the line, and it matches only if that
+ * element is a block.
+ */
+export const anchoredTo = (line) => line.locator(":scope + .anchored");
+
+/** The box that holds the draft of a line until the user sends the batch. */
+export const draftBox = (line) => anchoredTo(line).locator(".compose textarea");
+
+/**
+ * Waits until no box has a save in progress. htmx's own class reports this.
+ *
+ * The box shows no message at other times, by design: a box that contains text
+ * is already saved, so there is no "saved" message to test. A box that the user
+ * types in always has a request in progress, because the throttle sends the
+ * first keystroke. This wait therefore shows that the server has the text.
+ */
+export const saveSettled = (page) =>
+  expect(page.locator("#review .compose.htmx-request")).toHaveCount(0);
+
+/**
+ * Types a review comment on a diff line and waits for the server to receive it.
+ *
+ * The box saves its text while the user types, so the click away only sends the
+ * last part of it. Each caller then tests the draft, and `modals.spec.mjs`
+ * sends the batch immediately after. A save in progress would miss that batch.
+ */
 export async function comment(page, line, body) {
   await line.click();
-  await page.locator(".compose textarea").fill(body);
-  // Blur is the save. Not the section's own header any more — a file's is the
-  // disclosure's `<summary>`, so clicking it would fold the file away and tick
-  // it viewed. The batch footer is the nearest thing that is neither a line nor
-  // a control, and it cannot scroll out from under the click.
+  await draftBox(line).fill(body);
+  // The blur sends the text. Do not click the header of the section: the header
+  // of a file is the `<summary>` of a disclosure, so a click closes the file and
+  // marks it as viewed. The batch footer is the nearest element that is not a
+  // line and not a control, and it cannot move before the click.
   await page.locator(".batch-label").click();
+  await saveSettled(page);
 }
 
 /**

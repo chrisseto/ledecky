@@ -4,6 +4,7 @@ import {
   addCard,
   addProject,
   cardIn,
+  comment,
   editWorktree,
   moveCard,
   openCard,
@@ -140,15 +141,12 @@ test("a large diff, counted @perf", async ({ page }) => {
   await settled();
   const tickBytes = bytes - bytesBeforeTick;
 
-  // Opening a comment box and saving it. Both are one line's business now, so
-  // this is the block and the two counts beside it — not the pane.
+  // Opens a comment box and writes in it. Each step applies to one line, so
+  // this is the block of that line, and then one or two saves that answer with
+  // the comment count. It is not the pane.
   const bytesBeforeComment = bytes;
   const line = page.locator("#review .file[open] .line").first();
-  await line.click();
-  await expect(page.locator("#review .compose textarea")).toBeVisible();
-  await page.locator("#review .compose textarea").fill("measured");
-  await page.locator("#review .batch-label").click();
-  await expect(page.locator("#review .comment", { hasText: "measured" })).toBeVisible();
+  await comment(page, line, "measured");
   await settled();
   const commentBytes = bytes - bytesBeforeComment;
 
@@ -221,8 +219,9 @@ test("a large diff, counted @perf", async ({ page }) => {
   expect(report.elementsPerLine).toBeLessThan(10);
   expect(report.layoutObjects).toBeLessThan(50_000);
   expect(report.scrollLayouts).toBeLessThanOrEqual(SCROLLS * 2);
-  // A fold is a 204 and nothing else, and a comment is one line's block plus
-  // the counts that were reading over its shoulder.
+  // A fold sends a 204 and nothing else. A comment sends the block of one line,
+  // and then the comment count for each save. The box saves its text while the
+  // user types, so this limit also applies to that text.
   expect(report.tickBytes).toBeLessThan(1_000);
   expect(report.commentBytes).toBeLessThan(20_000);
 });

@@ -1,0 +1,33 @@
+{# The area below the box. It shows the state of the save, and it holds the
+   control that deletes the comment.
+
+   The area shows no "saved" message. If the box contains text, the server has
+   that text, or receives it now, or did not receive it. Only the last of these
+   three states needs a message.
+
+   This is a separate file to keep the markup of the box short. No response
+   replaces this area. The control identifies the line, not the draft, so it is
+   correct with a draft and without one. The retry button also keeps its event
+   listener, because no response replaces the button. #}
+<footer class="compose-meta">
+  {# The stylesheet delays this element 200ms. A save that completes more
+     quickly shows no spinner. #}
+  <span class="saving" aria-hidden="true"></span>
+
+  <span class="failed" role="status">
+    Not saved · <button class="link" type="button" data-retry>retry</button>
+  </span>
+
+  <span class="spacer"></span>
+
+  {# One control for all states. An empty box has no comment to delete, so the
+     button then only closes the box. The button identifies the line, not the
+     comment, which makes this possible.
+
+     The request is a `DELETE`. htmx puts the parameters of a `DELETE` in the
+     query, and ignores the values of the form around the button. #}
+  <button class="link" type="button"
+          hx-delete="{{ box.remove_href }}"
+          hx-sync="closest .anchored:queue last"
+          hx-target="closest .anchored" hx-swap="outerHTML">Remove</button>
+</footer>

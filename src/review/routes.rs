@@ -7,7 +7,7 @@ use rocket::form::Form;
 use rocket::http::Status;
 use rocket::serde::Serialize;
 use rocket::tokio::task::spawn_blocking;
-use rocket::{get, post, State};
+use rocket::{delete, get, post, State};
 
 use crate::agent::{messaging, AgentManager};
 use crate::config::Settings;
@@ -163,14 +163,9 @@ impl CommitView {
 struct View<'a> {
     scope: Option<&'a str>,
     expand: Option<&'a str>,
-    /// Which line has the compose box open, as `<path>#<side>:<line>`.
-    ///
-    /// Kept in the URL rather than in the DOM so an update re-renders the box
-    /// where it already was, instead of the pane arriving without it.
-    comment: Option<&'a str>,
 }
 
-#[get("/cards/<id>/diff?<scope>&<expand>&<comment>")]
+#[get("/cards/<id>/diff?<scope>&<expand>")]
 pub async fn diff_pane(
     db: &State<DB>,
     settings: &State<Settings>,
@@ -178,13 +173,8 @@ pub async fn diff_pane(
     id: i64,
     scope: Option<&str>,
     expand: Option<&str>,
-    comment: Option<&str>,
 ) -> Result<Tmpl, Status> {
-    let view = View {
-        scope,
-        expand,
-        comment,
-    };
+    let view = View { scope, expand };
     Ok(Tmpl(
         "_review.html",
         pane(db, settings, cache, id, view).await?,
@@ -251,14 +241,10 @@ async fn pane(
 
     // A comment belongs to the point in history it was written against, so only
     // the range that ends there asks for it.
-    let here = Comment::find_in_range(
-        db,
-        id,
-        viewing_turn(&scope, &turns),
-        scope.snapshot_turn().is_some(),
-    )
-    .await
-    .map_err(|err| failed(id, "reading the comments", err))?;
+    let turn = viewing_turn(&scope, &turns);
+    let here = Comment::find_in_range(db, id, turn, scope.snapshot_turn().is_some())
+        .await
+        .map_err(|err| failed(id, "reading the comments", err))?;
     // The batch goes whole, so the count is card-wide even where the range is
     // not: a draft left on another one is never simply lost.
     let pending = Comment::draft_count(db, id)
@@ -296,19 +282,11 @@ async fn pane(
         rocket::uri!(diff_pane(
             id = id,
             scope = Some(scope),
-            expand = Some(expand),
-            comment = Option::<&str>::None
+            expand = Some(expand)
         ))
         .to_string()
     };
     let opening = |expansion: &Expansion| link(&scope_key, &expansion.key());
-
-    // `<path>#<side>:<line>` split back into what the comment form posts.
-    let anchored = view.comment.and_then(|key| {
-        let (path, anchor) = key.rsplit_once('#')?;
-        let (side, line) = anchor.split_once(':')?;
-        Some((path.to_owned(), side.to_owned(), line.to_owned()))
-    });
 
     // What the card last had recorded of it, as a tree, so the worktree can be
     // compared against it.
@@ -370,13 +348,20 @@ async fn pane(
     let stranded = pending - showing as i64;
     let submitted = here.len() - showing;
 
-    // Comments hang off `<file>#<side>:<line>` so a template lookup is one hit.
-    let mut threads: HashMap<String, Vec<Comment>> = HashMap::new();
+    // Both maps use `<file>#<side>:<line>` as the key, so a template makes one
+    // lookup. One map holds the sent comments of a line. The other holds its box.
+    let mut sent: HashMap<String, Vec<&Comment>> = HashMap::new();
+    let mut boxes: HashMap<String, minijinja::Value> = HashMap::new();
     for comment in &here {
-        threads
-            .entry(comment.anchor())
-            .or_default()
-            .push(comment.clone());
+        let key = comment.anchor();
+        match comment.is_draft() {
+            true => {
+                let body = Some(comment.body.as_str());
+                let item = box_item(id, &key, body, turn, &scope_key, Some(&expand_key));
+                boxes.insert(key, item);
+            }
+            false => sent.entry(key).or_default().push(comment),
+        }
     }
 
     // The parse is independent of what is on screen and cached, so opening a
@@ -480,7 +465,7 @@ async fn pane(
     );
 
     Ok(context! {
-        card, tree, threads, scopes, modes, submitted, stranded,
+        card, tree, sent, boxes, scopes, modes, submitted, stranded,
         messages, message_comments,
         drafts => pending,
         files => rendered,
@@ -496,23 +481,12 @@ async fn pane(
         standalone => true,
         scope => scope_key,
         expand => expand_key,
-        // The same view with nothing being commented on: what a line links to
-        // when its box is already open, and what closing one lands on.
-        comment_base => link(&scope_key, &expand_key),
-        comment => view.comment,
-        comment_file => anchored.as_ref().map(|a| a.0.clone()),
-        comment_side => anchored.as_ref().map(|a| a.1.clone()),
-        comment_line => anchored.as_ref().map(|a| a.2.clone()),
-        // Closing the box swaps its own block, so this is the one link out of
-        // the pane that does not lead back to the pane.
-        cancel_href => view.comment
-            .map(|key| anchored_href(id, key, false, &scope_key, Some(&expand_key))),
-        // Carries the open box, so an update redraws it rather than dropping it.
+        // What the pane refetches. It names the range and the expansion only,
+        // so no fragment has to correct it.
         source => rocket::uri!(diff_pane(
             id = id,
             scope = Some(&scope_key),
-            expand = Some(&expand_key),
-            comment = view.comment
+            expand = Some(&expand_key)
         ))
         .to_string(),
     })
@@ -588,7 +562,6 @@ impl ViewForm {
         View {
             scope: Some(&self.scope),
             expand: self.expand.as_deref(),
-            comment: None,
         }
     }
 }
@@ -603,19 +576,17 @@ struct Counts {
     drafts: i64,
     stranded: i64,
     submitted: usize,
+    /// The turn that a new draft on this range belongs to.
+    turn: Option<i64>,
 }
 
 async fn counts_for(db: &DB, id: i64, scope_key: &str) -> Result<Counts, Status> {
     let scope = Scope::parse(Some(scope_key));
     let turns = Turn::for_card(db, id).await;
-    let here = Comment::find_in_range(
-        db,
-        id,
-        viewing_turn(&scope, &turns),
-        scope.snapshot_turn().is_some(),
-    )
-    .await
-    .map_err(|err| failed(id, "reading the comments", err))?;
+    let turn = viewing_turn(&scope, &turns);
+    let here = Comment::find_in_range(db, id, turn, scope.snapshot_turn().is_some())
+        .await
+        .map_err(|err| failed(id, "reading the comments", err))?;
     let drafts = Comment::draft_count(db, id)
         .await
         .map_err(|err| failed(id, "counting the drafts", err))?;
@@ -626,20 +597,21 @@ async fn counts_for(db: &DB, id: i64, scope_key: &str) -> Result<Counts, Status>
         stranded: drafts - showing as i64,
         submitted: here.len() - showing,
         here,
+        turn,
     })
 }
 
-/// `<path>#<side>:<line>` split back into what the comment form posts.
-fn split_key(key: &str) -> Option<(String, String, String)> {
+/// Splits `<path>#<side>:<line>` into the line that a comment belongs to.
+fn split_key(key: &str) -> Option<(&str, Side, i64)> {
     let (path, anchor) = key.rsplit_once('#')?;
     let (side, line) = anchor.split_once(':')?;
-    Some((path.to_owned(), side.to_owned(), line.to_owned()))
+    Some((path, Side::parse(side), line.parse().ok()?))
 }
 
-/// One line's comments, and the box when it is being written in.
+/// The comments of one line, and the box for the next one.
 ///
-/// Rendered on its own so opening, saving, cancelling and removing each swap
-/// the block they are about rather than the whole pane — see `_anchored.html`.
+/// The server renders this block alone. A save, a close and a delete therefore
+/// each replace only the block that they apply to. See `_anchored.html`.
 fn anchored(
     id: i64,
     key: &str,
@@ -647,62 +619,62 @@ fn anchored(
     scope: &str,
     expand: Option<&str>,
     counts: &Counts,
-    source: Option<String>,
 ) -> minijinja::Value {
-    let parts = split_key(key);
-    let thread: Vec<Comment> = counts
-        .here
-        .iter()
-        .filter(|c| c.anchor() == key)
-        .cloned()
-        .collect();
+    // A line has one draft, and the box is that draft. The other comments went
+    // to the agent, so the template renders them as text.
+    let here = counts.here.iter().filter(|c| c.anchor() == key);
+    let (writing, sent): (Vec<_>, Vec<_>) = here.partition(|c| c.is_draft());
     let expand_key = expand.unwrap_or_default().to_owned();
 
     minijinja::context! {
         card => minijinja::context! { id => id },
         key => key,
-        open => open,
-        thread => thread,
-        comment_file => parts.as_ref().map(|p| p.0.clone()),
-        comment_side => parts.as_ref().map(|p| p.1.clone()),
-        comment_line => parts.as_ref().map(|p| p.2.clone()),
+        sent => sent,
+        // The server renders a box for the draft of the line, or because the
+        // user opened the line. The control below the box is the same for both.
+        box => (!writing.is_empty() || open).then(|| {
+            let body = writing.first().map(|c| c.body.as_str());
+            box_item(id, key, body, counts.turn, scope, expand)
+        }),
         scope => scope,
         expand => expand_key,
-        cancel_href => anchored_href(id, key, false, scope, expand),
-        source => source,
         drafts => counts.drafts,
         stranded => counts.stranded,
         submitted => counts.submitted,
     }
 }
 
-/// What the pane refetches when the stream says the diff moved.
+/// The box of one line: its text, and the link that deletes the draft.
 ///
-/// Carries the open box, so a redraw brings it back rather than dropping it —
-/// which is why a fragment that opens or closes one sends a new copy.
-fn pane_source(id: i64, scope: &str, expand: Option<&str>, comment: Option<&str>) -> String {
-    rocket::uri!(diff_pane(
-        id = id,
-        scope = Some(scope),
-        expand = Some(expand.unwrap_or_default()),
-        comment = comment,
-    ))
-    .to_string()
+/// The pane and the block both use this function, so a box is the same in
+/// each. The URL also stays out of the template, as all other URLs do.
+fn box_item(
+    id: i64,
+    key: &str,
+    body: Option<&str>,
+    turn: Option<i64>,
+    scope: &str,
+    expand: Option<&str>,
+) -> minijinja::Value {
+    minijinja::context! {
+        // NB: do not pass the `Option`. minijinja renders a none value as the
+        // word "none", and an empty box then contains that word.
+        body => body.unwrap_or_default(),
+        // The turn that the server rendered the box for. The draft belongs to
+        // that turn for as long as the box is open. See `save_comment`.
+        turn => turn,
+        remove_href => rocket::uri!(discard_draft(
+            id = id,
+            key = key,
+            turn = turn,
+            scope = Some(scope),
+            expand = Some(expand.unwrap_or_default()),
+        ))
+        .to_string(),
+    }
 }
 
-/// Built here rather than in a template, like every other link out of the pane.
-fn anchored_href(id: i64, key: &str, open: bool, scope: &str, expand: Option<&str>) -> String {
-    rocket::uri!(anchored_block(
-        id = id,
-        key = key,
-        scope = Some(scope),
-        expand = Some(expand.unwrap_or_default()),
-        open = open.then_some(true),
-    ))
-    .to_string()
-}
-
-/// The box for one line, or the line's thread once it is closed again.
+/// The box for one line, or the comments of the line after the box closes.
 #[get("/cards/<id>/comments/at?<key>&<scope>&<expand>&<open>")]
 pub async fn anchored_block(
     db: &State<DB>,
@@ -715,96 +687,107 @@ pub async fn anchored_block(
     let scope = scope.unwrap_or_default();
     let open = open.unwrap_or(false);
     let counts = counts_for(db, id, &scope).await?;
-    let source = pane_source(id, &scope, expand.as_deref(), open.then_some(key.as_str()));
     Ok(Tmpl(
-        "_anchored_open.html",
-        anchored(
-            id,
-            &key,
-            open,
-            &scope,
-            expand.as_deref(),
-            &counts,
-            Some(source),
-        ),
+        "_anchored.html",
+        anchored(id, &key, open, &scope, expand.as_deref(), &counts),
     ))
 }
 
 #[derive(rocket::FromForm)]
-pub struct CommentForm {
-    file_path: String,
-    side: String,
-    line: i64,
+pub struct SaveForm {
+    /// The line the box belongs to, as `<path>#<side>:<line>`.
+    key: String,
+    /// The turn that the server rendered the box for. Absent if the card has none.
+    turn: Option<i64>,
     body: String,
     #[field(default = String::new())]
     scope: String,
     expand: Option<String>,
 }
 
+/// Writes the text of a line's box.
+///
+/// Sends back the comment count only, as an out-of-band update. It must not
+/// send the box: the box saves its text while the user types, so a replacement
+/// of the form also replaces the textarea and moves the cursor. The area below
+/// the box does not change, so the response omits it too.
 #[post("/cards/<id>/comments", data = "<form>")]
-pub async fn add_comment(db: &State<DB>, id: i64, form: Form<CommentForm>) -> Result<Tmpl, Status> {
-    let body = form.body.trim();
-    if !body.is_empty() {
-        let turns = Turn::for_card(db, id).await;
-        Comment::create(
-            db,
-            id,
-            viewing_turn(&Scope::parse(Some(&form.scope)), &turns),
-            &form.file_path,
-            form.line,
-            Side::parse(&form.side),
-            body,
-        )
-        .await
-        .map_err(|_| Status::InternalServerError)?;
-    }
+pub async fn save_comment(db: &State<DB>, id: i64, form: Form<SaveForm>) -> Result<Tmpl, Status> {
+    let (file_path, side, line) = split_key(&form.key).ok_or(Status::BadRequest)?;
+    let turns = Turn::for_card(db, id).await;
 
-    let key = format!("{}#{}:{}", form.file_path, form.side, form.line);
+    // NB: the turn that the server rendered the box for, not the current turn
+    // of the card. A box stays open while its draft exists. If a new turn
+    // starts, the current turn does not identify the row of that draft.
+    // `save_draft` then finds no row, and writes a second comment.
+    let turn = turn_of(form.turn, &turns, &form.scope);
+
+    // An empty box is not a comment, so this save deletes the draft.
+    Comment::save_draft(db, id, turn, file_path, line, side, form.body.trim())
+        .await
+        .map_err(|err| failed(id, "saving the comment", err))?;
+
     let counts = counts_for(db, id, &form.scope).await?;
-    let source = pane_source(id, &form.scope, form.expand.as_deref(), None);
     Ok(Tmpl(
-        "_anchored_reply.html",
-        anchored(
-            id,
-            &key,
-            false,
-            &form.scope,
-            form.expand.as_deref(),
-            &counts,
-            Some(source),
-        ),
+        "_batch_state.html",
+        minijinja::context! {
+            card => minijinja::context! { id => id },
+            oob => true,
+            scope => &form.scope,
+            expand => form.expand.clone().unwrap_or_default(),
+            drafts => counts.drafts,
+            stranded => counts.stranded,
+            submitted => counts.submitted,
+        },
     ))
 }
 
-#[derive(rocket::FromForm)]
-pub struct DeleteCommentForm {
-    key: String,
-    #[field(default = String::new())]
-    scope: String,
-    expand: Option<String>,
+/// The turn that a box gives for its draft, tested against the card's turns.
+///
+/// The function tests the value instead of accepting it. An old or incorrect
+/// id therefore cannot attach a comment to a turn of a different card.
+fn turn_of(claimed: Option<i64>, turns: &[Turn], scope: &str) -> Option<i64> {
+    match claimed {
+        Some(turn) if turns.iter().any(|t| t.id == turn) => Some(turn),
+        // A box that the server rendered before the first turn gives no value.
+        // A value that is not a turn of this card is also not usable.
+        _ => viewing_turn(&Scope::parse(Some(scope)), turns),
+    }
 }
 
-#[post("/cards/<id>/comments/<comment_id>/delete", data = "<form>")]
-pub async fn delete_comment(
+/// Deletes the draft on one line before the user sends the batch.
+///
+/// The URL identifies the line, not the comment. A line has one draft, so the
+/// browser does not need the comment id. The box can therefore save its text to
+/// a URL that does not change.
+///
+/// NB: the line and the range are query parameters, not a body. htmx puts the
+/// parameters of a `DELETE` in the URL, as it does for a `GET`. It also ignores
+/// the form around the button.
+#[delete("/cards/<id>/comments/at?<key>&<turn>&<scope>&<expand>")]
+pub async fn discard_draft(
     db: &State<DB>,
     id: i64,
-    comment_id: i64,
-    form: Form<DeleteCommentForm>,
+    key: &str,
+    turn: Option<i64>,
+    scope: Option<&str>,
+    expand: Option<&str>,
 ) -> Result<Tmpl, Status> {
-    Comment::delete_draft(db, id, comment_id).await;
+    let (file_path, side, line) = split_key(key).ok_or(Status::BadRequest)?;
+    let scope_key = scope.unwrap_or_default();
+    let turns = Turn::for_card(db, id).await;
 
-    let counts = counts_for(db, id, &form.scope).await?;
+    // The turn of the box, for the reason that `save_comment` gives. The draft
+    // to delete is the draft that the box shows.
+    let turn = turn_of(turn, &turns, scope_key);
+    Comment::save_draft(db, id, turn, file_path, line, side, "")
+        .await
+        .map_err(|err| failed(id, "withdrawing the comment", err))?;
+
+    let counts = counts_for(db, id, scope_key).await?;
     Ok(Tmpl(
         "_anchored_reply.html",
-        anchored(
-            id,
-            &form.key,
-            false,
-            &form.scope,
-            form.expand.as_deref(),
-            &counts,
-            None,
-        ),
+        anchored(id, key, false, scope_key, expand, &counts),
     ))
 }
 

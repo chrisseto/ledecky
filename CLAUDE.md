@@ -30,6 +30,11 @@ runs all three, so reach for the scripts.
 The whole suite is ~20s on four workers, so run it. Narrow to a file while
 iterating on that file, not to save wall clock.
 
+**Don't pipe a run into `head` or `tail`.** Closing the pipe early kills the
+reporter mid-run, which prints as `N did not run` with no failure above it and
+exits non-zero — a red run that is nothing of the sort. Redirect to a file and
+read that instead.
+
 Don't reach for `--only-changed`: it selects test files that changed, or that
 import something changed, and the specs do not import Rust — so **editing
 `src/` selects nothing** and the run comes back green having executed nothing.
@@ -71,6 +76,18 @@ It cannot pay for that footgun at this suite's size.
   by `global-setup` and passed to the workers in `LEDECKY_TEST_ROOT`. Teardown
   removes it, so set `E2E_DEBUG=1` when you want to read what a run left.
 
+## Writing comments
+
+**Write comments in ASD-STE100 (Simplified Technical English).** Short
+sentences, one idea each. Active voice, present tense. No metaphor, no idiom,
+no figurative language. One meaning per word — prefer `delete` to `withdraw`,
+`show` to `say`, `complete` to `land`. Keep code identifiers as they are.
+
+**Comment on the code as it is, not on how it changed.** A comment that only
+makes sense if you remember the previous version — "this used to redraw the
+pane", "the button came back dead" — is noise to the next reader. Say what the
+code does and why it has to, and leave the history to `git log`.
+
 ## Writing queries
 
 **A query returns `rusqlite::Result`, never a default.** `unwrap_or_default()`
@@ -85,6 +102,23 @@ statement. No comments inside the string; the reason belongs in the doc comment
 or an `NB:` above the call. An `ORDER BY` needs a reason a caller can feel: a
 thread reading in the order it was written, a batch reaching the agent that way.
 Don't add one to a query whose caller only counts.
+
+## htmx 4 attributes
+
+Two parsing rules that fail silently rather than loudly:
+
+- **Quote any trigger modifier value that contains a space.** HCON ends a bare
+  value at the first space, so `from:find textarea` becomes `from: "find"`,
+  htmx binds the trigger to no element, and nothing happens at all. Write
+  `from:'find textarea'`.
+- **An out-of-band selector cannot contain a space,** and resolves against the
+  document. Use `hx-swap-oob` when the fragment owns a fixed id, so no sender
+  repeats a selector. Use `hx-partial` when the target has no id or is relative
+  to the requesting element: a partial resolves `hx-target` against the
+  request's source element, so `find`/`closest` work there.
+
+Read `node_modules/htmx.org/dist/htmx.esm.js` rather than htmx 1/2 docs; the
+attribute set and the swap pipeline both differ.
 
 ## Iterating on Rust only
 

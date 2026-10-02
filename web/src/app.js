@@ -27,12 +27,6 @@ customElements.define("x-terminal", TerminalPane);
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
 
-  const cancel = document.querySelector("#review [data-cancel-comment]");
-  if (cancel) {
-    discardComment(cancel);
-    return;
-  }
-
   document.querySelector("#overlay [data-close-overlay]")?.click();
 });
 
@@ -159,10 +153,6 @@ document.addEventListener("keydown", (event) => {
 });
 
 // ---- review comments --------------------------------------------------------
-// A box and the comments under it are one block against one line, asked for and
-// swapped on its own. Clicking away is what saves it as a draft; an empty box
-// was a change of mind. Which line is open is also in the pane's own fetch URL,
-// so the stream's resync brings it back rather than morphing it away.
 
 // NB: one listener for every line, rather than an `hx-get` on each. Only the
 // action attributes make htmx initialise an element, and `hx-get` is one — so
@@ -186,13 +176,22 @@ document.addEventListener("click", (event) => {
   const review = line.closest(".review");
   const key = `${file.dataset.path}#${line.dataset.anchor}`;
 
-  // A line's comments and its open box are one block, rendered only for the
-  // lines that have either — so it is there to swap or it is not there yet.
+  // The server renders this block only for a line that has comments or a box.
+  // The block is therefore present, or it does not exist yet.
   const block = line.nextElementSibling?.matches(".anchored")
     ? line.nextElementSibling
     : null;
-  // Clicking the line whose box is open is how it closes again.
-  const open = !block?.querySelector(".compose");
+
+  // NB: a box that contains text keeps the click. A request would replace the
+  // block, and the new box holds the text that the server has — which is up to
+  // one throttle interval behind the box on screen.
+  const box = block?.querySelector(".compose textarea");
+  if (box?.value.trim()) {
+    box.focus();
+    return;
+  }
+  // A click on a line that has an empty box closes that box.
+  const open = !box;
 
   const url =
     `/cards/${review.dataset.card}/comments/at` +
@@ -211,48 +210,15 @@ document.addEventListener("click", (event) => {
   htmx.ajax("GET", url, block ? { target: block, swap: "outerHTML" } : { target: line, swap: "afterend" });
 });
 
-// NB: closing the box blurs it either way, and a blur is what saves — so both
-// ways out have to say which they are. A mouse announces itself by pressing
-// Cancel; Escape has to say so on its own.
-let discarding = false;
-
-document.addEventListener("mousedown", (event) => {
-  discarding = !!event.target.closest?.("[data-cancel-comment]");
-});
-
-/** Throws the box away: marks the blur that follows, then closes it. */
-function discardComment(cancel) {
-  discarding = true;
-  cancel.click();
-}
-
-document.addEventListener("focusout", (event) => {
-  const textarea = event.target.closest?.(".compose textarea");
-  if (!textarea) return;
-
-  // One blur per way out, so the mark cannot outlive what set it.
-  if (discarding) {
-    discarding = false;
-    return;
-  }
-
-  const form = textarea.closest("form");
-  if (textarea.value.trim()) form.requestSubmit();
-  else form.querySelector("[data-cancel-comment]")?.click();
-});
-
-// A field the server drew has to be focused once it arrives: the comment box,
-// and the base search when a refusal reopened the menu around it.
+// A field the server drew has to be focused once it arrives: the base search
+// when a refusal reopened the menu around it.
 document.addEventListener("htmx:after:settle", () => {
-  const field = document.querySelector(
-    ".branch-menu[open] .search[data-autofocus], .compose textarea[data-autofocus]",
-  );
+  const field = document.querySelector(".branch-menu[open] .search[data-autofocus]");
   if (!field) return;
   if (document.activeElement !== field) field.focus();
 
   // NB: the search box outlives the response that asked for it — the menu
   // stays open and re-filters in place — so the ask has to be spent, or every
-  // later settle drags the cursor back out of whatever it moved to. The
-  // compose box arrives and leaves with the block around it.
-  if (field.matches(".search")) field.removeAttribute("data-autofocus");
+  // later settle drags the cursor back out of whatever it moved to.
+  field.removeAttribute("data-autofocus");
 });

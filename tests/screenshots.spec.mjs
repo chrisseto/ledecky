@@ -6,6 +6,7 @@ import {
   addProject,
   cardIn,
   comment,
+  draftBox,
   fileSection,
   openCard,
   showTab,
@@ -90,7 +91,8 @@ test("capture the whole flow @shots", async ({ page }) => {
   await shot(page, "09c-branch-picker");
   await page.locator(".drawer-card .branch-menu summary").click();
 
-  await comment(page, fileSection(page, "main.rs").locator(".line.l-added").first(), "Say hello instead.");
-  await expect(page.locator("#review .comment")).toBeVisible();
+  const commented = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, commented, "Say hello instead.");
+  await expect(draftBox(commented)).toBeVisible();
   await shot(page, "10-draft-comment");
 });
