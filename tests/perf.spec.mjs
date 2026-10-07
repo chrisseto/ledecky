@@ -7,6 +7,7 @@ import {
   editWorktree,
   moveCard,
   openCard,
+  showTab,
 } from "./support/board.mjs";
 
 /**
@@ -93,7 +94,7 @@ test("a large diff, counted @perf", async ({ page }) => {
   await openCard(page, cardId);
   // The card still has a live agent, so the drawer leads with the Agent tab and
   // the review pane is `display: none` — nothing in it has a box to measure.
-  await page.locator('label[for="tab-review"]').click();
+  await showTab(page, "review");
   // The card's own agent has had a turn of its own, so the range holds a couple
   // of files this spec did not seed. Wait on the ones it did.
   const seeded = page.locator('#review .file[data-path^="src/file_"]');

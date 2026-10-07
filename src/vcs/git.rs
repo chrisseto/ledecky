@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 use crate::config::Settings;
+use crate::vcs::Worktree;
 
 /// Runs a git command in `repo` and returns trimmed stdout.
 pub async fn run(repo: &Path, args: &[&str]) -> Result<String> {
@@ -27,7 +28,39 @@ pub async fn run(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
 }
 
-/// Which of `paths` — absolute, files or directories — the worktree's own rules
+/// Runs a git command against `work` and returns trimmed stdout.
+///
+/// NB: with `--git-dir` given and no `--work-tree`, git reads the current
+/// directory as the top of the work tree. So `-C` keeps doing the work for both
+/// kinds of checkout and a relative pathspec resolves the same way either side.
+fn command(work: &Worktree) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(work.path());
+    if let Some(git_dir) = work.git_dir() {
+        cmd.arg(format!("--git-dir={}", git_dir.display()));
+    }
+    cmd
+}
+
+async fn run_work(work: &Worktree, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = command(work);
+    cmd.args(args);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
+}
+
+/// Which of `paths` — absolute, files or directories — the work tree's own rules
 /// ignore.
 ///
 /// What a build writes is not work anyone is reviewing, and it arrives in the
@@ -39,14 +72,12 @@ pub async fn run(repo: &Path, args: &[&str]) -> Result<String> {
 /// stopped, and is read here as "none of them". Both err towards announcing, as
 /// does its consulting the index, which keeps tracked work out of the answer
 /// however the rules read.
-pub async fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
+pub async fn ignored(work: &Worktree, paths: &[PathBuf]) -> HashSet<PathBuf> {
     if paths.is_empty() {
         return HashSet::new();
     }
 
-    let mut child = match Command::new("git")
-        .arg("-C")
-        .arg(worktree)
+    let mut child = match command(work)
         .args(["check-ignore", "-z", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -55,7 +86,7 @@ pub async fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     {
         Ok(child) => child,
         Err(err) => {
-            warn!("check-ignore in {}: {err}", worktree.display());
+            warn!("check-ignore in {}: {err}", work.path().display());
             return HashSet::new();
         }
     };
@@ -92,7 +123,7 @@ pub async fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     if !matches!(out.status.code(), Some(0 | 1)) {
         warn!(
             "check-ignore in {} gave up ({}); treating nothing as ignored",
-            worktree.display(),
+            work.path().display(),
             out.status
         );
         return HashSet::new();
@@ -107,7 +138,7 @@ pub async fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
         .collect()
 }
 
-/// Whether every one of `paths` is ignored by the worktree's own rules — the
+/// Whether every one of `paths` is ignored by the work tree's own rules — the
 /// burst filter, asked once per settled burst by the worktree watcher.
 ///
 /// What a build writes is not work anyone is reviewing, and it arrives in the
@@ -115,12 +146,12 @@ pub async fn ignored(worktree: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
 /// not cost a restage, let alone one per reader.
 ///
 /// Nothing at all is not a build, and answering "yes" would swallow the burst.
-pub async fn all_ignored(worktree: &Path, paths: &[PathBuf]) -> bool {
+pub async fn all_ignored(work: &Worktree, paths: &[PathBuf]) -> bool {
     if paths.is_empty() {
         return false;
     }
 
-    let ignored = ignored(worktree, paths).await;
+    let ignored = ignored(work, paths).await;
     paths.iter().all(|path| ignored.contains(path))
 }
 
@@ -310,64 +341,62 @@ async fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// Where `worktree` branches from `base_branch` now, or `None` when the two
-/// share no history.
+/// Where `head` branches from `base_branch` now, or `None` when the two share
+/// no history.
 ///
-/// Always an ancestor of the worktree's `HEAD`, which is what makes a range
-/// starting here well formed however the base ref got where it is. Plain
-/// `merge-base` rather than `--fork-point` so that a worktree which merged
-/// instead of rebasing is read the same way.
-pub async fn fork_point(repo: &Path, worktree: &Path, base_branch: &str) -> Option<String> {
-    // NB: in the worktree, not the repo. `HEAD` is per-worktree, and its own
-    // commits are reachable from nowhere else; the repo's is whatever happens to
-    // be checked out there.
-    let head = rev_parse(worktree, Rev::Head).await?;
-
-    // Back in the repo, where the base branch lives. The object database and
-    // `refs/heads` are shared, so this resolves either way.
-    run(repo, &["merge-base", base_branch, &head])
+/// Always an ancestor of `head`, which is what makes a range starting here well
+/// formed however the base ref got where it is. Plain `merge-base` rather than
+/// `--fork-point` so that a workspace which merged instead of rebasing is read
+/// the same way.
+///
+/// NB: `head` is passed in rather than read here. A git worktree answers it with
+/// `rev-parse HEAD`, a jj workspace with `jj log -r @-`, and only the caller
+/// knows which it has — see `vcs::head`.
+pub async fn fork_point(repo: &Path, head: &str, base_branch: &str) -> Option<String> {
+    // In the repo, where the base branch lives. The object database and
+    // `refs/heads` are shared with every workspace, so this resolves either way.
+    run(repo, &["merge-base", base_branch, head])
         .await
         .ok()
         .filter(|sha| !sha.is_empty())
 }
 
-/// Moves `base_ref` to wherever `worktree` branches from `base_branch` now.
+/// Moves `base_ref` to wherever `head` branches from `base_branch` now.
 ///
-/// A detached worktree does not contain new upstream commits, so a branch that
+/// A detached workspace does not contain new upstream commits, so a branch that
 /// merely moves ahead is harmless and this does nothing. What it is for is a
-/// rebase: afterwards the worktree is rooted at a commit `base_ref` has never
-/// heard of, and `base_ref..worktree` would fold every upstream commit into the
+/// rebase: afterwards the workspace is rooted at a commit `base_ref` has never
+/// heard of, and `base_ref..head` would fold every upstream commit into the
 /// range.
 ///
-/// The ref moves *forward* only, except when it has fallen out of the worktree's
-/// history entirely — see the guard. A rewound branch, or a worktree checked out
-/// at an older commit, must not drag it back.
+/// The ref moves *forward* only, except when it has fallen out of the workspace's
+/// history entirely — see the guard. A rewound branch, or a workspace sitting at
+/// an older commit, must not drag it back.
 ///
 /// Returns the new value when it moved, and `None` otherwise — which is both the
 /// ordinary case and what every failure reads as. Best-effort on purpose:
 /// callers poll this, and an unresolvable `base_branch` still has to render.
 pub async fn reconcile_base(
     repo: &Path,
-    worktree: &Path,
+    head: &str,
     base_ref: &str,
     base_branch: &str,
 ) -> Option<String> {
     let current = rev_parse(repo, Rev::Ref(base_ref)).await?;
-    let head = rev_parse(worktree, Rev::Head).await?;
-    let candidate = fork_point(repo, worktree, base_branch).await?;
+    let candidate = fork_point(repo, head, base_branch).await?;
 
     if candidate == current {
         return None;
     }
 
     // NB: the two cases one direction cannot tell apart. While the base is still
-    // behind the worktree it is a true description of where that worktree is
+    // behind the workspace it is a true description of where that workspace is
     // rooted, and a branch rewound under it must not drag it back. Once it is
-    // not, the worktree has been rebased off the base entirely — `base..head`
+    // not, the workspace has been rebased off the base entirely — `base..head`
     // has stopped naming a range, and no later poll could repair it — so the
     // fork point is followed wherever it went. The second question is only
     // asked once the first has already said no.
-    if !is_ancestor(repo, &current, &candidate).await && is_ancestor(repo, &current, &head).await {
+    if !is_ancestor(repo, &current, &candidate).await && is_ancestor(repo, &current, head).await {
         return None;
     }
 
@@ -387,12 +416,12 @@ pub async fn reconcile_base(
 /// `index.lock`, and leave our staging behind for its next `git status` to
 /// report. An index kept *inside* the tree would additionally be swept up by
 /// its own `add -A`.
-async fn stage_tree(worktree: &Path, index: &Path) -> Result<String> {
+async fn stage_tree(work: &Worktree, index: &Path) -> Result<String> {
     std::fs::create_dir_all(index.parent().unwrap())?;
 
     let index_env: &[(&str, &str)] = &[("GIT_INDEX_FILE", &index.to_string_lossy())];
-    run_env(worktree, &["add", "-A"], index_env).await?;
-    run_env(worktree, &["write-tree"], index_env).await
+    run_work(work, &["add", "-A"], index_env).await?;
+    run_work(work, &["write-tree"], index_env).await
 }
 
 /// The worktree exactly as it stands, as a tree object the diff can use as a
@@ -408,14 +437,14 @@ async fn stage_tree(worktree: &Path, index: &Path) -> Result<String> {
 pub async fn working_tree(
     settings: &Settings,
     repo: &Path,
-    worktree: &Path,
+    work: &Worktree,
     card_id: i64,
 ) -> Result<String> {
     // NB: this index is deliberately *not* removed afterwards, unlike the turn
     // snapshot's. It is rewritten on every poll, and git's stat cache is the
     // only thing keeping `add -A` off a full re-hash of the tree each time.
     let index = settings.card_dir(card_id).join("working.index");
-    let tree = stage_tree(worktree, &index).await?;
+    let tree = stage_tree(work, &index).await?;
 
     run(repo, &["update-ref", &settings.working_ref(card_id), &tree]).await?;
     Ok(tree)
@@ -502,19 +531,19 @@ pub async fn commits(repo: &Path, base: &str, head: &str) -> Vec<Commit> {
 pub async fn snapshot_turn(
     settings: &Settings,
     repo: &Path,
-    worktree: &Path,
+    work: &Worktree,
     card_id: i64,
     n: i64,
     parent: &str,
 ) -> Result<Option<String>> {
     let index = settings.card_dir(card_id).join("snapshot.index");
     let _ = std::fs::remove_file(&index);
-    let tree = stage_tree(worktree, &index).await?;
+    let tree = stage_tree(work, &index).await?;
     let _ = std::fs::remove_file(&index);
 
-    let parent_tree = run(worktree, &["rev-parse", &format!("{parent}^{{tree}}")])
-        .await
-        .ok();
+    // NB: in the repository, not the work tree. Both of these are pure object
+    // operations, and a jj workspace has no `.git` to ask.
+    let parent_tree = tree_of(repo, parent).await;
     if parent_tree.as_deref() == Some(tree.as_str()) {
         return Ok(None);
     }
@@ -526,7 +555,7 @@ pub async fn snapshot_turn(
         ("GIT_COMMITTER_EMAIL", "ledecky@localhost"),
     ];
     let sha = run_env(
-        worktree,
+        repo,
         &[
             "commit-tree",
             &tree,
@@ -541,6 +570,31 @@ pub async fn snapshot_turn(
 
     run(repo, &["update-ref", &settings.turn_ref(card_id, n), &sha]).await?;
     Ok(Some(sha))
+}
+
+/// Where a worktree's commits have got to.
+///
+/// A detached worktree's `HEAD` is the only place its own commits are reachable
+/// from — the turn refs are a parallel chain and never contain them.
+pub async fn head(worktree: &Path) -> Option<String> {
+    rev_parse(worktree, Rev::Head).await
+}
+
+/// NB: the base branch is almost always checked out in the main worktree, and
+/// git refuses to move a branch that another worktree holds. Saying so up front
+/// saves the agent a failed `git branch -f` and a round of guessing.
+pub fn merge_prompt(branch: &str, repo: &Path) -> String {
+    format!(
+        "The reviewer approved this work. Land it on `{branch}`:\n\n\
+         1. Commit anything still outstanding in this worktree.\n\
+         2. `{branch}` is checked out in the main repository at `{repo}`, so it cannot be \
+            moved from here. Apply your commits there instead — \
+            `git -C {repo} merge --ff-only <sha>`, or rebase onto `{branch}` first if it has \
+            moved ahead.\n\
+         3. Report the final SHA of `{branch}`.\n\n\
+         Do not push.",
+        repo = repo.display(),
+    )
 }
 
 /// Lines added and removed between two revisions.
@@ -614,15 +668,24 @@ mod tests {
         std::fs::create_dir_all(artefact.parent().unwrap()).unwrap();
         std::fs::write(&artefact, "").unwrap();
 
-        assert!(ignored(&repo, std::slice::from_ref(&artefact))
-            .await
-            .contains(&artefact));
+        assert!(ignored(
+            &Worktree::Git(repo.clone()),
+            std::slice::from_ref(&artefact)
+        )
+        .await
+        .contains(&artefact));
 
         // One tracked file in the burst is enough to make it real.
-        assert!(!all_ignored(&repo, &[artefact, repo.join("a.txt")]).await);
+        assert!(
+            !all_ignored(
+                &Worktree::Git(repo.clone()),
+                &[artefact, repo.join("a.txt")]
+            )
+            .await
+        );
 
         // Nothing at all is not a build; saying so would swallow the burst.
-        assert!(!all_ignored(&repo, &[]).await);
+        assert!(!all_ignored(&Worktree::Git(repo.clone()), &[]).await);
     }
 
     /// What keeps a walk from pruning a directory the diff is showing: git
@@ -642,8 +705,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(ignored(&repo, &[repo.join("target")]).await.is_empty());
-        assert!(!all_ignored(&repo, &[repo.join("target/kept.txt")]).await);
+        assert!(
+            ignored(&Worktree::Git(repo.clone()), &[repo.join("target")])
+                .await
+                .is_empty()
+        );
+        assert!(
+            !all_ignored(
+                &Worktree::Git(repo.clone()),
+                &[repo.join("target/kept.txt")]
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -658,15 +731,21 @@ mod tests {
         let artefact = repo.join("target/debug/out.o");
         let paths = [artefact.clone(), repo.join("a.txt")];
         assert_eq!(
-            ignored(&repo, &paths).await,
+            ignored(&Worktree::Git(repo.clone()), &paths).await,
             HashSet::from([artefact.clone()])
         );
-        assert!(ignored(&repo, &[]).await.is_empty());
+        assert!(ignored(&Worktree::Git(repo.clone()), &[]).await.is_empty());
 
         // A path outside the repository stops check-ignore where it stands.
         // Whatever is left unanswered has to read as work rather than as build
         // output, or a burst carrying one would be swallowed whole.
-        assert!(!all_ignored(&repo, &[PathBuf::from("/etc/hosts"), artefact]).await);
+        assert!(
+            !all_ignored(
+                &Worktree::Git(repo.clone()),
+                &[PathBuf::from("/etc/hosts"), artefact]
+            )
+            .await
+        );
     }
 
     /// The premise the diff cache and every `304` rest on: an unchanged
@@ -675,8 +754,12 @@ mod tests {
     async fn staging_an_unchanged_worktree_is_the_same_tree_twice() {
         let (settings, repo) = scratch("stable").await;
 
-        let once = working_tree(&settings, &repo, &repo, 1).await.unwrap();
-        let twice = working_tree(&settings, &repo, &repo, 1).await.unwrap();
+        let once = working_tree(&settings, &repo, &Worktree::Git(repo.clone()), 1)
+            .await
+            .unwrap();
+        let twice = working_tree(&settings, &repo, &Worktree::Git(repo.clone()), 1)
+            .await
+            .unwrap();
         assert_eq!(once, twice);
 
         // And the ref is reachable, so `gc` cannot take it mid-read.
@@ -692,13 +775,17 @@ mod tests {
     async fn staging_picks_up_work_the_agent_has_not_committed() {
         let (settings, repo) = scratch("dirty").await;
 
-        let clean = working_tree(&settings, &repo, &repo, 1).await.unwrap();
+        let clean = working_tree(&settings, &repo, &Worktree::Git(repo.clone()), 1)
+            .await
+            .unwrap();
 
         // Both an edit and a wholly new file, which `git diff HEAD` alone would
         // miss — this is what the review pane could not show before.
         std::fs::write(repo.join("a.txt"), "two\n").unwrap();
         std::fs::write(repo.join("b.txt"), "new\n").unwrap();
-        let dirty = working_tree(&settings, &repo, &repo, 1).await.unwrap();
+        let dirty = working_tree(&settings, &repo, &Worktree::Git(repo.clone()), 1)
+            .await
+            .unwrap();
 
         assert_ne!(clean, dirty);
 
@@ -710,7 +797,9 @@ mod tests {
     async fn the_scratch_index_stays_out_of_the_worktree() {
         let (settings, repo) = scratch("index").await;
 
-        let tree = working_tree(&settings, &repo, &repo, 1).await.unwrap();
+        let tree = working_tree(&settings, &repo, &Worktree::Git(repo.clone()), 1)
+            .await
+            .unwrap();
 
         // An index kept inside the tree would be staged by its own `add -A`.
         let listed = run(&repo, &["ls-tree", "-r", "--name-only", &tree])
@@ -788,7 +877,13 @@ mod tests {
         // Drift on its own is not a rebase: the worktree is detached and does
         // not contain the upstream commit, so there is nothing to correct.
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "main"
+            )
+            .await,
             None
         );
         assert_eq!(
@@ -801,7 +896,13 @@ mod tests {
         run(&worktree, &["rebase", "main"]).await.unwrap();
 
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "main"
+            )
+            .await,
             Some(upstream.clone())
         );
         assert_eq!(
@@ -813,7 +914,13 @@ mod tests {
 
         // Idempotent: nothing has moved since, so there is nothing to write.
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "main"
+            )
+            .await,
             None
         );
 
@@ -874,7 +981,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "main"
+            )
+            .await,
             Some(upstream)
         );
     }
@@ -896,7 +1009,7 @@ mod tests {
         assert_eq!(
             reconcile_base(
                 &repo,
-                &worktree_of(&settings),
+                &head_of(&worktree_of(&settings)).await,
                 &settings.base_ref(1),
                 "main"
             )
@@ -925,7 +1038,7 @@ mod tests {
         // The worktree is detached and does not contain the upstream commit, so
         // where it branches from is still where it started.
         assert_eq!(
-            fork_point(&repo, &worktree, "main").await,
+            fork_point(&repo, &head_of(&worktree).await, "main").await,
             Some(started.clone())
         );
 
@@ -953,9 +1066,18 @@ mod tests {
             .unwrap();
         run(&repo, &["branch", "orphan", &orphan]).await.unwrap();
 
-        assert_eq!(fork_point(&repo, &worktree, "orphan").await, None);
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "orphan").await,
+            fork_point(&repo, &head_of(&worktree).await, "orphan").await,
+            None
+        );
+        assert_eq!(
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "orphan"
+            )
+            .await,
             None
         );
     }
@@ -1000,7 +1122,13 @@ mod tests {
         assert!(!is_ancestor(&repo, &started, &sidework).await);
 
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "side").await,
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "side"
+            )
+            .await,
             Some(sidework.clone())
         );
         assert_eq!(
@@ -1032,7 +1160,13 @@ mod tests {
         // rewrites that commit and the card rebases again.
         commit(&repo, "upstream.txt", "theirs\n", "upstream work").await;
         run(&worktree, &["rebase", "main"]).await.unwrap();
-        reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await;
+        reconcile_base(
+            &repo,
+            &head_of(&worktree).await,
+            &settings.base_ref(1),
+            "main",
+        )
+        .await;
 
         run(&repo, &["reset", "--hard", "-q", &started])
             .await
@@ -1043,7 +1177,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            reconcile_base(&repo, &worktree, &settings.base_ref(1), "main").await,
+            reconcile_base(
+                &repo,
+                &head_of(&worktree).await,
+                &settings.base_ref(1),
+                "main"
+            )
+            .await,
             Some(rewritten.clone())
         );
 
@@ -1067,7 +1207,7 @@ mod tests {
         assert_eq!(
             reconcile_base(
                 &repo,
-                &worktree_of(&settings),
+                &head_of(&worktree_of(&settings)).await,
                 &settings.base_ref(1),
                 "feature"
             )
@@ -1080,6 +1220,12 @@ mod tests {
                 .unwrap(),
             started
         );
+    }
+
+    /// What `vcs::head` does for a git workspace, which `fork_point` and
+    /// `reconcile_base` now take as an argument rather than reading themselves.
+    async fn head_of(worktree: &Path) -> String {
+        rev_parse(worktree, Rev::Head).await.unwrap_or_default()
     }
 
     fn worktree_of(settings: &Settings) -> PathBuf {

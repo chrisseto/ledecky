@@ -12,11 +12,12 @@ use crate::agent::AgentManager;
 use crate::config::Settings;
 use crate::db::Db;
 use crate::events::{Changes, Kind};
-use crate::git;
 use crate::project::lifecycle;
 use crate::project::{Card, CardEdit, Lane, NewCard, Project};
 use crate::review::{self, DiffCache, Turn};
 use crate::tmpl::Tmpl;
+use crate::vcs::git;
+use crate::vcs::{self, VCS};
 use crate::watch::Worktrees;
 
 pub const PERMISSION_MODES: &[(&str, &str)] = &[
@@ -288,6 +289,9 @@ pub struct CardForm {
     base_branch: String,
     permission_mode: String,
     model: String,
+    /// Absent when the project offers only one, in which case the form renders
+    /// no chooser at all.
+    vcs: Option<String>,
     /// Set by the second submit button, which keeps the form open for the next
     /// card rather than returning to the board.
     more: Option<String>,
@@ -300,6 +304,7 @@ struct Fields {
     base_branch: String,
     permission_mode: String,
     model: String,
+    vcs: VCS,
 }
 
 impl Default for Fields {
@@ -309,6 +314,7 @@ impl Default for Fields {
             base_branch: String::new(),
             permission_mode: "plan".into(),
             model: String::new(),
+            vcs: VCS::Git,
         }
     }
 }
@@ -320,6 +326,7 @@ impl Fields {
             base_branch: card.base_branch.clone(),
             permission_mode: card.permission_mode.clone(),
             model: card.model.clone().unwrap_or_default(),
+            vcs: card.vcs,
         }
     }
 
@@ -329,6 +336,7 @@ impl Fields {
             base_branch: form.base_branch.clone(),
             permission_mode: form.permission_mode.clone(),
             model: form.model.clone(),
+            vcs: form.vcs.as_deref().map_or(VCS::Git, VCS::parse),
         }
     }
 }
@@ -394,13 +402,42 @@ async fn form_context(
         false => fields.base_branch,
     };
 
+    // Per project rather than a const beside `MODELS`: what a repo can make a
+    // workspace with is a property of the repo. One option is git and needs no
+    // chooser, which is what the template keys off.
+    let detected = vcs::detect(&project.repo());
+    let vcs_options: Vec<_> = detected
+        .iter()
+        .map(|vcs| (vcs.as_str(), vcs.label()))
+        .collect();
+    let vcs = match detected.contains(&fields.vcs) {
+        true => fields.vcs,
+        false => VCS::Git,
+    };
+
     context! {
-        card, error, branches, base_branch,
+        card, error, branches, base_branch, vcs_options,
         task => fields.task,
         permission_mode => fields.permission_mode,
         model => fields.model,
+        vcs => vcs.as_str(),
         permission_modes => PERMISSION_MODES,
         models => MODELS,
+    }
+}
+
+/// Only a VCS the project actually has is accepted.
+///
+/// Checked against the repository rather than against the list the form
+/// rendered: a stale form, or someone poking at the endpoint, would otherwise
+/// create a card whose workspace cannot be made at all. Git is the safe reading
+/// — it is what `detect` offers wherever there is anything to offer, and what an
+/// absent field means, the form having had nothing to ask.
+fn chosen_vcs(project: &Project, requested: Option<&str>) -> VCS {
+    let wanted = requested.map_or(VCS::Git, VCS::parse);
+    match vcs::detect(&project.repo()).contains(&wanted) {
+        true => wanted,
+        false => VCS::Git,
     }
 }
 
@@ -450,6 +487,7 @@ async fn create(
             base_branch: form.base_branch.trim(),
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
+            vcs: chosen_vcs(&project, form.vcs.as_deref()),
         },
     )
     .await;

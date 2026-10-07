@@ -49,6 +49,24 @@
           {% endfor %}
         </select>
       </label>
+
+      {# Only where there is a choice to make: a repository that is not
+         colocated jujutsu offers git alone, and a chooser with one entry says
+         nothing.
+
+         And only on a new card. `vcs` is set once and describes the workspace
+         rather than a preference, so `CardEdit` has no field for it — offering
+         the choice here would be offering something the write ignores. #}
+      {% if vcs_options | length > 1 and not editing %}
+        <label>
+          <span>Version control</span>
+          <select name="vcs">
+            {% for value, label in vcs_options %}
+              <option value="{{ value }}" {% if value == vcs %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      {% endif %}
     </div>
 
     <label>

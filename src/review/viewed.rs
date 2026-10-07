@@ -44,6 +44,7 @@ mod tests {
     use super::*;
     use crate::db::tests::memory_db;
     use crate::project::{Card, NewCard, Project};
+    use crate::vcs::VCS;
 
     async fn card(db: &Db) -> i64 {
         let project = Project::upsert(db, std::path::Path::new("/srv/repo"))
@@ -57,6 +58,7 @@ mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await

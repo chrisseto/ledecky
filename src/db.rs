@@ -14,6 +14,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/005_session_titles.sql"),
     include_str!("../migrations/006_awaiting_user.sql"),
     include_str!("../migrations/007_turn_base.sql"),
+    include_str!("../migrations/008_card_vcs.sql"),
 ];
 
 /// One connection, behind a pool.
@@ -109,6 +110,7 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::vcs::VCS;
 
     /// A migrated, throwaway database for tests.
     ///
@@ -178,6 +180,7 @@ pub mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await

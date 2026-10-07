@@ -264,12 +264,13 @@ async fn snapshot(
         return Ok(());
     };
 
+    let repo = project.repo();
     Turn::snapshot(
         db,
         settings,
         card_id,
-        &project.repo(),
-        &worktree,
+        &repo,
+        &crate::vcs::Worktree::new(card.vcs, &repo, &worktree),
         last_message,
     )
     .await?;

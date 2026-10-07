@@ -14,9 +14,10 @@ use anyhow::{Context, Result};
 use crate::agent::{Agent, AgentManager};
 use crate::config::Settings;
 use crate::events::Kind;
-use crate::git;
 use crate::project::{Card, Lane, Project};
 use crate::review::DiffCache;
+use crate::vcs::git;
+use crate::vcs::{self, Worktree};
 use crate::watch::Worktrees;
 
 /// Creates the card's worktree if needed and starts its agent.
@@ -42,10 +43,17 @@ pub async fn start(
     let repo = project.repo();
     let worktree = settings.worktree_path(card_id);
 
-    if !worktree.join(".git").exists() {
-        git::create_worktree(settings, &repo, &worktree, &card.base_branch, card_id)
-            .await
-            .context("creating the worktree")?;
+    if !vcs::exists(card.vcs, &worktree) {
+        vcs::create(
+            settings,
+            card.vcs,
+            &repo,
+            &worktree,
+            &card.base_branch,
+            card_id,
+        )
+        .await
+        .context("creating the workspace")?;
     }
 
     // Said before the spawn: a client that learned of the move
@@ -83,7 +91,13 @@ pub async fn start(
     // and this is still the request. A worktree this new holds only what the
     // checkout put there, so the walk is short — but nothing should stand
     // between the agent starting and the card being able to say so.
-    worktrees.ensure(card_id, card.project_id, &worktree).await;
+    worktrees
+        .ensure(
+            card_id,
+            card.project_id,
+            &Worktree::new(card.vcs, &repo, &worktree),
+        )
+        .await;
 
     let watching = Arc::clone(manager);
     let started = agent.clone();
@@ -121,7 +135,7 @@ pub async fn teardown(
         .worktree_path
         .map(PathBuf::from)
         .unwrap_or_else(|| settings.worktree_path(card_id));
-    git::remove_worktree(&project.repo(), &worktree).await;
+    vcs::remove(settings, card.vcs, &project.repo(), &worktree, card_id).await;
     // Turn refs are history and are kept; this one only ever described the
     // worktree that has just gone, and would otherwise pin its tree forever.
     let _ = git::run(

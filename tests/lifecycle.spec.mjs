@@ -5,14 +5,14 @@ import { SLOW } from "../playwright.config.mjs";
 
 import {
   addCard,
-  addProject,
   addedLines,
+  addProject,
   baseRef,
-  cardIn,
   cardDirOf,
+  cardIn,
   cardRefs,
-  commitInRepo,
   comment,
+  commitInRepo,
   editWorktree,
   fileSection,
   git,
@@ -23,6 +23,7 @@ import {
   pollsOfPath,
   refreshDiff,
   removeInWorktree,
+  showTab,
   staleDiff,
   turnRefs,
   worktreeGit,
@@ -155,7 +156,7 @@ test("a terminal opened behind the review tab still fits its own pane", async ({
   await openCard(page, cardId);
   await expect(page.locator("#tab-review")).toBeChecked();
 
-  await page.locator('label[for="tab-agent"]').click();
+  await showTab(page, "agent");
 
   const rows = terminalRows(page);
   await expect(rows).toContainText("fake-agent", { timeout: 15_000 });

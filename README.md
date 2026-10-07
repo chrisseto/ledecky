@@ -44,6 +44,28 @@ was built with: templates reload without a restart, assets need one.
 `$XDG_DATA_HOME/ledecky/worktrees/<card>` and records the starting commit as
 `refs/ledecky/<card>/base`.
 
+A card can say it wants a jujutsu workspace instead, and the new-card form only
+offers the choice for a repository that *has* jj — meaning one colocated with
+git, with both `.jj` and `.git` at its root. That requirement is the whole
+reason the rest of this works unchanged: the object store and `refs/heads` stay
+where they are, so every read that resolves an object still runs against the
+repository. What differs is the work tree. `jj workspace add` makes no `.git` of
+its own, so staging names the project's gitdir instead of relying on `-C` to
+find one, and the head a range ends at comes from `jj log -r latest(@-)` rather
+than `rev-parse HEAD` — `@-` rather than `@`, so an untouched workspace reports
+its base exactly as a detached worktree that has committed nothing does, and
+`latest` because a merge working copy has two parents and bare `@-` would name
+them both. jj's own
+`.jj` is kept out of every snapshot by a `.gitignore` written inside it, which
+is what jj itself does when it colocates. The flake pins 0.45.1, which is what
+this is tested against; nothing here reaches for a recent jj feature, but the
+root has to be colocated, and `jj git colocation enable` is what converts one
+that is not.
+
+Colocated *child* workspaces are not something jj can do yet
+([jj#8052](https://github.com/jj-vcs/jj/issues/8052)); when they are, the
+workspace will carry its own `.git` and that one difference goes away.
+
 **Turns.** Claude Code HTTP hooks, passed per-session via `--settings`, report
 each `Stop`. The server then commits the *working tree* as
 `refs/ledecky/<card>/turn-<n>` — the agent does not have to commit for a turn to
@@ -78,7 +100,8 @@ someone — a redraw takes the open comment box, the range picker and the scroll
 position with it, and none of that is the agent's to disturb mid-sentence. So
 the pane goes stale visibly and waits to be asked.
 
-**Review.** The diff is rendered by piping `git diff` through [delta][] at full
+**Review.** Whichever VCS made the workspace, the diff is rendered by piping
+`git diff` through [delta][] at full
 context. Full context is what makes highlighting correct: a block comment or
 string opened above the visible window would otherwise leave everything after it
 mis-coloured. Delta also marks the part of a line that actually changed, so a
@@ -202,11 +225,16 @@ documents every key at its default; nothing reads it unless named.
 `ledecky.toml` carries the agent plumbing's real-time waits beside these; the
 end-to-end suite shrinks every one of them rather than waiting them out.
 
+`git`, `delta` and — for a jujutsu card — `jj` are taken from `PATH` with no
+fallback. The flake supplies all three, and the packaged binary is wrapped so it
+finds them whatever `PATH` it inherits.
+
 The hook port is fixed by default because hook URLs have to be stable. Hooks
 are served on a listener of their own, so widening `address` exposes the board
 and never them — `hook_address` is what widens the hooks.
 
-Per-card permission mode and model are set on the new-card form, whose one Task
+Per-card permission mode, model and — where the repository offers a choice —
+version control are set on the new-card form, whose one Task
 field doubles as the card's title: the first line names the card, the whole
 thing is what the agent is told. The mode only seeds a card's first session; a
 restarted one resumes in whatever mode it was last in, as the client recorded it.
@@ -236,8 +264,16 @@ src/project/   project.rs card.rs board.rs lifecycle.rs
 src/agent/     agent.rs manager.rs messaging.rs terminal.rs webhooks.rs
 src/review/    turn.rs comment.rs scope.rs expand.rs viewed.rs
                diff.rs ansi.rs cache.rs routes.rs
-src/           config.rs db.rs git.rs hooks.rs tmpl.rs
+src/vcs/       mod.rs git.rs jj.rs
+src/           config.rs db.rs hooks.rs tmpl.rs
 ```
+
+`vcs/git.rs` owns every git primitive and `vcs/jj.rs` every jj one; neither
+imports the other. `vcs/mod.rs` owns the choosing, and is the only place with
+two arms. There is no trait: it is two variants over a handful of operations,
+most of them one `match`. It also owns `Worktree`, which is what a card's
+checkout looks like from outside — a path, and for jj the repository git has to
+be pointed at, because a jj workspace has no `.git` of its own.
 
 Within `agent/` the split is mechanism from ownership. `agent.rs` knows about a
 pty, a screen and a process, and imports neither the database nor the event bus:
@@ -280,6 +316,10 @@ stay behind as the record. To clear a whole board by hand:
 ```sh
 rm -rf ~/.local/share/ledecky
 git -C <project> worktree prune
+# For a jujutsu project, the workspaces are jj's to forget rather than git's.
+jj -R <project> --ignore-working-copy workspace list |
+  awk -F: '/^ledecky-/ { print $1 }' |
+  xargs -n1 jj -R <project> --ignore-working-copy workspace forget
 git -C <project> for-each-ref --format='%(refname)' 'refs/ledecky/**' |
   xargs -n1 git -C <project> update-ref -d
 ```

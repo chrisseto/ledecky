@@ -9,6 +9,7 @@
 , coreutils
 , delta
 , git
+, jujutsu
 }:
 
 let
@@ -36,17 +37,17 @@ let
   # same one rather than keeping its own list in step with this.
   assetInputs = [ nodejs_22 pnpm esbuild ];
 
-  # What the server shells out to, with no fallback for any of them: `git`
-  # drives the worktrees and snapshots, `delta` renders every diff, and `kill`
-  # retires an orphaned agent. The wrapper bakes these in, and the dev shell
-  # needs them for the same reason `cargo run` does.
+  # What the server shells out to, with no fallback for any of them: `git` and
+  # `jj` drive the worktrees and snapshots, `delta` renders every diff, and
+  # `kill` retires an orphaned agent. The wrapper bakes these in, and the dev
+  # shell needs them for the same reason `cargo run` does.
   #
   # These go *ahead* of whatever PATH the server inherits. `review::ansi` reads
   # delta's output as a vocabulary — sentinel backgrounds and the `Nord`
   # palette, which `palette_is_complete` asserts on — so the diff pane is only
   # correct against the delta this was built with, not whichever one a session
   # happens to carry.
-  runtimeInputs = [ git delta coreutils ];
+  runtimeInputs = [ git delta coreutils jujutsu ];
 
   # Everything the bundle reads is a dependency, so the only thing `--prod`
   # leaves out is `@playwright/test` — which the end-to-end suite needs and this

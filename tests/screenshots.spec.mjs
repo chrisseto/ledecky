@@ -8,6 +8,7 @@ import {
   comment,
   fileSection,
   openCard,
+  showTab,
   turnRefs,
   worktreeGit,
 } from "./support/board.mjs";
@@ -59,18 +60,18 @@ test("capture the whole flow @shots", async ({ page }) => {
   await shot(page, "07-board-in-review");
 
   await openCard(page, cardId);
-  await page.locator('label[for="tab-agent"]').click();
+  await showTab(page, "agent");
   await expect(terminalRows(page)).toContainText("fake-agent");
   await shot(page, "08-agent");
 
-  await page.locator('label[for="tab-review"]').click();
+  await showTab(page, "review");
   await shot(page, "09-review");
 
   // The colour coding only means anything with more than one kind of point in
   // the list, so give it a commit of the agent's own to sit beside the turn.
   worktreeGit(cardId, "-c", "user.email=a@b.c", "-c", "user.name=a", "commit", "-qam", "banner: land it");
   await page.reload();
-  await page.locator('label[for="tab-review"]').click();
+  await showTab(page, "review");
   await page.locator("[data-range-menu] summary").click();
   await expect(page.locator("[data-range-menu] .menu-item.anchor-commit")).toBeVisible();
   await shot(page, "09b-range-menu");

@@ -4,10 +4,23 @@ import { dirname, join } from "node:path";
 import { expect } from "@playwright/test";
 
 import { terminalRows } from "./dom.mjs";
-import { DATA_HOME, REPO } from "./paths.mjs";
+import { DATA_HOME, JJ_CONFIG, JJ_REPO, REPO } from "./paths.mjs";
 
 export const git = (...args) =>
   execFileSync("git", ["-C", REPO, ...args], { encoding: "utf8" }).trim();
+
+/** The same, against the colocated jujutsu repository. */
+export const jjRepoGit = (...args) =>
+  execFileSync("git", ["-C", JJ_REPO, ...args], { encoding: "utf8" }).trim();
+
+/** `jj`, in whichever workspace or repository `cwd` names. */
+export const jj = (cwd, ...args) =>
+  execFileSync("jj", args, {
+    cwd,
+    encoding: "utf8",
+    // The run's own config, for the reason `provision` writes it.
+    env: { ...process.env, JJ_CONFIG },
+  }).trim();
 
 /** Where the server puts a card's worktree, as `Settings` derives it. */
 export const worktreeOf = (cardId) => join(DATA_HOME, "ledecky", "worktrees", String(cardId));
@@ -66,10 +79,10 @@ export const addedLines = (from, to) =>
     .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
     .join("\n");
 
-/** Registers the scratch repository as a project and returns its board URL. */
-export async function addProject(page) {
+/** Registers a scratch repository as a project and returns its board URL. */
+export async function addProject(page, repo = REPO) {
   await page.goto("/projects/new");
-  await page.getByLabel("Repository directory").fill(REPO);
+  await page.getByLabel("Repository directory").fill(repo);
   await page.getByRole("button", { name: "Add project" }).click();
   await expect(page).toHaveURL(/\/projects\/\d+$/);
   return page.url();
@@ -82,12 +95,19 @@ export async function addProject(page) {
  * helper keeps the old title/description shape and joins them the way a person
  * typing into the box would.
  */
-export async function addCard(page, projectUrl, { title, description, base = "main", permissions, model }) {
+export async function addCard(
+  page,
+  projectUrl,
+  { title, description, base = "main", permissions, model, vcs },
+) {
   await page.goto(`${projectUrl}/cards/new`);
   await page.getByLabel("Task").fill(description ? `${title}\n\n${description}` : title);
   await page.getByRole("radio", { name: base, exact: true }).check();
   if (permissions) await page.getByLabel("Permissions").selectOption(permissions);
   if (model) await page.getByLabel("Model").selectOption(model);
+  // Only rendered where the project offers more than one, so only named when a
+  // test means to pick.
+  if (vcs) await page.getByLabel("Version control").selectOption(vcs);
   await page.getByRole("button", { name: "Create", exact: true }).click();
   await expect(page).toHaveURL(projectUrl);
 }
@@ -104,6 +124,19 @@ export async function openCard(page, cardId) {
 }
 
 /**
+ * Switches the open drawer to a tab.
+ *
+ * The tabs are a radio and its label, and the radio is what CSS keys off — so
+ * the label is what a reader clicks. Named once here because which tab the
+ * drawer lands on follows the agent's state, so nearly every spec that reads a
+ * pane has to ask for one.
+ */
+export async function showTab(page, name) {
+  await page.locator(`label[for="tab-${name}"]`).click();
+  await expect(page.locator(`#tab-${name}`)).toBeChecked();
+}
+
+/**
  * Opens the card on its Agent tab.
  *
  * Which tab the drawer lands on follows the agent's state, and the terminal
@@ -112,8 +145,19 @@ export async function openCard(page, cardId) {
  */
 export async function openAgent(page, cardId) {
   await openCard(page, cardId);
-  await page.locator('label[for="tab-agent"]').click();
+  await showTab(page, "agent");
   await expect(terminalRows(page)).toBeVisible();
+}
+
+/**
+ * Opens the card on its Review tab.
+ *
+ * Which tab the drawer lands on follows whether there is anything to review, so
+ * anything reading the diff has to ask for it rather than assume.
+ */
+export async function openReview(page, cardId) {
+  await openCard(page, cardId);
+  await showTab(page, "review");
 }
 
 /**

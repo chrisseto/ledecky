@@ -7,8 +7,28 @@ import { AGENT_TIMINGS } from "../../playwright.config.mjs";
 
 export const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
+/// Where a run's jj configuration lives, under its own root.
+///
+/// NB: derived here rather than taken from `paths.mjs`, which throws unless
+/// `LEDECKY_TEST_ROOT` is set — and `global-setup` imports *this* file in order
+/// to set it. `paths.mjs` exports the same path for the workers, which load
+/// after it exists.
+const jjConfig = (root) => join(root, "jj.toml");
+
 const git = (cwd, ...args) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+
+/** The filler the fake agent edits, and a second file to widen against. */
+function seed(repo) {
+  // Long enough that a 3-line context window does not already show the whole
+  // file, so widening it is observable.
+  const filler = Array.from({ length: 24 }, (_, i) => `fn spare_${i}() -> u32 { ${i} }`);
+  writeFileSync(
+    join(repo, "main.rs"),
+    `${filler.join("\n")}\n\nfn main() {\n    println!("hi");\n}\n`,
+  );
+  writeFileSync(join(repo, "README.md"), "# scratch\n");
+}
 
 /**
  * The server binary.
@@ -33,20 +53,44 @@ export function provision(root) {
   git(repo, "init", "-q", "-b", "main");
   git(repo, "config", "user.email", "e2e@ledecky.test");
   git(repo, "config", "user.name", "ledecky e2e");
-  // The fake agent edits this file; keeping it small keeps diff assertions
-  // legible. Long enough that a 3-line context window does not already show the
-  // whole file, so widening it is observable.
-  const filler = Array.from({ length: 24 }, (_, i) => `fn spare_${i}() -> u32 { ${i} }`);
-  writeFileSync(
-    join(repo, "main.rs"),
-    `${filler.join("\n")}\n\nfn main() {\n    println!("hi");\n}\n`,
-  );
-  writeFileSync(join(repo, "README.md"), "# scratch\n");
+  // The fake agent edits these; keeping them small keeps diff assertions
+  // legible.
+  seed(repo);
   git(repo, "add", "-A");
   git(repo, "commit", "-qm", "init");
 
   // A second branch so the base-branch picker has something to choose between.
   git(repo, "branch", "release");
+
+  // An empty config, so jj never reads the developer's own. Not about the
+  // identity — jj warns and carries on without one — but about `git.colocate`,
+  // snapshot limits and templates, none of which should decide a run. Written
+  // before the first jj call below, which reads it.
+  writeFileSync(jjConfig(root), "");
+
+  // NB: the config on every jj call the harness makes, not just the server's.
+  // `provision` runs jj too, and one reading the developer's own config would
+  // be reading the very thing the empty file above exists to avoid.
+  const jj = (cwd, ...args) =>
+    execFileSync("jj", args, {
+      cwd,
+      encoding: "utf8",
+      env: { ...process.env, JJ_CONFIG: jjConfig(root) },
+    }).trim();
+
+  // And a colocated jj repository, which is the only kind the board offers jj
+  // for: `refs/heads` and the object store stay where every git read expects
+  // them. `--colocate` spelled out rather than left to the default, since the
+  // default is exactly what `git.colocate` overrides.
+  const jjRepo = join(root, "jj-repo");
+  mkdirSync(jjRepo, { recursive: true });
+  git(jjRepo, "init", "-q", "-b", "main");
+  git(jjRepo, "config", "user.email", "e2e@ledecky.test");
+  git(jjRepo, "config", "user.name", "ledecky e2e");
+  seed(jjRepo);
+  git(jjRepo, "add", "-A");
+  git(jjRepo, "commit", "-qm", "init");
+  jj(jjRepo, "git", "init", "--colocate");
 }
 
 /** Starts a server on a port of its own choosing and reports where it landed. */
@@ -69,6 +113,9 @@ export async function boot({ root, agentBin } = {}) {
       XDG_DATA_HOME: join(root, "data"),
       // Likewise, never read the real config.
       XDG_CONFIG_HOME: join(root, "config"),
+      // The server is what spawns `jj`, so this is where that isolation has to
+      // land. `provision` writes the file.
+      JJ_CONFIG: jjConfig(root),
       LEDECKY_AGENT_BIN:
         agentBin ?? process.env.LEDECKY_AGENT_BIN ?? join(PROJECT, "tests/fake-agent.mjs"),
       ...AGENT_TIMINGS,

@@ -187,6 +187,14 @@ impl Settings {
         self.data_dir().join("worktrees")
     }
 
+    /// `<app_slug>-<card>` — what jj calls the card's workspace.
+    ///
+    /// Derived rather than recorded: `jj workspace forget` needs the name back,
+    /// and a card id is already unique within a repository.
+    pub fn workspace_name(&self, card_id: i64) -> String {
+        format!("{}-{card_id}", self.app_slug)
+    }
+
     pub fn card_dir(&self, card_id: i64) -> PathBuf {
         self.data_dir().join("cards").join(card_id.to_string())
     }
@@ -283,6 +291,7 @@ mod tests {
         assert_eq!(s.db_path(), PathBuf::from("/srv/board/planner.db"));
         assert_eq!(s.worktree_path(7), PathBuf::from("/srv/board/worktrees/7"));
         assert_eq!(s.card_dir(7), PathBuf::from("/srv/board/cards/7"));
+        assert_eq!(s.workspace_name(7), "planner-7");
         assert_eq!(s.card_refs(7), "refs/planner/7/");
         assert_eq!(s.base_ref(7), "refs/planner/7/base");
         assert_eq!(s.turn_ref(7, 3), "refs/planner/7/turn-3");

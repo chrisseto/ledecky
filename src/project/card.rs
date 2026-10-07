@@ -3,6 +3,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
 use crate::db::{sql, Db};
+use crate::vcs::VCS;
 
 /// The kanban column a card sits in.
 ///
@@ -134,6 +135,9 @@ pub struct Card {
     pub position: f64,
     pub permission_mode: String,
     pub model: Option<String>,
+    /// What made the workspace, once there is one. Frozen with the rest of the
+    /// form, since the workspace is built from it.
+    pub vcs: VCS,
     pub worktree_path: Option<String>,
     pub session_id: Option<String>,
     pub agent_pid: Option<i64>,
@@ -151,9 +155,14 @@ pub struct NewCard<'a> {
     pub base_branch: &'a str,
     pub permission_mode: &'a str,
     pub model: Option<&'a str>,
+    pub vcs: VCS,
 }
 
 /// What a card's form can still change, before an agent has seen any of it.
+///
+/// NB: no `vcs`. It is set once, at creation, and describes the workspace
+/// rather than a preference — so there is nothing here to change it with, and
+/// the form only offers the choice on a new card.
 pub struct CardEdit<'a> {
     pub task: &'a str,
     pub base_branch: &'a str,
@@ -163,7 +172,7 @@ pub struct CardEdit<'a> {
 
 impl Card {
     const COLUMNS: &'static str = "id, project_id, title, task, base_branch, lane, position, \
-         permission_mode, model, worktree_path, session_id, agent_pid, agent_state, \
+         permission_mode, model, vcs, worktree_path, session_id, agent_pid, agent_state, \
          merge_requested, created_at, updated_at";
 
     /// [`Card::editable`] as a `WHERE` clause, so the test and the write it
@@ -232,16 +241,26 @@ impl Card {
         .unwrap_or_default()
     }
 
-    /// The cards on a board that still have a worktree, as `(id, path)`.
-    pub async fn live_worktrees(db: &Db, project_id: i64) -> Vec<(i64, String)> {
-        sqlx::query_as(
-            "SELECT id, worktree_path FROM cards
+    /// Every card of `project_id` that still has a workspace, with what made it
+    /// — which is what says how to point git at the thing.
+    ///
+    /// NB: propagated rather than defaulted. An empty answer means "no card has
+    /// a workspace", which is what establishes no watches and stages nothing —
+    /// so a broken statement would read as a board that has gone quiet, and say
+    /// nothing about it.
+    pub async fn live_worktrees(db: &Db, project_id: i64) -> sqlx::Result<Vec<(i64, String, VCS)>> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, worktree_path, vcs FROM cards
              WHERE project_id = ?1 AND worktree_path IS NOT NULL",
         )
         .bind(project_id)
         .fetch_all(db.pool())
-        .await
-        .unwrap_or_default()
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, path, vcs)| (id, path, VCS::parse(&vcs)))
+            .collect())
     }
 
     pub async fn create(db: &Db, new: NewCard<'_>) -> sqlx::Result<i64> {
@@ -261,8 +280,8 @@ impl Card {
 
         let id = sqlx::query(
             "INSERT INTO cards
-                 (project_id, task, base_branch, position, permission_mode, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (project_id, task, base_branch, position, permission_mode, model, vcs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(new.project_id)
         .bind(new.task)
@@ -270,6 +289,7 @@ impl Card {
         .bind(position)
         .bind(new.permission_mode)
         .bind(new.model)
+        .bind(new.vcs.as_str())
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
@@ -280,6 +300,13 @@ impl Card {
 
     /// Rewrites a card that has not been handed to an agent yet, reporting
     /// whether it was still editable when the write landed.
+    ///
+    /// NB: `vcs` is deliberately not among the columns. A workspace is made
+    /// before any session is recorded, and a card dragged back out of In
+    /// Progress is editable again with that workspace still on disk — so a
+    /// write here could leave the column and the directory disagreeing, and
+    /// `vcs::exists` would then answer for the wrong marker. Set at creation
+    /// and left alone, there is nothing to disagree about.
     pub async fn update(db: &Db, id: i64, edit: CardEdit<'_>) -> sqlx::Result<bool> {
         let rows = sqlx::query(sql(format!(
             "UPDATE cards SET task = ?1, base_branch = ?2,
@@ -519,6 +546,7 @@ impl<'r> FromRow<'r, SqliteRow> for Card {
             position: row.try_get("position")?,
             permission_mode: row.try_get("permission_mode")?,
             model: row.try_get("model")?,
+            vcs: VCS::parse(&row.try_get::<String, _>("vcs")?),
             worktree_path: row.try_get("worktree_path")?,
             session_id: row.try_get("session_id")?,
             agent_pid: row.try_get("agent_pid")?,
@@ -553,6 +581,7 @@ mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await
@@ -744,6 +773,36 @@ mod tests {
             card.opening_prompt().unwrap(),
             "Teach it to hum\n\nQuietly."
         );
+    }
+
+    /// `vcs` describes the workspace on disk, and a card can be editable with
+    /// one already there: it keeps its workspace when it leaves In Progress, and
+    /// a workspace is made before any session is recorded. So the edit has to
+    /// leave the column alone — `start` and `teardown` both read it to decide
+    /// which arm to take, and a column disagreeing with the directory leaves a
+    /// card that can neither be started nor torn down.
+    #[tokio::test]
+    async fn an_edit_leaves_what_made_the_workspace_alone() {
+        let (db, project_id) = seeded().await;
+
+        let id = add(&db, project_id, "a jj card").await;
+        sqlx::query("UPDATE cards SET vcs = 'jj' WHERE id = ?1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        Card::starting(&db, id, "/data/worktrees/1").await.unwrap();
+        // The premise: still editable, because nothing has read the task.
+        assert!(Card::find(&db, id).await.unwrap().editable());
+
+        assert!(rewrite(&db, id).await);
+
+        let card = Card::find(&db, id).await.unwrap();
+        assert_eq!(card.vcs, VCS::JJ, "the workspace on disk is still jj");
+        // And everything the form does own still landed.
+        assert_eq!(card.task, "Teach it to hum\n\nQuietly.");
+        assert_eq!(card.base_branch, "release");
+        assert_eq!(card.model.as_deref(), Some("opus"));
     }
 
     #[tokio::test]

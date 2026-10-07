@@ -7,9 +7,10 @@ use sqlx::{FromRow, Row};
 
 use crate::config::Settings;
 use crate::db::{sql, Db};
-use crate::git;
 use crate::project::{Card, Project};
 use crate::review::{Comment, DiffCache};
+use crate::vcs::git;
+use crate::vcs::{self, Worktree};
 
 /// A snapshot of the worktree at the end of one agent turn.
 ///
@@ -113,7 +114,7 @@ impl Turn {
         Ok(())
     }
 
-    /// Snapshots `worktree` as the card's next turn.
+    /// Snapshots the card's workspace as its next turn.
     ///
     /// Returns `None` when nothing changed on disk, which is how a chat-only
     /// turn avoids piling up an empty ref.
@@ -122,7 +123,7 @@ impl Turn {
         settings: &Settings,
         card_id: i64,
         repo: &Path,
-        worktree: &Path,
+        work: &Worktree,
         message: &str,
     ) -> anyhow::Result<Option<Self>> {
         let n = Self::next_number(db, card_id).await;
@@ -137,8 +138,7 @@ impl Turn {
         // snapshot belongs to.
         let base_sha = git::rev_parse(repo, git::Rev::Ref(&base)).await;
 
-        let Some(sha) =
-            git::snapshot_turn(settings, repo, worktree, card_id, n, &parent_sha).await?
+        let Some(sha) = git::snapshot_turn(settings, repo, work, card_id, n, &parent_sha).await?
         else {
             return Ok(None);
         };
@@ -212,10 +212,10 @@ pub async fn live_head(
         return cache.known_head(card.id).or_else(settled);
     }
 
-    // NB: `.git` rather than the directory, matching how a session decides a
-    // worktree is real. `teardown` removes it from the hook thread, so this can
-    // lose the race and find a half-removed one either way.
-    let Some(live) = worktree.filter(|path| path.join(".git").exists()) else {
+    // NB: the workspace marker rather than the directory, matching how a session
+    // decides a workspace is real. `teardown` removes it from the hook thread,
+    // so this can lose the race and find a half-removed one either way.
+    let Some(live) = worktree.filter(|path| vcs::exists(card.vcs, path)) else {
         return settled();
     };
 
@@ -258,7 +258,7 @@ pub async fn restage(
     // is staging, and a head written for a worktree that has gone outlives the
     // refs it names.
     let worktree = card.worktree_path.as_ref().map(PathBuf::from)?;
-    if !worktree.join(".git").exists() {
+    if !vcs::exists(card.vcs, &worktree) {
         cache.forget_head(card_id);
         return None;
     }
@@ -293,7 +293,8 @@ async fn stage(
     // this returns.
     reconcile(cache, settings, repo, worktree, card).await;
 
-    match git::working_tree(settings, repo, worktree, card.id).await {
+    let work = Worktree::new(card.vcs, repo, worktree);
+    match git::working_tree(settings, repo, &work, card.id).await {
         Ok(tree) => Some(tree),
         Err(err) => {
             warn!("card {}: staging the worktree: {err:#}", card.id);
@@ -324,8 +325,12 @@ async fn reconcile(
     }
 
     let base_ref = settings.base_ref(card.id);
-    let Some(moved) = git::reconcile_base(repo, worktree, &base_ref, &card.base_branch).await
-    else {
+    // NB: the head comes from whatever made the workspace. A git worktree has
+    // its own `HEAD`; a jj workspace answers with `@-`.
+    let Some(head) = vcs::head(card.vcs, worktree).await else {
+        return;
+    };
+    let Some(moved) = git::reconcile_base(repo, &head, &base_ref, &card.base_branch).await else {
         return;
     };
 
@@ -338,6 +343,7 @@ mod tests {
     use super::*;
     use crate::db::tests::memory_db;
     use crate::project::{Card, NewCard, Project};
+    use crate::vcs::VCS;
 
     async fn card(db: &Db) -> i64 {
         let project = Project::upsert(db, Path::new("/srv/repo")).await.unwrap();
@@ -349,6 +355,7 @@ mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await
@@ -541,6 +548,7 @@ mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await

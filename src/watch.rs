@@ -27,8 +27,9 @@ use tokio::sync::mpsc;
 use crate::config::Settings;
 use crate::db::Db;
 use crate::events::{Changes, Kind};
-use crate::git;
 use crate::review::{turn, DiffCache};
+use crate::vcs::git;
+use crate::vcs::Worktree;
 
 /// How many distinct paths of a burst to look at before deciding what it was.
 /// A build writes far more than this; nobody edits that many by hand.
@@ -84,10 +85,12 @@ impl Worktrees {
     /// Reports whether this call is what started watching it, so a caller can
     /// tell the difference between "already covered" and "covered from now on"
     /// — the latter leaves a window before it during which writes went unseen.
-    pub async fn ensure(&self, card_id: i64, project_id: i64, worktree: &Path) -> bool {
+    pub async fn ensure(&self, card_id: i64, project_id: i64, work: &Worktree) -> bool {
         if self.watching(card_id) {
             return false;
         }
+
+        let worktree = work.path();
 
         // NB: not under the lock, which the recursive watch this replaced could
         // afford to be. The walk asks git what to prune and so awaits, and a
@@ -95,7 +98,7 @@ impl Worktrees {
         // card's `ensure`. Two calls racing on one card is what the second
         // check below is for: the loser drops its watcher, and dropping it is
         // what gives the descriptors back.
-        let watcher = match self.spawn(card_id, project_id, worktree).await {
+        let watcher = match self.spawn(card_id, project_id, work).await {
             Ok(watcher) => watcher,
             Err(err) => {
                 warn!("card {card_id}: watching {}: {err}", worktree.display());
@@ -135,8 +138,9 @@ impl Worktrees {
         &self,
         card_id: i64,
         project_id: i64,
-        worktree: &Path,
+        work: &Worktree,
     ) -> notify::Result<Arc<Mutex<RecommendedWatcher>>> {
+        let worktree = work.path();
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let mut watcher =
@@ -149,7 +153,7 @@ impl Worktrees {
         // discovered, so failing to watch it is failing to watch the card.
         watcher.watch(worktree, RecursiveMode::NonRecursive)?;
         let mut watched = HashSet::from([worktree.to_path_buf()]);
-        walk(worktree, &[worktree], &mut |level| {
+        walk(work, &[worktree], &mut |level| {
             install(&mut watcher, &mut watched, level)
         })
         .await;
@@ -162,7 +166,7 @@ impl Worktrees {
         let cache = self.0.cache.clone();
         let changes = self.0.changes.clone();
         let debounce = self.0.debounce;
-        let worktree = worktree.to_path_buf();
+        let work = work.clone();
 
         // NB: a task, not a thread. It stages the worktree, which is git and
         // therefore awaited — and `notify` hands its events to a sync callback,
@@ -187,12 +191,12 @@ impl Worktrees {
                 // burst that reads as a build can still have carried a
                 // directory that is not, and a directory missed here is missed
                 // for as long as the card lives.
-                if !burst.settle(&handle, &mut watched, &worktree).await {
+                if !burst.settle(&handle, &mut watched, &work).await {
                     return;
                 }
 
                 let touched: Vec<PathBuf> = burst.touched.into_iter().collect();
-                if git::all_ignored(&worktree, &touched).await {
+                if git::all_ignored(&work, &touched).await {
                     continue;
                 }
 
@@ -248,7 +252,7 @@ fn report(tx: &mpsc::UnboundedSender<Seen>, event: notify::Event) {
         return;
     }
     // Git's own bookkeeping is not work anyone is reviewing.
-    if event.paths.iter().any(|path| is_git_internal(path)) {
+    if event.paths.iter().any(|path| is_vcs_internal(path)) {
         return;
     }
 
@@ -304,11 +308,12 @@ impl Burst {
         &mut self,
         handle: &Weak<Mutex<RecommendedWatcher>>,
         watched: &mut HashSet<PathBuf>,
-        worktree: &Path,
+        work: &Worktree,
     ) -> bool {
         let Some(watcher) = handle.upgrade() else {
             return false;
         };
+        let worktree = work.path();
 
         // NB: the guard is taken for each piece of work rather than held across
         // the whole of this. `walk` awaits git, and a `MutexGuard` cannot be
@@ -362,7 +367,7 @@ impl Burst {
             // is already a path nothing ignores, so the burst announces on its
             // own account; adding the tree to it would announce the tree.
             let mut fresh = HashSet::new();
-            walk(worktree, &[worktree], &mut |level| {
+            walk(work, &[worktree], &mut |level| {
                 fresh.extend(level.iter().cloned());
                 if let Ok(mut guard) = watcher.lock() {
                     install(&mut guard, watched, level);
@@ -392,7 +397,7 @@ impl Burst {
             .collect();
         if !fresh.is_empty() {
             let touched = &mut self.touched;
-            walk(worktree, &fresh, &mut |level| {
+            walk(work, &fresh, &mut |level| {
                 // The directories join the burst so that a build big enough to
                 // be sampled cannot hide the one new directory in it that
                 // nothing ignores. Whatever was written inside them before
@@ -431,11 +436,11 @@ impl Burst {
 /// worktree in one call, but it can only report a directory it has a file in —
 /// and `mkdir` ahead of the first write is exactly how a build arrives, so an
 /// empty `node_modules` would be walked into and watched.
-async fn walk(worktree: &Path, roots: &[&Path], keep: &mut impl FnMut(&[PathBuf])) {
+async fn walk(work: &Worktree, roots: &[&Path], keep: &mut impl FnMut(&[PathBuf])) {
     let mut level: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
 
     while !level.is_empty() {
-        let ignored = git::ignored(worktree, &level).await;
+        let ignored = git::ignored(work, &level).await;
         level.retain(|dir| !ignored.contains(dir));
         keep(&level);
 
@@ -458,10 +463,19 @@ async fn walk(worktree: &Path, roots: &[&Path], keep: &mut impl FnMut(&[PathBuf]
                     continue;
                 }
                 let path = entry.path();
-                // A linked worktree's `.git` is a file, so this only bites in a
+                // A linked worktree's `.git` is a file, so that only bites in a
                 // repository proper — where it is most of the saving, `objects`
-                // alone being a 256-way fanout.
-                if path.file_name() != Some(OsStr::new(".git")) {
+                // alone being a 256-way fanout. `.jj` is always a directory and
+                // always worth skipping: jj rewrites its working copy on every
+                // command.
+                //
+                // NB: not left to `check-ignore`. The `.jj/.gitignore` written
+                // at creation hides what is *inside* `.jj`, but not `.jj`
+                // itself, so the walk would still descend into it.
+                if !matches!(
+                    path.file_name().and_then(OsStr::to_str),
+                    Some(".git" | ".jj")
+                ) {
                     next.push(path);
                 }
             }
@@ -516,9 +530,14 @@ fn changed_content(kind: &EventKind) -> bool {
     )
 }
 
-fn is_git_internal(path: &Path) -> bool {
+/// Whichever VCS made the workspace, its own bookkeeping is not work to review.
+///
+/// `.jj` matters as much as `.git`: jj rewrites `.jj/working_copy` on every
+/// command it runs, so relaying those would have each of the agent's own jj
+/// invocations announce a change.
+fn is_vcs_internal(path: &Path) -> bool {
     path.components()
-        .any(|part| part.as_os_str() == OsStr::new(".git"))
+        .any(|part| matches!(part.as_os_str().to_str(), Some(".git") | Some(".jj")))
 }
 
 /// NB: `symlink_metadata`, so a link to a directory does not read as one. What
@@ -543,7 +562,7 @@ fn is_gitignore(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::run;
+    use crate::vcs::git::run;
 
     /// A repository to walk, with the ignore rules already committed.
     async fn scratch(name: &str, ignore: &str, dirs: &[&str]) -> PathBuf {
@@ -574,7 +593,12 @@ mod tests {
     /// What the watcher would end up holding descriptors for.
     async fn watched(worktree: &Path, roots: &[&Path]) -> Vec<PathBuf> {
         let mut found = Vec::new();
-        walk(worktree, roots, &mut |level| found.extend_from_slice(level)).await;
+        walk(
+            &Worktree::Git(worktree.to_path_buf()),
+            roots,
+            &mut |level| found.extend_from_slice(level),
+        )
+        .await;
         found.sort();
         found
     }

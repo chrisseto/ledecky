@@ -8,8 +8,8 @@ use anyhow::Result;
 use rocket::serde::Serialize;
 use tokio::sync::Semaphore;
 
-use crate::git;
 use crate::review::diff::{self, Change, ParsedFile};
+use crate::vcs::git;
 
 /// Bytes of parsed files to keep before dropping the least recently used.
 const BUDGET: usize = 256 << 20;

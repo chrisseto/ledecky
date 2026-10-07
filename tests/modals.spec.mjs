@@ -8,6 +8,7 @@ import {
   comment,
   fileSection,
   openCard,
+  showTab,
   turnRefs,
 } from "./support/board.mjs";
 import { terminalInput, terminalRows } from "./support/dom.mjs";
@@ -39,7 +40,7 @@ test("a tool permission prompt shows on the card and resumes when answered", asy
   await openCard(page, cardId);
 
   // The marker makes the fake agent raise a permission dialog on its next turn.
-  await page.locator('label[for="tab-review"]').click();
+  await showTab(page, "review");
   await comment(
     page,
     fileSection(page, "main.rs").locator(".line.l-added").first(),
@@ -50,7 +51,7 @@ test("a tool permission prompt shows on the card and resumes when answered", asy
   await expect(page.locator("#agent-state")).toContainText("needs you");
   await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
 
-  await page.locator('label[for="tab-agent"]').click();
+  await showTab(page, "agent");
   const rows = terminalRows(page);
   await expect(rows).toContainText("needs approval");
   const terminal = terminalInput(page);

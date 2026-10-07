@@ -1,6 +1,6 @@
 use crate::config::Settings;
-use crate::git::Commit;
 use crate::review::Turn;
+use crate::vcs::git::Commit;
 
 /// The tree with nothing in it, which is what a root commit is measured against.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";

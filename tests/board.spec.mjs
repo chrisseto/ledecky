@@ -1,6 +1,9 @@
 import { expect, test } from "./support/fixtures.mjs";
 
-import { addCard, addProject, cardIn, git, lane, moveCard, openCard, pollsOf } from "./support/board.mjs";
+import {
+  addCard, addProject, cardIn, git, lane, moveCard, openCard, pollsOf,
+  showTab,
+} from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -274,7 +277,7 @@ test("a card with nothing to review says so, without an empty picker", async ({ 
   await cardIn(page, "todo", "Untouched").click();
 
   // Nothing has run, so the review tab is not the one that leads.
-  await page.locator('label[for="tab-review"]').click();
+  await showTab(page, "review");
 
   // A card that never started has no worktree and no turns, so there is no
   // point in history to measure from and the picker stays off the page.

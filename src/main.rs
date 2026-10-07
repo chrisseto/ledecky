@@ -12,13 +12,13 @@ mod assets;
 mod config;
 mod db;
 mod events;
-mod git;
 mod gzip;
 mod hooks;
 mod listener;
 mod project;
 mod review;
 mod tmpl;
+mod vcs;
 mod watch;
 
 use std::net::SocketAddr;

@@ -31,3 +31,14 @@ export const DATA_HOME = join(ROOT, "data");
 
 /** The scratch git repository the board points at. */
 export const REPO = join(ROOT, "repo");
+
+/**
+ * A second scratch repository, colocated with jujutsu.
+ *
+ * Separate rather than colocating `REPO`: every other spec would then be
+ * running against a jj repo too, and what they cover is the git path.
+ */
+export const JJ_REPO = join(ROOT, "jj-repo");
+
+/** Where jj reads its configuration, so a run never reads the developer's. */
+export const JJ_CONFIG = join(ROOT, "jj.toml");

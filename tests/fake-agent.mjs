@@ -242,11 +242,27 @@ async function hook(event, body) {
 const git = (cwd, ...args) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
-/** Applies the merge prompt: commit here, then fast-forward the base branch. */
+const jj = (cwd, ...args) => execFileSync("jj", args, { cwd, encoding: "utf8" }).trim();
+
+/**
+ * Applies the merge prompt: commit here, then move the base branch.
+ *
+ * Which VCS made this workspace is read off the disk rather than out of the
+ * prompt. A colocated jj workspace could be merged with git — the objects are
+ * the same — but that would leave jj's own view of the working copy disagreeing
+ * with it, which is not what the prompt asked for and not what a real agent
+ * would do.
+ */
 function performMerge(prompt) {
   const branch = prompt.match(/Land it on `([^`]+)`/)?.[1];
   if (!branch || !repo) return "could not work out the base branch";
 
+  return existsSync(join(process.cwd(), ".jj"))
+    ? mergeWithJj(branch)
+    : mergeWithGit(branch);
+}
+
+function mergeWithGit(branch) {
   git(process.cwd(), "add", "-A");
   try {
     git(
@@ -266,6 +282,29 @@ function performMerge(prompt) {
   const sha = git(process.cwd(), "rev-parse", "HEAD");
   git(repo, "merge", "--ff-only", sha);
   return `merged ${sha} into ${branch}`;
+}
+
+/**
+ * NB: the bookmark is moved from the main repository, which is what the prompt
+ * says and what makes it reach `refs/heads`. Moved from here it would stay
+ * unexported, and the server reads git to decide the merge landed.
+ */
+function mergeWithJj(branch) {
+  // Anything still only in the working copy has to reach `@-`, since that is
+  // what a bookmark can point at.
+  jj(process.cwd(), "commit", "-m", `work for ${sessionId}`);
+  const sha = jj(
+    process.cwd(),
+    "--ignore-working-copy",
+    "log",
+    "--no-graph",
+    "-r",
+    "@-",
+    "-T",
+    "commit_id",
+  );
+  jj(repo, "bookmark", "set", branch, "-r", sha);
+  return `moved ${branch} to ${sha}`;
 }
 
 async function submit(prompt) {

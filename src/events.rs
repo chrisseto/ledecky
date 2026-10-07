@@ -160,7 +160,25 @@ pub fn stream(
     let worktrees = worktrees.inner().clone();
     let announce = changes.inner().clone();
     rocket::tokio::spawn(async move {
-        let live = Card::live_worktrees(&db, project).await;
+        let live = match Card::live_worktrees(&db, project).await {
+            Ok(live) => live,
+            // Not a route, so there is nobody to answer 500 to — but a silent
+            // empty list here is a board whose panes never update again, which
+            // is worth a line.
+            Err(err) => {
+                error!("project {project}: listing live workspaces: {err}");
+                return;
+            }
+        };
+        // One lookup for the whole project: a jj workspace is staged against
+        // the repository's gitdir, so the watch needs to know where that is.
+        // A project that has gone has nothing left to watch.
+        let Some(repo) = crate::project::Project::find(&db, project)
+            .await
+            .map(|project| project.repo())
+        else {
+            return;
+        };
 
         // Two ways a card can arrive here needing staging. A watch that has
         // only just been established missed anything written while it was being
@@ -173,8 +191,9 @@ pub fn stream(
         // over a head that is gone, and the board would sit on its cards' last
         // turns until something wrote again.
         let mut stale: Vec<i64> = Vec::new();
-        for (card_id, path) in live {
-            let fresh = worktrees.ensure(card_id, project, Path::new(&path)).await;
+        for (card_id, path, vcs) in live {
+            let work = crate::vcs::Worktree::new(vcs, &repo, Path::new(&path));
+            let fresh = worktrees.ensure(card_id, project, &work).await;
 
             if fresh || cache.known_head(card_id).is_none() {
                 stale.push(card_id);

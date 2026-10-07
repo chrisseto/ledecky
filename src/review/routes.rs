@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use minijinja::context;
@@ -12,7 +12,6 @@ use rocket::{get, post, State};
 use crate::agent::{messaging, AgentManager};
 use crate::config::Settings;
 use crate::db::Db;
-use crate::git;
 use crate::project::{Card, Lane, Project};
 use crate::review::comment::{format_review, Side};
 use crate::review::diff::{Line, ParsedFile, Segment};
@@ -20,6 +19,8 @@ use crate::review::scope::Mode;
 use crate::review::turn;
 use crate::review::{Comment, DiffCache, Expansion, Scope, Turn, Viewed};
 use crate::tmpl::Tmpl;
+use crate::vcs;
+use crate::vcs::git;
 
 /// Rendered lines beyond which a file is held back behind a button.
 ///
@@ -276,9 +277,14 @@ async fn pane(
     )
     .await;
     let commits = match worktree.as_deref() {
-        Some(worktree) => {
-            git::commits(&repo, &settings.base_ref(id), &head_of(worktree).await).await
-        }
+        // NB: no head, no commits — not a literal `HEAD` fallback. These are
+        // listed from the *repository*, where `HEAD` is whatever the main
+        // checkout has, so the picker would offer the project's own upstream
+        // commits as anchors for the card's work.
+        Some(worktree) => match vcs::head(card.vcs, worktree).await {
+            Some(head) => git::commits(&repo, &settings.base_ref(id), &head).await,
+            None => Vec::new(),
+        },
         None => Vec::new(),
     };
 
@@ -531,16 +537,6 @@ fn viewing_turn(scope: &Scope, turns: &[Turn]) -> Option<i64> {
         // Every other range ends at the live head, which is the card as it is.
         None => turns.last().map(|turn| turn.id),
     }
-}
-
-/// What the agent's worktree has checked out, for listing the commits it made.
-///
-/// A detached worktree's `HEAD` is the only place its own commits are reachable
-/// from — the turn refs are a parallel chain and never contain them.
-async fn head_of(worktree: &Path) -> String {
-    git::run(worktree, &["rev-parse", "HEAD"])
-        .await
-        .unwrap_or_else(|_| "HEAD".into())
 }
 
 /// The diff's files as a tree: one group per directory, in the order the diff

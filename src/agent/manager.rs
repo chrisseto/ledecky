@@ -24,9 +24,9 @@ use crate::agent::{messaging, Agent};
 use crate::config::{Settings, Timings};
 use crate::db::Db;
 use crate::events::{Changes, Kind};
-use crate::git;
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
+use crate::vcs::git;
 
 /// How often a starting session is re-checked while it proves itself.
 const STARTUP_POLL: Duration = Duration::from_millis(100);
@@ -394,7 +394,7 @@ impl AgentManager {
 
         // NB: on the blocking pool. The inbox is a unix socket written under a
         // timeout, which blocks the thread it is on however short it is.
-        let prompt = merge_prompt(&card.base_branch, &repo);
+        let prompt = crate::vcs::merge_prompt(card.vcs, &card.base_branch, &repo);
         let sent = spawn_blocking(move || messaging::send(&inbox, &prompt))
             .await
             .expect("asking for a merge panicked");
@@ -480,22 +480,6 @@ async fn settled(agent: &Agent, within: Duration) -> Startup {
         rocket::tokio::time::sleep(STARTUP_POLL).await;
     }
     Startup::Stalled
-}
-
-/// NB: the base branch is almost always checked out in the main worktree, and
-/// git refuses to move a branch that another worktree holds. Saying so up front
-/// saves the agent a failed `git branch -f` and a round of guessing.
-fn merge_prompt(branch: &str, repo: &Path) -> String {
-    format!(
-        "The reviewer approved this work. Land it on `{branch}`:\n\n\
-         1. Commit anything still outstanding in this worktree.\n\
-         2. `{branch}` is checked out in the main repository at `{repo}`, so it cannot be moved \
-            from here. Apply your commits there instead — `git -C {repo} merge --ff-only <sha>`, \
-            or rebase onto `{branch}` first if it has moved ahead.\n\
-         3. Report the final SHA of `{branch}`.\n\n\
-         Do not push.",
-        repo = repo.display(),
-    )
 }
 
 /// Whether `pid` is a live process working inside one of our worktrees.
@@ -588,6 +572,7 @@ mod tests {
     use super::*;
     use crate::db::tests::memory_db;
     use crate::project::{NewCard, Project};
+    use crate::vcs::VCS;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::path::{Path, PathBuf};
     use std::process::Child;
@@ -660,6 +645,7 @@ mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await
@@ -820,7 +806,7 @@ mod tests {
 
     #[test]
     fn the_merge_prompt_points_at_the_main_checkout() {
-        let prompt = merge_prompt("main", Path::new("/srv/repo"));
+        let prompt = crate::vcs::merge_prompt(VCS::Git, "main", Path::new("/srv/repo"));
 
         assert!(prompt.starts_with("The reviewer approved this work."));
         // The agent has to be told where the branch actually lives, or it will
@@ -902,6 +888,7 @@ mod tests {
                 base_branch: "main",
                 permission_mode: "acceptEdits",
                 model: None,
+                vcs: VCS::Git,
             },
         )
         .await

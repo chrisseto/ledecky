@@ -185,7 +185,17 @@ async fn save(
         return Err(reject(db, settings, cache, form.board, &typed, message).await);
     }
     if !is_git_repo(&path) {
-        let message = format!("{} is not a git repository", path.display());
+        // A jj repo that is not colocated has no git work tree to stage and no
+        // `refs/heads` to read, so say what would make it usable rather than
+        // only that it is not a git repository.
+        let message = match path.join(".jj").exists() {
+            true => format!(
+                "{} is a jujutsu repository that is not colocated with git. \
+                 Run `jj git colocation enable` in it first.",
+                path.display()
+            ),
+            false => format!("{} is not a git repository", path.display()),
+        };
         return Err(reject(db, settings, cache, form.board, &typed, message).await);
     }
 
