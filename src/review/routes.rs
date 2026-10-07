@@ -11,7 +11,7 @@ use rocket::{get, post, State};
 
 use crate::agent::{messaging, AgentManager};
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::DB;
 use crate::project::{Card, Lane, Project};
 use crate::review::comment::{format_review, Side};
 use crate::review::diff::{Line, ParsedFile, Segment};
@@ -172,7 +172,7 @@ struct View<'a> {
 
 #[get("/cards/<id>/diff?<scope>&<expand>&<comment>")]
 pub async fn diff_pane(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -193,7 +193,7 @@ pub async fn diff_pane(
 
 /// Everything `_review.html` needs, for the drawer's first render.
 pub async fn initial(
-    db: &Db,
+    db: &DB,
     settings: &Settings,
     cache: &DiffCache,
     id: i64,
@@ -217,7 +217,7 @@ pub async fn initial(
 }
 
 async fn pane(
-    db: &Db,
+    db: &DB,
     settings: &Settings,
     cache: &DiffCache,
     id: i64,
@@ -605,7 +605,7 @@ struct Counts {
     submitted: usize,
 }
 
-async fn counts_for(db: &Db, id: i64, scope_key: &str) -> Result<Counts, Status> {
+async fn counts_for(db: &DB, id: i64, scope_key: &str) -> Result<Counts, Status> {
     let scope = Scope::parse(Some(scope_key));
     let turns = Turn::for_card(db, id).await;
     let here = Comment::find_in_range(
@@ -705,7 +705,7 @@ fn anchored_href(id: i64, key: &str, open: bool, scope: &str, expand: Option<&st
 /// The box for one line, or the line's thread once it is closed again.
 #[get("/cards/<id>/comments/at?<key>&<scope>&<expand>&<open>")]
 pub async fn anchored_block(
-    db: &State<Db>,
+    db: &State<DB>,
     id: i64,
     key: String,
     scope: Option<String>,
@@ -742,7 +742,7 @@ pub struct CommentForm {
 }
 
 #[post("/cards/<id>/comments", data = "<form>")]
-pub async fn add_comment(db: &State<Db>, id: i64, form: Form<CommentForm>) -> Result<Tmpl, Status> {
+pub async fn add_comment(db: &State<DB>, id: i64, form: Form<CommentForm>) -> Result<Tmpl, Status> {
     let body = form.body.trim();
     if !body.is_empty() {
         let turns = Turn::for_card(db, id).await;
@@ -786,7 +786,7 @@ pub struct DeleteCommentForm {
 
 #[post("/cards/<id>/comments/<comment_id>/delete", data = "<form>")]
 pub async fn delete_comment(
-    db: &State<Db>,
+    db: &State<DB>,
     id: i64,
     comment_id: i64,
     form: Form<DeleteCommentForm>,
@@ -812,7 +812,7 @@ pub async fn delete_comment(
 /// wholesale.
 #[post("/cards/<id>/comments/discard", data = "<form>")]
 pub async fn discard_comments(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -837,7 +837,7 @@ pub struct ViewedForm {
 /// is only what makes it outlive the page — so returning a pane would redraw
 /// every line of every other file to say something the reader can already see.
 #[post("/cards/<id>/viewed", data = "<form>")]
-pub async fn toggle_viewed(db: &State<Db>, id: i64, form: Form<ViewedForm>) -> Status {
+pub async fn toggle_viewed(db: &State<DB>, id: i64, form: Form<ViewedForm>) -> Status {
     Viewed::set(db, id, &form.file_path, form.viewed).await;
     Status::NoContent
 }
@@ -845,7 +845,7 @@ pub async fn toggle_viewed(db: &State<Db>, id: i64, form: Form<ViewedForm>) -> S
 /// Hands every draft comment to the agent as one message and marks them sent.
 #[post("/cards/<id>/review", data = "<form>")]
 pub async fn submit_review(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,

@@ -11,7 +11,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::agent::AgentManager;
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::DB;
 use crate::project::Card;
 use crate::project::board;
 use crate::project::lifecycle;
@@ -21,7 +21,7 @@ use crate::watch::Worktrees;
 
 #[get("/cards/<id>?<scope>")]
 pub async fn focus(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -34,7 +34,7 @@ pub async fn focus(
 /// Just the agent-state chip, so a state change redraws it without re-running a
 /// diff behind it.
 #[get("/cards/<id>/state")]
-pub async fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
+pub async fn state(db: &State<DB>, id: i64) -> Result<Tmpl, Status> {
     let card = Card::find(db, id).await.ok_or(Status::NotFound)?;
     Ok(Tmpl("_state.html", context! { card }))
 }
@@ -47,7 +47,7 @@ pub async fn state(db: &State<Db>, id: i64) -> Result<Tmpl, Status> {
 /// and selecting out of it, which is a board and a review pane's worth of git.
 #[get("/cards/<id>/agent")]
 pub async fn agent_pane(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     id: i64,
 ) -> Result<Tmpl, Status> {

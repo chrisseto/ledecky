@@ -59,7 +59,7 @@ pub struct HookAuth {
 
 #[derive(Serialize)]
 #[serde(crate = "rocket::serde")]
-struct HttpHook {
+struct HTTPHook {
     #[serde(rename = "type")]
     kind: &'static str,
     url: String,
@@ -117,7 +117,7 @@ impl HookAuth {
         let mut hooks: Map<String, Value> = EVENTS
             .iter()
             .map(|(event, path, matcher)| {
-                let handler = HttpHook {
+                let handler = HTTPHook {
                     kind: "http",
                     url: self.url(card_id, path),
                     timeout: HOOK_TIMEOUT_SECS,

@@ -9,7 +9,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
 use crate::config::Settings;
-use crate::db::{sql, Db};
+use crate::db::{sql, DB};
 use crate::project::board::{self, Shell};
 use crate::review::DiffCache;
 use crate::tmpl::Tmpl;
@@ -31,7 +31,7 @@ impl Project {
         PathBuf::from(&self.path)
     }
 
-    pub async fn find(db: &Db, id: i64) -> Option<Self> {
+    pub async fn find(db: &DB, id: i64) -> Option<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM projects WHERE id = ?1",
             Self::COLUMNS
@@ -43,7 +43,7 @@ impl Project {
         .flatten()
     }
 
-    pub async fn all(db: &Db) -> Vec<Self> {
+    pub async fn all(db: &DB) -> Vec<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM projects ORDER BY name",
             Self::COLUMNS
@@ -54,7 +54,7 @@ impl Project {
     }
 
     /// Registers `path`, or returns the id it already has.
-    pub async fn upsert(db: &Db, path: &Path) -> sqlx::Result<i64> {
+    pub async fn upsert(db: &DB, path: &Path) -> sqlx::Result<i64> {
         let path = path.to_string_lossy();
 
         // NB: in a transaction, because it looks before it inserts — two boards
@@ -86,7 +86,7 @@ impl Project {
     }
 
     /// Overrides the name taken from the directory.
-    pub async fn rename(db: &Db, id: i64, name: &str) {
+    pub async fn rename(db: &DB, id: i64, name: &str) {
         let _ = sqlx::query("UPDATE projects SET name = ?2 WHERE id = ?1")
             .bind(id)
             .bind(name)
@@ -110,7 +110,7 @@ impl<'r> FromRow<'r, SqliteRow> for Project {
 
 #[get("/projects/new?<board>")]
 pub async fn new(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     board: Option<i64>,
@@ -140,7 +140,7 @@ pub struct ProjectForm {
 
 #[post("/projects", data = "<form>")]
 pub async fn create(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     form: Form<ProjectForm>,
@@ -149,7 +149,7 @@ pub async fn create(
 }
 
 async fn save(
-    db: &Db,
+    db: &DB,
     settings: &Settings,
     cache: &DiffCache,
     form: ProjectForm,
@@ -159,7 +159,7 @@ async fn save(
     // NB: a helper rather than the closure this was. Putting the modal back up
     // is a render, a render reads the board behind it, and that awaits.
     async fn reject(
-        db: &Db,
+        db: &DB,
         settings: &Settings,
         cache: &DiffCache,
         board: Option<i64>,

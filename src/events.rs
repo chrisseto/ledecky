@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::DB;
 use crate::project::Card;
 use crate::review::{turn, DiffCache};
 use crate::watch::Worktrees;
@@ -55,7 +55,7 @@ pub struct Change {
 }
 
 /// Cloned into the threads that outlive a request — the prompt deliverer, the
-/// worktree watcher — the same way [`Db`] is.
+/// worktree watcher — the same way [`DB`] is.
 #[derive(Clone)]
 pub struct Changes(Arc<Bus>);
 
@@ -98,7 +98,7 @@ impl Changes {
     ///
     /// NB: a query of its own to find the project. Every caller is a mutation
     /// that has just written, and these are far rarer than reads.
-    pub async fn card(&self, db: &Db, card_id: i64, kind: Kind) {
+    pub async fn card(&self, db: &DB, card_id: i64, kind: Kind) {
         let project_id = Card::find(db, card_id).await.map(|card| card.project_id);
         if let Some(project_id) = project_id {
             self.emit(project_id, Some(card_id), kind);
@@ -136,7 +136,7 @@ impl Changes {
 /// up the conditional GET that makes an unchanged fragment cost a 304.
 #[get("/events?<project>")]
 pub fn stream(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     changes: &State<Changes>,

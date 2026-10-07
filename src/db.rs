@@ -28,9 +28,9 @@ const MIGRATIONS: &[&str] = &[
 /// of its own — one connection is not one statement, and every `.await` hands
 /// it back.
 #[derive(Clone)]
-pub struct Db(SqlitePool);
+pub struct DB(SqlitePool);
 
-impl Db {
+impl DB {
     pub async fn open(settings: &Settings) -> Result<Self> {
         let path = settings.db_path();
         let dir = path.parent().expect("the database path has a parent");
@@ -117,8 +117,8 @@ pub mod tests {
     /// NB: `sqlite::memory:` gives each *connection* a database of its own, so
     /// this only holds together because the pool is capped at one — the same
     /// cap production runs with.
-    pub async fn memory_db() -> Db {
-        Db::connect(SqliteConnectOptions::new().in_memory(true))
+    pub async fn memory_db() -> DB {
+        DB::connect(SqliteConnectOptions::new().in_memory(true))
             .await
             .unwrap()
     }

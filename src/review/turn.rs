@@ -6,7 +6,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
 use crate::config::Settings;
-use crate::db::{sql, Db};
+use crate::db::{sql, DB};
 use crate::project::{Card, Project};
 use crate::review::{Comment, DiffCache};
 use crate::vcs::git;
@@ -47,7 +47,7 @@ impl Turn {
          last_assistant_message, created_at, \
          CAST(strftime('%s', created_at) AS INTEGER) AS at";
 
-    pub async fn for_card(db: &Db, card_id: i64) -> Vec<Self> {
+    pub async fn for_card(db: &DB, card_id: i64) -> Vec<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM turns WHERE card_id = ?1 ORDER BY n",
             Self::COLUMNS
@@ -58,7 +58,7 @@ impl Turn {
         .unwrap_or_default()
     }
 
-    pub async fn latest(db: &Db, card_id: i64) -> Option<Self> {
+    pub async fn latest(db: &DB, card_id: i64) -> Option<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM turns WHERE card_id = ?1 ORDER BY n DESC LIMIT 1",
             Self::COLUMNS
@@ -70,7 +70,7 @@ impl Turn {
         .flatten()
     }
 
-    async fn next_number(db: &Db, card_id: i64) -> i64 {
+    async fn next_number(db: &DB, card_id: i64) -> i64 {
         sqlx::query_scalar("SELECT COALESCE(MAX(n), 0) + 1 FROM turns WHERE card_id = ?1")
             .bind(card_id)
             .fetch_one(db.pool())
@@ -84,7 +84,7 @@ impl Turn {
     /// one connection held for the whole sequence they could not. Losing that
     /// quietly would lose a turn; losing it loudly is `on_stop` logging it.
     async fn record(
-        db: &Db,
+        db: &DB,
         settings: &Settings,
         card_id: i64,
         n: i64,
@@ -119,7 +119,7 @@ impl Turn {
     /// Returns `None` when nothing changed on disk, which is how a chat-only
     /// turn avoids piling up an empty ref.
     pub async fn snapshot(
-        db: &Db,
+        db: &DB,
         settings: &Settings,
         card_id: i64,
         repo: &Path,
@@ -245,7 +245,7 @@ pub async fn live_head(
 ///
 /// Returns what it staged, or nothing if the card has no worktree left.
 pub async fn restage(
-    db: &Db,
+    db: &DB,
     cache: &DiffCache,
     settings: &Settings,
     card_id: i64,
@@ -345,7 +345,7 @@ mod tests {
     use crate::project::{Card, NewCard, Project};
     use crate::vcs::VCS;
 
-    async fn card(db: &Db) -> i64 {
+    async fn card(db: &DB) -> i64 {
         let project = Project::upsert(db, Path::new("/srv/repo")).await.unwrap();
         Card::create(
             db,

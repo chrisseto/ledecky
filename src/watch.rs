@@ -25,7 +25,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::DB;
 use crate::events::{Changes, Kind};
 use crate::review::{turn, DiffCache};
 use crate::vcs::git;
@@ -53,7 +53,7 @@ struct Watched {
     watches: Mutex<HashMap<i64, Arc<Mutex<RecommendedWatcher>>>>,
     /// Both carried here because the burst task stages the worktree itself,
     /// which means reading the card and the project it belongs to.
-    db: Db,
+    db: DB,
     settings: Settings,
     cache: DiffCache,
     changes: Changes,
@@ -64,7 +64,7 @@ struct Watched {
 
 impl Worktrees {
     pub fn new(
-        db: Db,
+        db: DB,
         settings: Settings,
         cache: DiffCache,
         changes: Changes,

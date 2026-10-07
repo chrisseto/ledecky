@@ -22,7 +22,7 @@ use rocket::{Orbit, Rocket};
 use crate::agent::agent::{self, Watcher};
 use crate::agent::{messaging, Agent};
 use crate::config::{Settings, Timings};
-use crate::db::Db;
+use crate::db::DB;
 use crate::events::{Changes, Kind};
 use crate::hooks::HookAuth;
 use crate::project::{AgentState, Card, Lane, Project};
@@ -33,7 +33,7 @@ const STARTUP_POLL: Duration = Duration::from_millis(100);
 
 pub struct AgentManager {
     agents: RwLock<HashMap<i64, Arc<Agent>>>,
-    db: Db,
+    db: DB,
     changes: Changes,
     /// Held here so the manager can configure the agents it starts. Nothing
     /// above needs to carry it: `settings_json` is only ever wanted at the
@@ -59,7 +59,7 @@ enum Report {
 impl AgentManager {
     /// NB: `Arc` from the start, because `spawn` hands the pump a `Weak` to
     /// this and there is nowhere else for that to come from.
-    pub fn new(db: Db, changes: Changes, auth: HookAuth, settings: Settings) -> Arc<Self> {
+    pub fn new(db: DB, changes: Changes, auth: HookAuth, settings: Settings) -> Arc<Self> {
         let (reports, mut inbox) = mpsc::unbounded_channel();
         let manager = Arc::new(Self {
             agents: RwLock::new(HashMap::new()),
@@ -431,7 +431,7 @@ impl AgentManager {
         settled(agent, within).await == Startup::Gone
     }
 
-    pub fn db(&self) -> &Db {
+    pub fn db(&self) -> &DB {
         &self.db
     }
 
@@ -635,7 +635,7 @@ mod tests {
     // ---- the transitions ----
 
     /// A card in `lane`, with its agent in `state`.
-    async fn card_in(db: &Db, lane: Lane, state: AgentState) -> i64 {
+    async fn card_in(db: &DB, lane: Lane, state: AgentState) -> i64 {
         let project = Project::upsert(db, Path::new("/srv/repo")).await.unwrap();
         let card = Card::create(
             db,
@@ -657,7 +657,7 @@ mod tests {
 
     /// A manager over a scratch database. The bus has no subscribers: these
     /// cover the transitions, not the announcing.
-    fn manager(db: &Db) -> Arc<AgentManager> {
+    fn manager(db: &DB) -> Arc<AgentManager> {
         AgentManager::new(
             db.clone(),
             Changes::default(),
@@ -666,7 +666,7 @@ mod tests {
         )
     }
 
-    async fn look(db: &Db, card_id: i64) -> (Lane, AgentState) {
+    async fn look(db: &DB, card_id: i64) -> (Lane, AgentState) {
         let card = Card::find(db, card_id).await.unwrap();
         (card.lane, card.agent_state)
     }
@@ -839,7 +839,7 @@ mod tests {
     // ---- the lane pair ------------------------------------------------------
 
     /// A manager whose settings point at a scratch data directory.
-    fn sweeper(db: &Db, settings: Settings) -> Arc<AgentManager> {
+    fn sweeper(db: &DB, settings: Settings) -> Arc<AgentManager> {
         AgentManager::new(
             db.clone(),
             Changes::default(),
@@ -878,7 +878,7 @@ mod tests {
         path
     }
 
-    async fn card_with_pid(db: &Db, pid: Option<i64>, worktree: &Path) -> i64 {
+    async fn card_with_pid(db: &DB, pid: Option<i64>, worktree: &Path) -> i64 {
         let project = Project::upsert(db, Path::new("/srv/repo")).await.unwrap();
         let card = Card::create(
             db,

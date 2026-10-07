@@ -94,7 +94,7 @@ async fn rocket(
     settings: Settings,
     hooks_at: SocketAddr,
 ) -> anyhow::Result<rocket::Rocket<rocket::Build>> {
-    let db = db::Db::open(&settings)
+    let db = db::DB::open(&settings)
         .await
         .context("opening the database")?;
     let templates = tmpl::Templates::load().context("loading templates")?;

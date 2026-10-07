@@ -4,7 +4,7 @@ use rocket::serde::Serialize;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
-use crate::db::{sql, Db};
+use crate::db::{sql, DB};
 
 /// Which side of the diff a comment is pinned to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +98,7 @@ impl Comment {
     /// Ordered by id, which is the order they were written: a line carrying
     /// more than one reads as the thread it was.
     pub async fn find_in_range(
-        db: &Db,
+        db: &DB,
         card_id: i64,
         turn: Option<i64>,
         history: bool,
@@ -121,7 +121,7 @@ impl Comment {
 
     /// Ordered by id so the batch reaches the agent in the order it was written,
     /// which is the order the reviewer was thinking in.
-    pub async fn drafts(db: &Db, card_id: i64) -> sqlx::Result<Vec<Self>> {
+    pub async fn drafts(db: &DB, card_id: i64) -> sqlx::Result<Vec<Self>> {
         sqlx::query_as(sql(Self::select(
             "WHERE card_id = ?1 AND state = 'draft' ORDER BY id",
         )))
@@ -132,7 +132,7 @@ impl Comment {
 
     /// Every draft on the card, including any the range on screen does not
     /// render — the batch goes to the agent whole, so the count has to say so.
-    pub async fn draft_count(db: &Db, card_id: i64) -> sqlx::Result<i64> {
+    pub async fn draft_count(db: &DB, card_id: i64) -> sqlx::Result<i64> {
         sqlx::query_scalar("SELECT COUNT(*) FROM comments WHERE card_id = ?1 AND state = 'draft'")
             .bind(card_id)
             .fetch_one(db.pool())
@@ -140,7 +140,7 @@ impl Comment {
     }
 
     pub async fn create(
-        db: &Db,
+        db: &DB,
         card_id: i64,
         turn_id: Option<i64>,
         file_path: &str,
@@ -166,7 +166,7 @@ impl Comment {
     }
 
     /// Drafts can be withdrawn; anything already sent to the agent cannot.
-    pub async fn delete_draft(db: &Db, card_id: i64, id: i64) {
+    pub async fn delete_draft(db: &DB, card_id: i64, id: i64) {
         let _ =
             sqlx::query("DELETE FROM comments WHERE id = ?1 AND card_id = ?2 AND state = 'draft'")
                 .bind(id)
@@ -176,7 +176,7 @@ impl Comment {
     }
 
     /// Withdraws the whole batch at once.
-    pub async fn delete_drafts(db: &Db, card_id: i64) {
+    pub async fn delete_drafts(db: &DB, card_id: i64) {
         let _ = sqlx::query("DELETE FROM comments WHERE card_id = ?1 AND state = 'draft'")
             .bind(card_id)
             .execute(db.pool())
@@ -188,7 +188,7 @@ impl Comment {
     /// Sending is what turns a note into a record, so it is also where one
     /// written before the card had any turn finally gets one — up to then it
     /// answers to the working range and needs no id of its own.
-    pub async fn mark_submitted(db: &Db, card_id: i64, turn: Option<i64>) {
+    pub async fn mark_submitted(db: &DB, card_id: i64, turn: Option<i64>) {
         let _ = sqlx::query(
             "UPDATE comments
                 SET state = 'submitted', turn_id = COALESCE(turn_id, ?2)
@@ -208,7 +208,7 @@ impl Comment {
     /// next is the record of the work it was written against, and without this
     /// it would be a row no range ever renders again — not a draft, so no
     /// working range wants it, and named by no turn, so no snapshot has it.
-    pub async fn adopt_orphans(db: &Db, card_id: i64, turn: i64) {
+    pub async fn adopt_orphans(db: &DB, card_id: i64, turn: i64) {
         let _ = sqlx::query(
             "UPDATE comments
                 SET turn_id = ?2
@@ -271,7 +271,7 @@ mod tests {
     use crate::project::{Card, NewCard, Project};
     use crate::vcs::VCS;
 
-    async fn card(db: &Db) -> i64 {
+    async fn card(db: &DB) -> i64 {
         let project = Project::upsert(db, std::path::Path::new("/srv/repo"))
             .await
             .unwrap();
@@ -292,7 +292,7 @@ mod tests {
 
     /// Every row on the card, whatever range it answers to. Unordered: what
     /// these assertions count does not depend on it.
-    async fn all(db: &Db, card_id: i64) -> Vec<Comment> {
+    async fn all(db: &DB, card_id: i64) -> Vec<Comment> {
         sqlx::query_as(sql(Comment::select("WHERE card_id = ?1")))
             .bind(card_id)
             .fetch_all(db.pool())
@@ -302,7 +302,7 @@ mod tests {
 
     /// `turn_id` is a foreign key, so a comment can only name a turn that is
     /// really there.
-    async fn turn(db: &Db, card_id: i64, n: i64) -> i64 {
+    async fn turn(db: &DB, card_id: i64, n: i64) -> i64 {
         sqlx::query(
             "INSERT INTO turns (card_id, n, ref_name, commit_sha, parent_sha)
              VALUES (?1, ?2, ?3, ?4, '')",

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::db::Db;
+use crate::db::DB;
 
 /// Files the reviewer has ticked off on a card.
 ///
@@ -9,7 +9,7 @@ use crate::db::Db;
 pub struct Viewed;
 
 impl Viewed {
-    pub async fn for_card(db: &Db, card_id: i64) -> HashSet<String> {
+    pub async fn for_card(db: &DB, card_id: i64) -> HashSet<String> {
         let rows: Vec<String> =
             sqlx::query_scalar("SELECT file_path FROM review_viewed WHERE card_id = ?1")
                 .bind(card_id)
@@ -26,7 +26,7 @@ impl Viewed {
     /// browser folds the file itself and reports the state it landed on, and an
     /// update that re-asserts what is already stored has to be harmless —
     /// nothing here can tell a reader's click from a redraw replaying one.
-    pub async fn set(db: &Db, card_id: i64, file_path: &str, viewed: bool) {
+    pub async fn set(db: &DB, card_id: i64, file_path: &str, viewed: bool) {
         let query = match viewed {
             true => sqlx::query(
                 "INSERT INTO review_viewed (card_id, file_path) VALUES (?1, ?2)
@@ -46,7 +46,7 @@ mod tests {
     use crate::project::{Card, NewCard, Project};
     use crate::vcs::VCS;
 
-    async fn card(db: &Db) -> i64 {
+    async fn card(db: &DB) -> i64 {
         let project = Project::upsert(db, std::path::Path::new("/srv/repo"))
             .await
             .unwrap();

@@ -2,7 +2,7 @@ use rocket::serde::Serialize;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Row};
 
-use crate::db::{sql, Db};
+use crate::db::{sql, DB};
 use crate::vcs::VCS;
 
 /// The kanban column a card sits in.
@@ -200,7 +200,7 @@ impl Card {
 
     // ---- queries ------------------------------------------------------------
 
-    pub async fn find(db: &Db, id: i64) -> Option<Self> {
+    pub async fn find(db: &DB, id: i64) -> Option<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM cards WHERE id = ?1",
             Self::COLUMNS
@@ -216,7 +216,7 @@ impl Card {
     ///
     /// NB: collected cards are excluded here rather than at each call site —
     /// this is the only read that feeds the board, and they belong on none of it.
-    pub async fn for_project(db: &Db, project_id: i64) -> Vec<Self> {
+    pub async fn for_project(db: &DB, project_id: i64) -> Vec<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM cards
              WHERE project_id = ?1 AND lane != '{}'
@@ -231,7 +231,7 @@ impl Card {
     }
 
     /// Cards that claim to have a live agent — the startup sweep's candidates.
-    pub async fn with_agent_pid(db: &Db) -> Vec<Self> {
+    pub async fn with_agent_pid(db: &DB) -> Vec<Self> {
         sqlx::query_as(sql(format!(
             "SELECT {} FROM cards WHERE agent_pid IS NOT NULL",
             Self::COLUMNS
@@ -248,7 +248,7 @@ impl Card {
     /// a workspace", which is what establishes no watches and stages nothing —
     /// so a broken statement would read as a board that has gone quiet, and say
     /// nothing about it.
-    pub async fn live_worktrees(db: &Db, project_id: i64) -> sqlx::Result<Vec<(i64, String, VCS)>> {
+    pub async fn live_worktrees(db: &DB, project_id: i64) -> sqlx::Result<Vec<(i64, String, VCS)>> {
         let rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT id, worktree_path, vcs FROM cards
              WHERE project_id = ?1 AND worktree_path IS NOT NULL",
@@ -263,7 +263,7 @@ impl Card {
             .collect())
     }
 
-    pub async fn create(db: &Db, new: NewCard<'_>) -> sqlx::Result<i64> {
+    pub async fn create(db: &DB, new: NewCard<'_>) -> sqlx::Result<i64> {
         // NB: in a transaction. The position is read and then written, and
         // between the two another card can be created — leaving both at the
         // same place in the lane.
@@ -307,7 +307,7 @@ impl Card {
     /// write here could leave the column and the directory disagreeing, and
     /// `vcs::exists` would then answer for the wrong marker. Set at creation
     /// and left alone, there is nothing to disagree about.
-    pub async fn update(db: &Db, id: i64, edit: CardEdit<'_>) -> sqlx::Result<bool> {
+    pub async fn update(db: &DB, id: i64, edit: CardEdit<'_>) -> sqlx::Result<bool> {
         let rows = sqlx::query(sql(format!(
             "UPDATE cards SET task = ?1, base_branch = ?2,
                  permission_mode = ?3, model = ?4, updated_at = datetime('now')
@@ -326,7 +326,7 @@ impl Card {
         Ok(rows > 0)
     }
 
-    pub async fn delete(db: &Db, id: i64) -> sqlx::Result<()> {
+    pub async fn delete(db: &DB, id: i64) -> sqlx::Result<()> {
         sqlx::query("DELETE FROM cards WHERE id = ?1")
             .bind(id)
             .execute(db.pool())
@@ -339,7 +339,7 @@ impl Card {
     /// NB: deliberately not gated by [`Self::EDITABLE`], which the form's
     /// `update` is. This lands once the agent is well under way, which is the
     /// whole point of it.
-    pub async fn set_title(db: &Db, id: i64, title: &str) {
+    pub async fn set_title(db: &DB, id: i64, title: &str) {
         let _ = sqlx::query(
             "UPDATE cards SET title = ?1, updated_at = datetime('now')
              WHERE id = ?2 AND title IS NOT ?1",
@@ -356,7 +356,7 @@ impl Card {
     /// [`Self::update`] is. The worktree keeps its root and the base ref keeps
     /// its value; what moves is what `reconcile_base` measures against and where
     /// a later merge is asked to land.
-    pub async fn set_base_branch(db: &Db, id: i64, branch: &str) -> sqlx::Result<()> {
+    pub async fn set_base_branch(db: &DB, id: i64, branch: &str) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE cards SET base_branch = ?1, updated_at = datetime('now')
              WHERE id = ?2",
@@ -368,7 +368,7 @@ impl Card {
         Ok(())
     }
 
-    pub async fn set_lane(db: &Db, id: i64, lane: Lane) {
+    pub async fn set_lane(db: &DB, id: i64, lane: Lane) {
         let _ =
             sqlx::query("UPDATE cards SET lane = ?1, updated_at = datetime('now') WHERE id = ?2")
                 .bind(lane.as_str())
@@ -377,7 +377,7 @@ impl Card {
                 .await;
     }
 
-    pub async fn set_agent_state(db: &Db, id: i64, state: AgentState) {
+    pub async fn set_agent_state(db: &DB, id: i64, state: AgentState) {
         let _ = sqlx::query(
             "UPDATE cards SET agent_state = ?1, updated_at = datetime('now') WHERE id = ?2",
         )
@@ -387,7 +387,7 @@ impl Card {
         .await;
     }
 
-    pub async fn set_session_id(db: &Db, id: i64, session_id: &str) {
+    pub async fn set_session_id(db: &DB, id: i64, session_id: &str) {
         let _ =
             sqlx::query("UPDATE cards SET session_id = ?1 WHERE id = ?2 AND session_id IS NOT ?1")
                 .bind(session_id)
@@ -397,7 +397,7 @@ impl Card {
     }
 
     /// Forgets the recorded session, so the next start opens a fresh one.
-    pub async fn clear_session_id(db: &Db, id: i64) {
+    pub async fn clear_session_id(db: &DB, id: i64) {
         let _ = sqlx::query("UPDATE cards SET session_id = NULL WHERE id = ?1")
             .bind(id)
             .execute(db.pool())
@@ -409,7 +409,7 @@ impl Card {
     /// NB: one write. Between the two a reader would find a card holding a
     /// worktree with nothing running in it, which is what the board draws a
     /// stopped card with a diff from.
-    pub async fn starting(db: &Db, id: i64, worktree: &str) -> sqlx::Result<()> {
+    pub async fn starting(db: &DB, id: i64, worktree: &str) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE cards SET worktree_path = ?1, agent_pid = NULL,
                  agent_state = ?2, updated_at = datetime('now')
@@ -424,7 +424,7 @@ impl Card {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn attach_worktree(db: &Db, id: i64, worktree: &str, pid: Option<i64>) {
+    pub async fn attach_worktree(db: &DB, id: i64, worktree: &str, pid: Option<i64>) {
         let _ = sqlx::query(
             "UPDATE cards SET worktree_path = ?1, agent_pid = ?2, updated_at = datetime('now')
              WHERE id = ?3",
@@ -436,7 +436,7 @@ impl Card {
         .await;
     }
 
-    pub async fn set_agent_pid(db: &Db, id: i64, pid: Option<i64>) {
+    pub async fn set_agent_pid(db: &DB, id: i64, pid: Option<i64>) {
         let _ = sqlx::query("UPDATE cards SET agent_pid = ?1 WHERE id = ?2")
             .bind(pid)
             .bind(id)
@@ -444,7 +444,7 @@ impl Card {
             .await;
     }
 
-    pub async fn detach_worktree(db: &Db, id: i64) {
+    pub async fn detach_worktree(db: &DB, id: i64) {
         let _ = sqlx::query(
             "UPDATE cards SET worktree_path = NULL, session_id = NULL, agent_pid = NULL
              WHERE id = ?1",
@@ -454,7 +454,7 @@ impl Card {
         .await;
     }
 
-    pub async fn request_merge(db: &Db, id: i64, base_sha: &str) {
+    pub async fn request_merge(db: &DB, id: i64, base_sha: &str) {
         let _ =
             sqlx::query("UPDATE cards SET merge_requested = 1, merge_base_sha = ?1 WHERE id = ?2")
                 .bind(base_sha)
@@ -463,7 +463,7 @@ impl Card {
                 .await;
     }
 
-    pub async fn merge_base_sha(db: &Db, id: i64) -> Option<String> {
+    pub async fn merge_base_sha(db: &DB, id: i64) -> Option<String> {
         sqlx::query_scalar("SELECT merge_base_sha FROM cards WHERE id = ?1")
             .bind(id)
             .fetch_optional(db.pool())
@@ -473,7 +473,7 @@ impl Card {
             .flatten()
     }
 
-    pub async fn clear_merge_request(db: &Db, id: i64) {
+    pub async fn clear_merge_request(db: &DB, id: i64) {
         let _ = sqlx::query("UPDATE cards SET merge_requested = 0 WHERE id = ?1")
             .bind(id)
             .execute(db.pool())
@@ -484,7 +484,7 @@ impl Card {
     ///
     /// Positions are rewritten wholesale rather than interpolated: the lanes are
     /// small, and it keeps them free of float drift.
-    pub async fn reorder(db: &Db, id: i64, project_id: i64, lane: Lane, index: usize) {
+    pub async fn reorder(db: &DB, id: i64, project_id: i64, lane: Lane, index: usize) {
         // NB: in a transaction, and the lane change is part of it. The
         // renumbering reads the lane it is about to rewrite, so a second move
         // landing in the middle would renumber against an order that has gone.
@@ -564,7 +564,7 @@ mod tests {
     use super::*;
     use crate::db::tests::memory_db;
 
-    async fn seeded() -> (Db, i64) {
+    async fn seeded() -> (DB, i64) {
         let db = memory_db().await;
         let id = crate::project::Project::upsert(&db, std::path::Path::new("/srv/repo"))
             .await
@@ -572,7 +572,7 @@ mod tests {
         (db, id)
     }
 
-    async fn add(db: &Db, project_id: i64, task: &str) -> i64 {
+    async fn add(db: &DB, project_id: i64, task: &str) -> i64 {
         Card::create(
             db,
             NewCard {
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(card.opening_prompt().unwrap(), task);
     }
 
-    async fn rewrite(db: &Db, id: i64) -> bool {
+    async fn rewrite(db: &DB, id: i64) -> bool {
         Card::update(
             db,
             id,

@@ -10,7 +10,7 @@ use rocket::{get, post, State};
 
 use crate::agent::AgentManager;
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::DB;
 use crate::events::{Changes, Kind};
 use crate::project::lifecycle;
 use crate::project::{Card, CardEdit, Lane, NewCard, Project};
@@ -50,7 +50,7 @@ pub const ADD_PROJECT: &str = "addproject";
 
 /// Renders the board with an overlay over it.
 pub struct Shell<'a> {
-    pub db: &'a Db,
+    pub db: &'a DB,
     pub settings: &'a Settings,
     pub cache: &'a DiffCache,
 }
@@ -151,7 +151,7 @@ impl Shell<'_> {
 
 #[get("/projects/<id>")]
 pub async fn board(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -169,7 +169,7 @@ pub async fn board(
 /// The board with nothing selected — whichever project was added first, or an
 /// empty shell asking for one.
 #[get("/")]
-pub async fn index(db: &State<Db>, settings: &State<Settings>, cache: &State<DiffCache>) -> Tmpl {
+pub async fn index(db: &State<DB>, settings: &State<Settings>, cache: &State<DiffCache>) -> Tmpl {
     let project = Project::all(db).await.into_iter().next();
     Shell {
         db,
@@ -183,7 +183,7 @@ pub async fn index(db: &State<Db>, settings: &State<Settings>, cache: &State<Dif
 /// The project switcher, over whichever board it was opened from.
 #[get("/projects?<board>")]
 pub async fn switcher(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     board: Option<i64>,
@@ -200,7 +200,7 @@ pub async fn switcher(
 
 #[get("/projects/<id>/cards/new")]
 pub async fn new_card(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -220,7 +220,7 @@ pub async fn new_card(
 /// The card form, on a card that has not been started yet.
 #[get("/cards/<id>/edit")]
 pub async fn edit_card(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
@@ -251,7 +251,7 @@ pub async fn edit_card(
 /// can be refused — the chip asking for a branch that has gone, a merge already
 /// out — and a refusal nobody can read is a control that looks broken.
 pub async fn card_view(
-    db: &Db,
+    db: &DB,
     manager: &AgentManager,
     settings: &Settings,
     cache: &DiffCache,
@@ -352,7 +352,7 @@ impl Fields {
 /// that is almost certainly warm.
 #[get("/projects/<id>/branches?<q>&<card>&<base_branch>")]
 pub async fn branch_menu(
-    db: &State<Db>,
+    db: &State<DB>,
     id: i64,
     q: Option<&str>,
     card: Option<i64>,
@@ -443,7 +443,7 @@ fn chosen_vcs(project: &Project, requested: Option<&str>) -> VCS {
 
 #[post("/projects/<id>/cards", data = "<form>")]
 pub async fn create_card(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     changes: &State<Changes>,
@@ -454,7 +454,7 @@ pub async fn create_card(
 }
 
 async fn create(
-    db: &Db,
+    db: &DB,
     settings: &Settings,
     cache: &DiffCache,
     changes: &Changes,
@@ -508,7 +508,7 @@ async fn create(
 /// read when the session opens, so until then it is all still a draft.
 #[post("/cards/<id>", data = "<form>")]
 pub async fn update_card(
-    db: &State<Db>,
+    db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     changes: &State<Changes>,
@@ -519,7 +519,7 @@ pub async fn update_card(
 }
 
 async fn update(
-    db: &Db,
+    db: &DB,
     settings: &Settings,
     cache: &DiffCache,
     changes: &Changes,
@@ -596,7 +596,7 @@ pub struct BaseForm {
 /// `head_ttl` and show the branch the card used to have.
 #[post("/cards/<id>/base", data = "<form>")]
 pub async fn set_base(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -667,7 +667,7 @@ fn permission_mode(requested: &str) -> &'static str {
 
 /// The project a URL names, falling back to the first one so an overlay always
 /// has a board behind it.
-pub async fn current(db: &Db, id: Option<i64>) -> Option<Project> {
+pub async fn current(db: &DB, id: Option<i64>) -> Option<Project> {
     if let Some(project) = id {
         if let Some(found) = Project::find(db, project).await {
             return Some(found);
@@ -685,7 +685,7 @@ pub struct MoveForm {
 
 #[post("/cards/<id>/move", data = "<form>")]
 pub async fn move_card(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     changes: &State<Changes>,
@@ -703,7 +703,7 @@ pub async fn move_card(
 /// The same move from the card drawer, which stays open around it.
 #[post("/cards/<id>/lane", data = "<form>")]
 pub async fn move_card_to_lane(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     changes: &State<Changes>,
@@ -729,7 +729,7 @@ pub async fn move_card_to_lane(
 /// through; see the note on `webhooks::receive`.
 #[allow(clippy::too_many_arguments)]
 async fn relane(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     changes: &State<Changes>,
@@ -770,7 +770,7 @@ async fn relane(
 
 #[post("/cards/<id>/delete")]
 pub async fn delete_card(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -782,7 +782,7 @@ pub async fn delete_card(
 }
 
 async fn remove(
-    db: &Db,
+    db: &DB,
     manager: &Arc<AgentManager>,
     settings: &Settings,
     cache: &DiffCache,
@@ -807,7 +807,7 @@ async fn remove(
 /// so there is nothing left to go back to.
 #[post("/projects/<id>/cards/garbage")]
 pub async fn collect_garbage(
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,

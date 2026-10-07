@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use crate::agent::messaging::Inbox;
 use crate::agent::{Agent, AgentManager};
 use crate::config::Settings;
-use crate::db::Db;
+use crate::db::DB;
 use crate::events::Kind;
 use crate::project::lifecycle;
 use crate::project::{Card, Project};
@@ -105,7 +105,7 @@ pub fn session_start(caller: Caller, payload: Json<Value>) -> Result<Json<Value>
 #[post("/hooks/<_>/<card_id>/<event>", data = "<payload>")]
 pub async fn receive(
     caller: Caller,
-    db: &State<Db>,
+    db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
@@ -132,7 +132,7 @@ pub async fn receive(
 /// as nothing at all.
 struct Server<'a> {
     agent: &'a Agent,
-    db: &'a Db,
+    db: &'a DB,
     manager: &'a Arc<AgentManager>,
     settings: &'a Settings,
     cache: &'a DiffCache,
@@ -205,7 +205,7 @@ async fn answer(
 }
 
 async fn on_stop(
-    db: &Db,
+    db: &DB,
     manager: &Arc<AgentManager>,
     settings: &Settings,
     cache: &DiffCache,
@@ -249,7 +249,7 @@ fn is_paused(payload: &Value) -> bool {
 }
 
 async fn snapshot(
-    db: &Db,
+    db: &DB,
     settings: &Settings,
     card_id: i64,
     last_message: &str,
@@ -329,7 +329,7 @@ fn title_in(transcript: &str) -> Option<String> {
     given.flatten().or_else(|| generated.flatten())
 }
 
-async fn record_event(db: &Db, card_id: i64, kind: &str, payload: &Value) {
+async fn record_event(db: &DB, card_id: i64, kind: &str, payload: &Value) {
     let _ = sqlx::query("INSERT INTO events (card_id, kind, payload_json) VALUES (?1, ?2, ?3)")
         .bind(card_id)
         .bind(kind)
