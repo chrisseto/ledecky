@@ -212,6 +212,18 @@
       {% endfor %}
     </div>
 
+    {# What the last send did, answered with the pane and not as a status
+       nobody sees. A refused send keeps its batch below this; a send that
+       completed can also leave a note.
+
+       NB: `review_note` and not `error`. This file is included with the
+       drawer's context, and `error` is the drawer's own bar. It sits above the
+       batch rather than inside it, because the batch comes back out of band on
+       its own and does not carry this. #}
+    {% if review_note %}
+      <p class="review-note error">{{ icon("alert-triangle") }} {{ review_note }}</p>
+    {% endif %}
+
     {% with oob = false %}{% include "_batch.html" %}{% endwith %}
     {% include "_pane_source.html" %}
   </div>

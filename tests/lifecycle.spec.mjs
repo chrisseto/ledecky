@@ -1056,6 +1056,13 @@ test("collecting the garbage reclaims what the finished card still held", async 
   // Its review cannot be reopened, though — the refs its turns name are gone, so
   // the drawer declines rather than trying to diff against nothing.
   expect((await page.request.get(`/cards/${cardId}`)).status()).toBe(404);
+
+  // And a merge posted at it is turned away on its lane rather than rebuilding
+  // the worktree this just reclaimed to look for commits that left with it.
+  // Needing a running agent used to turn it away by itself. 404 rather than the
+  // 409 a live card gets: a collected one has no page to answer with either.
+  expect((await page.request.post(`/cards/${cardId}/merge`)).status()).toBe(404);
+  expect(existsSync(worktreeOf(cardId))).toBe(false);
 });
 
 test("a merge already out refuses a change of base", async ({ page }) => {
@@ -1076,7 +1083,12 @@ test("a merge already out refuses a change of base", async ({ page }) => {
   const refused = await page.request.post(`/cards/${id}/base`, { form: { base_branch: "main" } });
   expect(refused.status()).toBe(409);
   // The status carries the refusal; the body is the drawer saying why.
-  expect(await refused.text()).toContain("already waiting to land on release");
+  const body = await refused.text();
+  expect(body).toContain("already waiting to land on release");
+  // Once, in the drawer's own bar. The review pane is included with the drawer's
+  // context, so a shared key put every refusal in its footer as well, worded for
+  // a bar it is not.
+  expect(body.match(/already waiting to land on release/g)).toHaveLength(1);
 
   await openCard(page, id);
   await expect(page.locator(".branch-menu summary")).toContainText("release");

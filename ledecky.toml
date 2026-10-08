@@ -42,8 +42,10 @@ head_ttl = 30000
 # with `LEDECKY_*` so it does not have to wait in real time.
 #
 #   hook_grace      how long to wait for any hook before reporting misconfigured
-#   startup_timeout how long a starting session has to report its inbox socket
+#   startup_timeout how long a starting session has to report in
 #   dialog_grace    how long a requested dialog has to paint
+#   submit_grace    how long to wait for the hook that says the session took it
 hook_grace = 15000
 startup_timeout = 5000
 dialog_grace = 5000
+submit_grace = 1500

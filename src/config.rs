@@ -66,13 +66,19 @@ pub struct Settings {
     /// allowlist that does not name us.
     pub hook_grace: u64,
 
-    /// How long, in milliseconds, a starting session has to report its inbox
-    /// socket before it is taken to be blocked on a dialog.
+    /// How long, in milliseconds, a starting session has to report in before
+    /// it is taken to be blocked on a dialog.
     pub startup_timeout: u64,
 
     /// How long, in milliseconds, a requested dialog has to paint before the
     /// watcher gives up on it.
     pub dialog_grace: u64,
+
+    /// How long to wait, in milliseconds, for a session's `UserPromptSubmit`
+    /// hook after a message has been written at its terminal. Its arrival is
+    /// what says the message landed; the screen cannot say, because a paste is
+    /// collapsed to a placeholder that names nobody.
+    pub submit_grace: u64,
 
     /// Whether to gzip responses. Defaults on in release builds only.
     pub gzip: bool,
@@ -94,6 +100,7 @@ impl Default for Settings {
             hook_grace: 15_000,
             startup_timeout: 5000,
             dialog_grace: 5000,
+            submit_grace: 1500,
             gzip: !cfg!(debug_assertions),
         }
     }
@@ -143,6 +150,7 @@ pub struct Timings {
     pub hook_grace: Duration,
     pub startup_timeout: Duration,
     pub dialog_grace: Duration,
+    pub submit_grace: Duration,
 }
 
 impl Settings {
@@ -172,6 +180,7 @@ impl Settings {
             hook_grace: Duration::from_millis(self.hook_grace),
             startup_timeout: Duration::from_millis(self.startup_timeout),
             dialog_grace: Duration::from_millis(self.dialog_grace),
+            submit_grace: Duration::from_millis(self.submit_grace),
         }
     }
 
@@ -282,6 +291,7 @@ mod tests {
         assert_eq!(t.hook_grace, Duration::from_secs(15));
         assert_eq!(t.startup_timeout, Duration::from_secs(5));
         assert_eq!(t.dialog_grace, Duration::from_secs(5));
+        assert_eq!(t.submit_grace, Duration::from_millis(1500));
     }
 
     #[test]

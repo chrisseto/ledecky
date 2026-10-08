@@ -12,21 +12,21 @@ use std::path::Path;
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use pty_process::Command;
 use rocket::fairing::{self, Fairing, Info};
 use rocket::tokio::sync::mpsc;
-use rocket::tokio::task::spawn_blocking;
 use rocket::{Orbit, Rocket};
 
 use crate::agent::agent::{self, Watcher};
-use crate::agent::{messaging, Agent};
+use crate::agent::Agent;
 use crate::config::{Settings, Timings};
 use crate::db::DB;
 use crate::events::{Changes, Kind};
 use crate::hooks::HookAuth;
-use crate::project::{AgentState, Card, Lane, Project};
+use crate::project::{lifecycle, AgentState, Card, Lane, Project};
 use crate::vcs::git;
+use crate::watch::Worktrees;
 
 /// How often a starting session is re-checked while it proves itself.
 const STARTUP_POLL: Duration = Duration::from_millis(100);
@@ -122,6 +122,7 @@ impl AgentManager {
         card: &Card,
         worktree: &Path,
         repo: &Path,
+        prompt: Option<&str>,
     ) -> Result<Arc<Agent>> {
         if let Some(existing) = self.get(card.id) {
             if existing.is_running() {
@@ -132,7 +133,7 @@ impl AgentManager {
             self.evict(card.id);
         }
 
-        let cmd = self.command(card, worktree, repo);
+        let cmd = self.command(card, worktree, repo, prompt);
         let (agent, reader) = Agent::attach(cmd, self.settings.timings())?;
 
         self.agents.write().unwrap().insert(card.id, agent.clone());
@@ -146,7 +147,7 @@ impl AgentManager {
     }
 
     /// The command line for a card's agent.
-    fn command(&self, card: &Card, worktree: &Path, repo: &Path) -> Command {
+    fn command(&self, card: &Card, worktree: &Path, repo: &Path, prompt: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.settings.agent_bin);
         // Restarting a card picks the conversation back up rather than starting
         // over with no memory of the work already done.
@@ -171,9 +172,20 @@ impl AgentManager {
         // `bypassPermissions` dialogs and submits it once they are answered, so
         // nothing here has to watch a screen to find out whether it landed.
         //
+        // A `prompt` given here is a message for a session being brought back to
+        // deliver it — a review batch, a merge request — and takes the same road
+        // for the same reason. It wins over the card's own task; see
+        // `lifecycle::start_with`.
+        //
         // NB: `--` first. A task is the user's prose and may well start with a
-        // dash, which would otherwise be read as a flag.
-        if let Some(prompt) = card.opening_prompt() {
+        // dash, which would otherwise be read as a flag. A positional prompt is
+        // accepted beside `--resume`, which is what makes this work for a
+        // session that already exists.
+        let opening = match prompt {
+            Some(prompt) => Some(prompt.to_owned()),
+            None => card.opening_prompt(),
+        };
+        if let Some(prompt) = opening {
             cmd = cmd.arg("--").arg(prompt);
         }
 
@@ -368,7 +380,11 @@ impl AgentManager {
     /// The server never rewrites the user's branches itself — conflicts are exactly
     /// the situation an agent is good at, and a failed rebase run by the server
     /// would just leave a mess for someone else to unpick.
-    pub async fn request_merge(&self, card_id: i64) -> Result<()> {
+    pub async fn request_merge(
+        self: &Arc<Self>,
+        worktrees: &Worktrees,
+        card_id: i64,
+    ) -> Result<()> {
         let card = Card::find(&self.db, card_id)
             .await
             .context("no such card")?;
@@ -376,11 +392,14 @@ impl AgentManager {
             .await
             .context("no such project")?;
 
-        let inbox = self
-            .running(card_id)
-            .context("the agent is not running")?
-            .inbox()
-            .context("the session has not reported an inbox socket")?;
+        // NB: the lane, not the agent. Requiring a running one used to turn this
+        // away by itself; now that a stopped card starts one, a merge posted at
+        // a card that has been retired would build its worktree back and look
+        // for commits that left with it.
+        anyhow::ensure!(
+            card.lane == Lane::InReview,
+            "a merge is only asked for from In Review"
+        );
 
         let repo = project.repo();
         let base_sha = git::run(&repo, &["rev-parse", &card.base_branch])
@@ -392,15 +411,14 @@ impl AgentManager {
         // without this reads the turn as ordinary work.
         Card::request_merge(&self.db, card_id, &base_sha).await;
 
-        // NB: on the blocking pool. The inbox is a unix socket written under a
-        // timeout, which blocks the thread it is on however short it is.
+        // The prompt is the backend's: git and jj land work differently.
         let prompt = crate::vcs::merge_prompt(card.vcs, &card.base_branch, &repo);
-        let sent = spawn_blocking(move || messaging::send(&inbox, &prompt))
+        if !lifecycle::deliver(self, &self.settings, worktrees, card_id, &prompt)
             .await
-            .expect("asking for a merge panicked");
-        if let Err(err) = sent {
+            .landed()
+        {
             Card::clear_merge_request(&self.db, card_id).await;
-            return Err(err).context("asking the agent to merge");
+            bail!("the merge request could not be delivered");
         }
 
         self.changes.card(&self.db, card_id, Kind::Board).await;
@@ -455,12 +473,12 @@ enum Startup {
 
 /// Waits for the session to say it is up, to die, or to put a dialog up.
 ///
-/// Readiness is the `SessionStart` hook reporting its inbox socket. That event
-/// fires only once the client is past the workspace-trust and
-/// `bypassPermissions` dialogs, so it separates a session that is ready from one
-/// waiting on somebody far better than watching the screen for an input box did
-/// — and the same wait answers whether a `--resume` took, since a resume that
-/// finds nothing exits without ever firing it.
+/// Readiness is the `SessionStart` hook reporting in. That event fires only
+/// once the client is past the workspace-trust and `bypassPermissions` dialogs,
+/// so it separates a session that is ready from one waiting on somebody far
+/// better than watching the screen for an input box does — and the same wait
+/// answers whether a `--resume` took, since a resume that finds nothing exits
+/// without ever firing it.
 ///
 /// NB: the screen is polled rather than read once at the end. The client takes
 /// seconds to paint, and where it lands in that window is not something to race:
@@ -468,7 +486,7 @@ enum Startup {
 async fn settled(agent: &Agent, within: Duration) -> Startup {
     let checks = within.as_millis() / STARTUP_POLL.as_millis().max(1);
     for _ in 0..checks {
-        if agent.inbox().is_some() {
+        if agent.is_ready() {
             return Startup::Ready;
         }
         if !agent.is_running() {

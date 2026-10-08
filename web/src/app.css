@@ -484,15 +484,21 @@ header.top {
   white-space: nowrap;
 }
 
-.drawer-error {
+.drawer-error,
+.review-note {
   display: flex;
   align-items: center;
   gap: 7px;
   padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
   background: oklch(0.62 0.15 25 / 0.1);
 }
-.drawer-error .icon { width: 14px; height: 14px; flex: none; }
+
+.drawer-error { border-bottom: 1px solid var(--border); }
+/* Above the batch footer, so the comments it refused are still below it. */
+.review-note { border-top: 1px solid var(--border); }
+
+.drawer-error .icon,
+.review-note .icon { width: 14px; height: 14px; flex: none; }
 
 .drawer-projects .drawer-head { padding: 14px 18px; }
 

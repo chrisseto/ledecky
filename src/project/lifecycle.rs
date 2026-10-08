@@ -2,19 +2,20 @@
 //! work has landed.
 //!
 //! These are the operations that cross subsystems — git, the diff cache, the
-//! worktree watcher and the agent manager all at once — which is why they live
-//! above the manager rather than in it. `teardown`'s other caller deletes a
-//! card and involves no agent at all.
+//! worktree watcher and the agent manager all at once — which is why they sit
+//! here rather than in the manager, which holds none of the first three.
+//! `teardown`'s other caller deletes a card and involves no agent at all.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::agent::agent::Paste;
 use crate::agent::{Agent, AgentManager};
 use crate::config::Settings;
 use crate::events::Kind;
-use crate::project::{Card, Lane, Project};
+use crate::project::{AgentState, Card, Lane, Project};
 use crate::review::DiffCache;
 use crate::vcs::git;
 use crate::vcs::{self, Worktree};
@@ -27,6 +28,32 @@ pub async fn start(
     worktrees: &Worktrees,
     card_id: i64,
 ) -> Result<Arc<Agent>> {
+    Ok(start_with(manager, settings, worktrees, card_id, None)
+        .await?
+        .agent)
+}
+
+/// A started agent, and whether the `prompt` it was given went in with it.
+pub struct Started {
+    pub agent: Arc<Agent>,
+    /// False whenever the caller's `prompt` went nowhere: one was already
+    /// running, or a failed `--resume` sent us back with the card's own task
+    /// instead. A caller with a message to deliver has to type it in itself.
+    pub carried_prompt: bool,
+}
+
+/// The same, with `prompt` as the session's opening task.
+///
+/// NB: a given `prompt` wins over the card's own, which only ever goes in on a
+/// session's first start — and a card still waiting for that has no turns, so
+/// nothing to review and nothing to merge.
+pub async fn start_with(
+    manager: &Arc<AgentManager>,
+    settings: &Settings,
+    worktrees: &Worktrees,
+    card_id: i64,
+    prompt: Option<&str>,
+) -> Result<Started> {
     let db = manager.db();
     let changes = manager.changes();
     let timings = settings.timings();
@@ -37,7 +64,10 @@ pub async fn start(
         .context("no such project")?;
 
     if let Some(existing) = manager.running(card_id) {
-        return Ok(existing);
+        return Ok(Started {
+            agent: existing,
+            carried_prompt: false,
+        });
     }
 
     let repo = project.repo();
@@ -64,8 +94,10 @@ pub async fn start(
     let card = Card::find(db, card_id).await.context("card vanished")?;
 
     let mut agent = manager
-        .spawn(&card, &worktree, &repo)
+        .spawn(&card, &worktree, &repo, prompt)
         .context("spawning the agent")?;
+
+    let mut carried_prompt = prompt.is_some();
 
     // A recorded session can stop being resumable — a transcript that was never
     // written, or one since pruned. `--resume` then exits before starting,
@@ -76,9 +108,15 @@ pub async fn start(
         Card::clear_session_id(db, card_id).await;
 
         let card = Card::find(db, card_id).await.context("card vanished")?;
+        // NB: without `prompt`. This is a conversation that knows nothing of the
+        // work a review or a merge request is about, and its own task is what it
+        // needs — the card's task would otherwise be lost for good, since the
+        // fresh session records an id straight away and `opening_prompt` never
+        // offers it again. The caller is told the message did not go.
         agent = manager
-            .spawn(&card, &worktree, &repo)
+            .spawn(&card, &worktree, &repo, None)
             .context("spawning the agent")?;
+        carried_prompt = false;
     }
 
     Card::set_agent_pid(db, card_id, agent.pid).await;
@@ -103,7 +141,96 @@ pub async fn start(
     let started = agent.clone();
     rocket::tokio::spawn(watching.watch_startup(started, card_id, timings));
 
-    Ok(agent)
+    Ok(Started {
+        agent,
+        carried_prompt,
+    })
+}
+
+/// What became of a message handed to a card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Typed at the session that was already running, and acknowledged by it.
+    Pasted,
+    /// Handed to a session started to take it.
+    Opened,
+    /// A dialog holds the terminal, so there was nowhere to put it.
+    Blocked,
+    /// The terminal's input box already held something, which is not ours.
+    Occupied,
+    /// Written at the terminal, but the session never said it took it.
+    Unconfirmed,
+    /// The terminal submitted something that was not this: a draft the emptiness
+    /// check could not see went to the agent in its place.
+    Displaced,
+    /// Delivered, but a draft the emptiness check could not see went with it.
+    Merged,
+    /// Nothing was running, and nothing could be started.
+    Failed,
+}
+
+impl Delivery {
+    /// Whether the message reached the agent. `Merged` did: something of the
+    /// user's went with it, which is worth saying but is not a failure to send.
+    pub fn landed(self) -> bool {
+        matches!(self, Delivery::Pasted | Delivery::Opened | Delivery::Merged)
+    }
+}
+
+impl From<Paste> for Delivery {
+    fn from(paste: Paste) -> Self {
+        match paste {
+            Paste::Submitted => Delivery::Pasted,
+            Paste::NoBox => Delivery::Blocked,
+            Paste::Occupied => Delivery::Occupied,
+            Paste::Unconfirmed => Delivery::Unconfirmed,
+            Paste::Displaced => Delivery::Displaced,
+            Paste::Merged => Delivery::Merged,
+        }
+    }
+}
+
+/// Gets `message` to the card's agent, starting one for it if none is running.
+///
+/// A running session takes it as a paste. A stopped one takes it the way an
+/// opening task arrives: on the command line of the session started to deliver
+/// it, so the client holds it behind the startup dialogs and submits it itself.
+/// That road has no screen to watch and nothing to wait for here, which is why
+/// a cold start is not the slow case it would be if the message had to be
+/// pasted once the client finished drawing itself.
+pub async fn deliver(
+    manager: &Arc<AgentManager>,
+    settings: &Settings,
+    worktrees: &Worktrees,
+    card_id: i64,
+    message: &str,
+) -> Delivery {
+    if let Some(agent) = manager.running(card_id) {
+        // Hook-derived, and asked before the screen is: `Notification` says a
+        // dialog was put up, and only a redraw ever says it has gone — so a card
+        // still recorded as waiting is one to leave alone, whatever the screen
+        // has got round to painting.
+        let waiting = Card::find(manager.db(), card_id)
+            .await
+            .is_some_and(|card| card.agent_state == AgentState::AwaitingUser);
+        if waiting {
+            return Delivery::Blocked;
+        }
+
+        return agent.paste(message).await.into();
+    }
+
+    match start_with(manager, settings, worktrees, card_id, Some(message)).await {
+        Ok(started) if started.carried_prompt => Delivery::Opened,
+        // It is up, but took something other than this message: one was already
+        // running by the time we looked again, or a failed `--resume` handed the
+        // fresh session the card's own task. Either way it still has to be typed.
+        Ok(started) => started.agent.paste(message).await.into(),
+        Err(err) => {
+            error!("card {card_id}: starting an agent to deliver a message: {err:#}");
+            Delivery::Failed
+        }
+    }
 }
 
 /// Kills the agent and removes the worktree. Turn refs are kept.

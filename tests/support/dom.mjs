@@ -19,3 +19,22 @@ export const terminalInput = (page) => terminal(page).locator(".xterm-helper-tex
 
 /** The grid xterm reports mouse positions against: its own box, not the pane's. */
 export const terminalScreen = (page) => terminal(page).locator(".xterm-screen");
+
+/**
+ * Pastes `text` into the terminal pane, as a person would.
+ *
+ * Built in the page rather than with `dispatchEvent`, which knows nothing about
+ * `paste` and would hand xterm a plain `Event` carrying no `clipboardData` —
+ * and built on the textarea, because xterm's own handler stops the event, so
+ * this fires it exactly once. Chromium's Ctrl+V is not an option: Playwright
+ * sends the keys without the editing command behind them, so nothing pastes.
+ */
+export async function pasteIntoTerminal(page, text) {
+  await terminalInput(page).evaluate((textarea, pasted) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", pasted);
+    textarea.dispatchEvent(
+      new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }),
+    );
+  }, text);
+}

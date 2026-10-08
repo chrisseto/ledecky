@@ -7,7 +7,6 @@ use rocket::serde::json::Json;
 use rocket::{post, State};
 use serde_json::{json, Value};
 
-use crate::agent::messaging::Inbox;
 use crate::agent::{Agent, AgentManager};
 use crate::config::Settings;
 use crate::db::DB;
@@ -63,36 +62,21 @@ impl<'r> FromRequest<'r> for Caller {
     }
 }
 
-/// Receives a session's inbox socket, reported by the `SessionStart` hook.
+/// Receives a session saying it is up, reported by the `SessionStart` hook.
 ///
 /// NB: off `/hooks` on purpose. This is posted by a re-execution of this binary
 /// (`hooks::dispatch`), not by Claude Code, so it carries none of the turn
 /// payload the others share — and it must not be recorded as a hook event,
 /// because its arrival proves only that *we* can reach ourselves. Whether Claude
 /// Code's own HTTP hooks land is the separate question `watch_startup` asks.
-#[post("/inbox/<_>/<_>", data = "<payload>")]
-pub fn session_start(caller: Caller, payload: Json<Value>) -> Result<Json<Value>, Status> {
-    let socket = payload
-        .get("socket")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if socket.is_empty() {
-        return Err(Status::BadRequest);
-    }
-
+#[post("/ready/<_>/<_>")]
+pub fn session_start(caller: Caller) -> Json<Value> {
     let Caller(agent) = caller;
     if agent.is_running() {
-        agent.set_inbox(Inbox {
-            socket: socket.to_owned(),
-            token: payload
-                .get("token")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        });
+        agent.mark_ready();
     }
 
-    Ok(Json(json!({})))
+    Json(json!({}))
 }
 
 /// Receives Claude Code's HTTP hooks. Always answers 200 with an empty decision:
@@ -184,7 +168,14 @@ async fn answer(
     }
 
     match event {
-        "prompt" => manager.turn_started(card_id).await,
+        "prompt" => {
+            // Before the state change, because a message the server sent is
+            // waiting on exactly this to know it arrived.
+            if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
+                agent.record_prompt(prompt);
+            }
+            manager.turn_started(card_id).await;
+        }
         // NB: a tool permission, a question, a plan to approve and an MCP
         // elicitation all arrive here — which is why the card says "needs you"
         // rather than naming one of them. Nothing reports the answer, so the

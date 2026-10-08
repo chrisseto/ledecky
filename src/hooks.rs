@@ -37,7 +37,7 @@ const EVENTS: &[(&str, &str, Option<&str>)] = &[
 
 const HOOK_TIMEOUT_SECS: u32 = 10;
 
-/// Subcommand a re-execution uses to report the session's inbox.
+/// Subcommand a re-execution uses to report that the session is up.
 const SESSION_START: &str = "session-start";
 
 /// First argument marking a re-execution as a hook rather than a server start.
@@ -89,13 +89,13 @@ impl HookAuth {
         format!("{}/hooks/{}/{card_id}/{event}", self.origin(), self.token)
     }
 
-    /// Where a session reports its inbox socket.
+    /// Where a session reports that it is up.
     ///
     /// NB: deliberately not under `/hooks`. Nothing Claude Code sends arrives
     /// here — it is posted by a re-execution of this binary — and a fourth
     /// segment there would collide with the `<event>` the real hooks use.
-    pub fn inbox_url(&self, card_id: i64) -> String {
-        format!("{}/inbox/{}/{card_id}", self.origin(), self.token)
+    pub fn ready_url(&self, card_id: i64) -> String {
+        format!("{}/ready/{}/{card_id}", self.origin(), self.token)
     }
 
     /// The `Host` every callback arrives with.
@@ -137,33 +137,30 @@ impl HookAuth {
 
         hooks.insert("SessionStart".to_owned(), self.session_start_hook(card_id));
 
-        // A message we send is not from one of the session's own children, so
-        // without this a card running `bypassPermissions` would hold every
-        // review behind an approval dialog instead of delivering it.
-        json!({ "hooks": hooks, "crossSessionInbound": "accept" })
+        json!({ "hooks": hooks })
     }
 
     pub fn settings_json(&self, card_id: i64) -> String {
         self.settings(card_id).to_string()
     }
 
-    /// Asks the session to report its inbox socket by re-executing this binary.
+    /// Asks the session to say it is up by re-executing this binary.
     ///
-    /// `CLAUDE_CODE_MESSAGING_SOCKET` is exported to hooks as an environment
-    /// variable, so only a `command` handler can see it — an HTTP POST carries
-    /// nothing of the sort. Running ourselves rather than `curl` keeps the hook
-    /// free of anything that has to be installed on the agent's path.
+    /// A `command` handler rather than an HTTP one because an HTTP hook on
+    /// `SessionStart` silently never fires; see `EVENTS`. Running ourselves
+    /// rather than `curl` keeps the hook free of anything that has to be
+    /// installed on the agent's path.
     ///
-    /// That this is a command hook is also why it is worth anything as a signal:
-    /// the event fires once the client is up and past the workspace-trust and
-    /// `bypassPermissions` dialogs, which have no hook of their own, so its
-    /// arrival is how `session::watch_startup` tells a session that is ready from
-    /// one still blocked on somebody.
+    /// The event is worth having because it fires once the client is up and past
+    /// the workspace-trust and `bypassPermissions` dialogs, which have no hook
+    /// of their own — so its arrival is how `watch_startup` tells a session that
+    /// is ready from one still blocked on somebody, and nothing is pasted at a
+    /// screen that would swallow it.
     fn session_start_hook(&self, card_id: i64) -> Value {
         let command = format!(
             "{} {HOOK_ARG} {SESSION_START} {}",
             shell_quote(&self.exe),
-            shell_quote(&self.inbox_url(card_id))
+            shell_quote(&self.ready_url(card_id))
         );
 
         json!([{
@@ -177,10 +174,10 @@ impl HookAuth {
 /// Returns `None` for an ordinary server start. `SessionStart` is the one event
 /// Claude Code will not deliver over HTTP, so the settings point it at this
 /// binary instead and the answer comes back in here — a second, short-lived
-/// process that reports the session's inbox and exits.
+/// process that says the session is up and exits.
 pub fn dispatch(args: &[String]) -> Option<Result<()>> {
     match args {
-        [arg, event, url] if arg == HOOK_ARG && event == SESSION_START => Some(report_inbox(url)),
+        [arg, event, url] if arg == HOOK_ARG && event == SESSION_START => Some(report_ready(url)),
         [arg, ..] if arg == HOOK_ARG => Some(Err(anyhow::anyhow!(
             "usage: {HOOK_ARG} {SESSION_START} <url>"
         ))),
@@ -188,16 +185,12 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
     }
 }
 
-/// Posts this session's inbox socket to the server.
-fn report_inbox(url: &str) -> Result<()> {
-    let socket = std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").unwrap_or_default();
-    if socket.is_empty() {
-        bail!("CLAUDE_CODE_MESSAGING_SOCKET is unset; this agent predates cross-session messaging");
-    }
-    let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").unwrap_or_default();
-
-    let body = json!({ "socket": socket, "token": token }).to_string();
-    post(url, &body)
+/// Tells the server this session is up.
+///
+/// NB: the arrival is the whole payload. Everything the server wants to know
+/// about the session it learns from the HTTP hooks and the pty.
+fn report_ready(url: &str) -> Result<()> {
+    post(url, "{}")
 }
 
 /// A one-shot HTTP POST, enough for a localhost callback to our own server.
@@ -363,24 +356,14 @@ mod tests {
         // Defining this key anywhere turns the allowlist on for every hook the
         // user has, including ones we know nothing about.
         assert!(settings.get("allowedHttpHookUrls").is_none());
-        // Only the two keys we mean to set.
+        // Hooks are the only key we mean to set.
         let keys: Vec<&String> = settings.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["crossSessionInbound", "hooks"]);
+        assert_eq!(keys, ["hooks"]);
     }
 
-    /// A message from us is not an own-child message, and the inbound default
-    /// holds one of those in a session that bypasses permission prompts. Without
-    /// this key a `bypassPermissions` card would strand every review behind an
-    /// approval dialog.
-    #[test]
-    fn settings_accept_inbound_messages() {
-        let (_, settings) = settings_for(1);
-        assert_eq!(settings["crossSessionInbound"], "accept");
-    }
-
-    /// Only a `command` handler sees `CLAUDE_CODE_MESSAGING_SOCKET`; it is an
-    /// environment variable, not anything an HTTP payload carries. The command
-    /// is this binary, so the hook needs nothing installed on the agent's path.
+    /// An HTTP hook on `SessionStart` silently never fires, so this one has to
+    /// be a `command` handler. The command is this binary, so the hook needs
+    /// nothing installed on the agent's path.
     #[test]
     fn session_start_re_executes_this_binary() {
         let (auth, settings) = settings_for(42);
@@ -389,7 +372,7 @@ mod tests {
         assert_eq!(handler["type"], "command");
         let command = handler["command"].as_str().unwrap();
         assert!(command.starts_with(&shell_quote(&auth.exe)));
-        assert!(command.ends_with(&format!("{SESSION_START} '{}'", auth.inbox_url(42))));
+        assert!(command.ends_with(&format!("{SESSION_START} '{}'", auth.ready_url(42))));
     }
 
     /// `dispatch` has to accept the arguments the settings emit, or the hook
@@ -398,7 +381,7 @@ mod tests {
     #[test]
     fn dispatch_accepts_what_the_hook_command_passes() {
         let auth = HookAuth::new(local(9999));
-        let url = auth.inbox_url(42);
+        let url = auth.ready_url(42);
 
         let command = auth.settings(42)["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()

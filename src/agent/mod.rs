@@ -3,7 +3,6 @@
 
 pub mod agent;
 pub mod manager;
-pub mod messaging;
 pub mod terminal;
 pub mod webhooks;
 

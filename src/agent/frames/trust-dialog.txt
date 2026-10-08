@@ -1,0 +1,20 @@
+cursor 18 0
+--
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /tmp/claude-1000/-home-chrisseto--local-share-ledecky-worktrees-68/fbb789f1-51af-4fec-b528-4da8e27c36b7/scratchpad/pro
+ be-repo
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel

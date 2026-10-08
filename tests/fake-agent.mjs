@@ -7,9 +7,8 @@
 //
 //   * an opening task taken as a positional argument, submitted on its own
 //     once the client is up;
-//   * a per-session inbox socket, whose path it reports by running the
-//     SessionStart command hook out of its own --settings — which is both how
-//     the server sends it anything and how the server knows it has started;
+//   * a readiness ping: it runs the SessionStart command hook out of its own
+//     --settings, which is how the server knows it has started;
 //   * a startup window where it has drawn nothing yet and the SessionStart hook
 //     has not run, which the server must not mistake for being ready;
 //   * dying on "k" without a SessionEnd hook, the way a crash or an outside
@@ -22,8 +21,10 @@
 //   * a permission mode recorded in its transcript, which `--resume` without
 //     --permission-mode picks back up. `[mode:<name>]` in a prompt changes it,
 //     standing in for shift+tab or approving a plan;
-//   * bracketed paste, because a person pasting into the pane is the one thing
-//     that does arrive by being typed at the terminal;
+//   * bracketed paste, which is how everything but the opening task arrives —
+//     a review batch and a merge request the server types at the terminal, and
+//     a person pasting into the pane. A paste goes nowhere while the client is
+//     still drawing itself or a modal is up, and only a bare Enter submits it;
 //   * mouse reporting on "m", in the default encoding — the one xterm.js sends
 //     over `onBinary` rather than `onData`. Behind a key rather than always on,
 //     and to be left off in any spec that scrolls the terminal: a protocol that
@@ -38,20 +39,20 @@
 // the base branch for real.
 
 import { execFileSync, execSync } from "node:child_process";
-import { createServer } from "node:net";
-import { createInterface } from "node:readline";
 import {
   appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 
 const ESC = "\u001b";
+// Verbatim from the real client: the marker, then a NON-BREAKING space. The
+// server reads the cursor against the width of this prefix, and a plain space
+// here let a bug through where every empty box read as one holding a draft.
+const MARKER = "\u276f\u00a0";
 const PASTE_START = `${ESC}[200~`;
 const PASTE_END = `${ESC}[201~`;
 const BEL = "\u0007";
@@ -106,10 +107,6 @@ const recordMode = () =>
   appendFileSync(transcriptPath, `${JSON.stringify({ type: "mode", permissionMode })}\n`);
 recordMode();
 
-// NB: in the system temp dir rather than under the card, because a unix socket
-// path is capped near 100 bytes and the suite's data directories are long.
-const socketPath = join(tmpdir(), `fake-agent-${process.pid}.sock`);
-
 const out = (s) => process.stdout.write(s);
 const transcript = [
   `fake-agent - ${sessionId}`,
@@ -142,49 +139,21 @@ setTimeout(() => {
   ready();
 }, Number(process.env.FAKE_AGENT_BOOT_MS ?? 4000));
 
-/**
- * Opens the inbox socket and runs the SessionStart command hook, which is how
- * the server learns where to send messages — and how it learns the session is
- * up.
- */
+/** Runs the SessionStart command hook, which is how the server learns the
+ * session is up. */
 function ready() {
-  const server = createServer((connection) => {
-    const lines = createInterface({ input: connection });
-    lines.on("line", (line) => {
-      let frame;
-      try {
-        frame = JSON.parse(line);
-      } catch {
-        return;
-      }
-      // The auth line opens the connection; the message follows it.
-      if (frame.type === "user") submit(frame.message.content);
-    });
-  });
-
-  // NB: everything below waits on the listen callback. Reporting the path
-  // before the socket accepts leaves the server a live path to connect to and
-  // nothing behind it, which is a flake rather than a failure.
-  server.listen(socketPath, () => {
-    const command = settings.hooks?.SessionStart?.[0]?.hooks?.[0]?.command;
-    if (command) {
-      try {
-        execSync(command, {
-          env: {
-            ...process.env,
-            CLAUDE_CODE_MESSAGING_SOCKET: socketPath,
-            CLAUDE_CODE_MESSAGING_TOKEN: `token-${process.pid}`,
-          },
-        });
-      } catch {
-        // A server that has gone away is not the fake agent's problem.
-      }
+  const command = settings.hooks?.SessionStart?.[0]?.hooks?.[0]?.command;
+  if (command) {
+    try {
+      execSync(command);
+    } catch {
+      // A server that has gone away is not the fake agent's problem.
     }
+  }
 
-    // The opening task was handed over on the command line and has been waiting
-    // for the client to be able to take it.
-    if (openingTask) submit(openingTask);
-  });
+  // The opening task was handed over on the command line and has been waiting
+  // for the client to be able to take it.
+  if (openingTask) submit(openingTask);
 }
 
 function render() {
@@ -204,6 +173,24 @@ function render() {
 
   out(`${ESC}[${ROWS - block.length};1H`);
   out(block.join("\r\n"));
+
+  // The real client leaves the cursor on its insertion point, and the server
+  // reads that to tell an empty box from one holding a draft — the text cannot
+  // say, because a long paste collapses to a placeholder.
+  //
+  // NB: stated rather than relied on. Drawing the composer last already leaves
+  // the cursor in the right place, so this changes nothing today; it is here so
+  // that reordering `render` cannot quietly move it. Only for the composer: a
+  // modal has no insertion point, and a client still drawing itself has no box.
+  if (!booting && !modal) {
+    const lines = shown.split("\n");
+    const last = lines[lines.length - 1];
+    // `composer` prefixes the marker row with MARKER and every continuation row
+    // with as many spaces, so the text starts at the same column either way.
+    // 1-based here.
+    const row = ROWS - block.length + 1 + (lines.length - 1);
+    out(`${ESC}[${row};${MARKER.length + last.length + 1}H`);
+  }
 }
 
 const border = () => "─".repeat(20);
@@ -212,11 +199,12 @@ const border = () => "─".repeat(20);
  * The input box.
  *
  * A typed message keeps the prompt marker on its first line only and runs plain
- * from there, exactly as the real client draws it.
+ * from there, and the continuation rows are indented to the marker's width,
+ * exactly as the real client draws it.
  */
 function composer() {
   const [first = "", ...rest] = shown.split("\n");
-  return [border(), `> ${first}`, ...rest.map((line) => `  ${line}`)];
+  return [border(), `${MARKER}${first}`, ...rest.map((line) => `  ${line}`)];
 }
 
 async function hook(event, body) {
@@ -318,7 +306,11 @@ async function submit(prompt) {
   // after submitting it, and only ever writes it to the transcript — never to a
   // hook payload. Derived from the prompt so the suite can still find the card
   // by the words it typed.
-  if (turn === 1) {
+  //
+  // Not on a resume: that session already has a name, and the server reads the
+  // latest title out of the transcript on every hook — so re-titling here would
+  // rename a card after whatever message brought its session back.
+  if (turn === 1 && !resuming) {
     appendFileSync(
       transcriptPath,
       `${JSON.stringify({
@@ -407,11 +399,6 @@ function answerModal(key) {
   // SessionEnd, no warning, just a pty that stops. The only thing that notices
   // is the server's pump reaching EOF.
   if (key === "k") {
-    try {
-      unlinkSync(socketPath);
-    } catch {
-      // Never opened.
-    }
     process.exit(1);
   }
 
@@ -516,17 +503,20 @@ process.stdin.on("data", (chunk) => {
       pasting += text.slice(0, end);
       text = text.slice(end + PASTE_END.length);
 
-      // Nothing the server sends arrives this way any more — this is a person
-      // pasting into the terminal pane. A client still drawing itself, or one
-      // with a modal up, has nowhere to put it.
+      // A client still drawing itself, or one with a modal up, has nowhere to
+      // put a paste. This is the gate the server polls for before it sends one,
+      // and the reason a review cannot land while a dialog is on screen.
       if (!booting && !modal) {
-        buffer = pasting;
+        // Appended, not assigned: a second paste joins whatever the box already
+        // holds rather than replacing it, which is what makes "the server must
+        // write before it submits" something a spec can tell apart.
+        buffer += pasting;
         shown =
-          pasting.length > 200
+          buffer.length > 200
             // The client normalises a paste's newlines to CR on the way out,
             // so what arrives here is not split on "\n".
-            ? `[Pasted text #1 +${pasting.split(/\r\n|\r|\n/).length} lines]`
-            : pasting;
+            ? `[Pasted text #1 +${buffer.split(/\r\n|\r|\n/).length} lines]`
+            : buffer;
       }
       pasting = null;
       render();
@@ -563,11 +553,6 @@ process.stdin.on("data", (chunk) => {
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(signal, () => {
-    try {
-      unlinkSync(socketPath);
-    } catch {
-      // Never opened, or already gone.
-    }
     hook("SessionEnd", { reason: signal }).finally(() => process.exit(0));
   });
 }

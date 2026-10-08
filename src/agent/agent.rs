@@ -5,9 +5,10 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use pty_process::{Command, OwnedReadPty, OwnedWritePty, Size};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch, Notify};
+use tokio::time::{timeout_at, Instant as Deadline};
 
-use crate::agent::messaging::Inbox;
 use crate::config::Timings;
 
 const DEFAULT_ROWS: u16 = 40;
@@ -16,6 +17,21 @@ const SCROLLBACK: usize = 5000;
 
 /// Rows at the bottom of the screen treated as the input box.
 const COMPOSER_ROWS: usize = 15;
+
+/// Moves the cursor to the end of whatever the input box holds.
+///
+/// NB: `CSI F`, which is what the client answers to; `SS3 F` and the `CSI n ~`
+/// forms go unread. Measured rather than assumed, because the wrong one is
+/// indistinguishable from a box that had nothing to move past.
+const END: &[u8] = b"\x1b[F";
+
+/// How many times a message is written before giving up on it.
+///
+/// NB: two, where the screen-reading version needed four. Each attempt now
+/// waits `Timings::submit_grace` on the session's own hook rather than polling
+/// the screen, so an attempt costs real time and a dropped paste is the only
+/// thing a second one buys.
+const PASTE_ATTEMPTS: u32 = 2;
 
 /// What the pty pump has seen.
 ///
@@ -49,6 +65,38 @@ enum Dialog {
     OnScreen,
 }
 
+/// What became of a message handed to a running session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paste {
+    /// The session's own hook came back carrying it.
+    Submitted,
+    /// There was no input box: a dialog holds the keyboard, or the client never
+    /// finished drawing itself.
+    NoBox,
+    /// The box already held something, which is not ours to send.
+    Occupied,
+    /// Written, but nothing came back to say the session took it.
+    Unconfirmed,
+    /// Submitted, along with something the box was already holding.
+    Merged,
+    /// Something else was submitted instead: the box held a draft the emptiness
+    /// check did not see, and the submit key sent that.
+    Displaced,
+}
+
+/// What the session acknowledged submitting, against what was asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Submission {
+    /// The prompt was ours and nothing else.
+    Ours,
+    /// Ours went, with something the box was already holding.
+    Merged,
+    /// Something else went, and ours did not.
+    Foreign,
+    /// Nothing was acknowledged.
+    Nothing,
+}
+
 /// One live `claude` process attached to a pty.
 pub struct Agent {
     /// Recorded so a later server run can sweep this up if we die without
@@ -66,10 +114,14 @@ pub struct Agent {
     output: broadcast::Sender<Bytes>,
     /// What the pump believes about a dialog, and when it started believing it.
     dialog: Mutex<(Dialog, Instant)>,
-    /// Where to send this session messages, once its `SessionStart` hook has
-    /// said. `None` until then, which is also how the manager tells a session
-    /// that is up from one still held by a dialog.
-    inbox: Mutex<Option<Inbox>>,
+    /// The last prompt this session reported submitting, whitespace squashed.
+    /// Sent by the `UserPromptSubmit` hook; awaited by [`Agent::paste`], which
+    /// is how a message is known to have arrived.
+    submitted: watch::Sender<Option<String>>,
+    /// Whether this session's `SessionStart` hook has reported in. `false`
+    /// until it does, which is how the manager tells a session that is up from
+    /// one still held by a dialog.
+    ready: watch::Sender<bool>,
     /// The real-time waits this agent makes, from `Settings`.
     timings: Timings,
 }
@@ -116,7 +168,8 @@ impl Agent {
             screen,
             output,
             dialog: Mutex::new((Dialog::None, Instant::now())),
-            inbox: Mutex::new(None),
+            submitted: watch::Sender::new(None),
+            ready: watch::Sender::new(false),
             timings,
         });
 
@@ -154,19 +207,219 @@ impl Agent {
     }
 
     pub async fn write_input(&self, bytes: &[u8]) {
+        self.write_run(&[bytes]).await;
+    }
+
+    /// Writes `parts` as one uninterrupted run.
+    ///
+    /// NB: one acquisition for the lot. The websocket writes through the same
+    /// lock, so a keystroke could otherwise land between a paste and the submit
+    /// key behind it — appended to the composer and sent with the message, or an
+    /// Enter of the user's own submitting the paste early and leaving ours to
+    /// fire at an empty box. The client reads its input in order, so a run that
+    /// cannot be split cannot be interleaved.
+    async fn write_run(&self, parts: &[&[u8]]) {
         let mut writer = self.writer.lock().await;
-        let _ = writer.write_all(bytes).await;
+        for part in parts {
+            let _ = writer.write_all(part).await;
+        }
         let _ = writer.flush().await;
     }
 
-    /// Records where this session takes messages.
-    pub fn set_inbox(&self, inbox: Inbox) {
-        *self.inbox.lock().unwrap() = Some(inbox);
+    /// Records that this session's `SessionStart` hook has reported in.
+    ///
+    /// NB: `send_replace`, not `send`. A `watch` sender with nothing subscribed
+    /// to it counts as closed and `send` drops the value on the floor — and this
+    /// almost always lands before anything is waiting to hear it.
+    pub fn mark_ready(&self) {
+        let _ = self.ready.send_replace(true);
     }
 
-    /// Where this session takes messages, if it has reported in yet.
-    pub fn inbox(&self) -> Option<Inbox> {
-        self.inbox.lock().unwrap().clone()
+    /// Whether this session has reported in yet.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Sends `text` to the session as one message.
+    ///
+    /// Claude Code's TUI reads a bare newline as submit, so the text goes in as
+    /// a bracketed paste followed by `\r`. What makes that safe is the two
+    /// checks around it, neither of which reads the message itself: the input
+    /// box has to be *empty* first, so the submit key cannot send somebody's
+    /// half-typed line along with this or instead of it; and the session's own
+    /// `UserPromptSubmit` hook has to come back carrying the text, which is what
+    /// says it arrived.
+    ///
+    /// NB: nothing looks for the message on screen, deliberately. A multi-line
+    /// paste is collapsed to `[Pasted text #1 +N lines]`, which says nothing
+    /// about *whose* paste it is — so a check that waited to see this one in the
+    /// box answered to anybody's, and sent theirs.
+    pub async fn paste(&self, text: &str) -> Paste {
+        let text = text.trim_end();
+        if text.is_empty() {
+            return Paste::Submitted;
+        }
+
+        // Hook-derived, and stronger than anything on screen: the `SessionStart`
+        // ping lands only once the client is up and past the workspace-trust and
+        // `bypassPermissions` dialogs — the two the submit key would answer "No,
+        // exit", and the two drawn in a shape no screen check is sure to know.
+        if !self.await_ready().await {
+            return Paste::NoBox;
+        }
+        match self.await_composer().await {
+            Composer::Empty => {}
+            Composer::Occupied => return Paste::Occupied,
+            Composer::Dialog | Composer::Missing => return Paste::NoBox,
+        }
+
+        // NB: subscribed before the slot is cleared, and cleared before the
+        // first write. The same batch sent twice is the same string, so a
+        // leftover would confirm the second send on the strength of the first.
+        let wanted = squash(text);
+        let mut acks = self.submitted.subscribe();
+        self.submitted.send_replace(None);
+
+        let mut payload = Vec::with_capacity(text.len() + 16);
+        payload.extend_from_slice(b"\x1b[200~");
+        payload.extend_from_slice(text.as_bytes());
+        payload.extend_from_slice(b"\x1b[201~");
+
+        for _ in 0..PASTE_ATTEMPTS {
+            // END first, and all three in one run. A box the cursor check read
+            // as empty can still hold a draft somebody left with the cursor
+            // parked at its start, and this puts the paste after their text
+            // rather than in front of it. On an empty box it does nothing —
+            // measured against the client, which honours `CSI F` and redraws
+            // nothing for it.
+            self.write_run(&[END, &payload, b"\r"]).await;
+
+            match self.await_submitted(&mut acks, &wanted).await {
+                Submission::Ours => return Paste::Submitted,
+                Submission::Merged => return Paste::Merged,
+                Submission::Foreign => return Paste::Displaced,
+                Submission::Nothing => {}
+            }
+
+            // Nothing was submitted, and the box says which half went missing.
+            // Empty: the paste was dropped mid-redraw and the submit key landed
+            // on nothing, so the loop can send the whole thing again. Holding
+            // something: this text is sitting in it and only the key went
+            // astray, so send that rather than a second copy of the message.
+            if self.composer() != Composer::Empty {
+                self.write_run(&[b"\r"]).await;
+                return match self.await_submitted(&mut acks, &wanted).await {
+                    Submission::Ours => Paste::Submitted,
+                    Submission::Merged => Paste::Merged,
+                    Submission::Foreign => Paste::Displaced,
+                    Submission::Nothing => Paste::Unconfirmed,
+                };
+            }
+        }
+        Paste::Unconfirmed
+    }
+
+    /// Records a prompt the session says it submitted.
+    ///
+    /// NB: `send_replace` for the same reason as [`Agent::mark_ready`] — most
+    /// prompts are the user's and nothing is waiting on them.
+    pub fn record_prompt(&self, prompt: &str) {
+        let _ = self.submitted.send_replace(Some(squash(prompt)));
+    }
+
+    /// Waits for the session to report submitting a prompt, and says whether it
+    /// was the one asked for.
+    ///
+    /// A prompt that is *not* ours is worth more than silence: it says the box
+    /// held something the emptiness check missed and the submit key has just
+    /// sent it. Nothing can take that back, but reporting it beats reporting a
+    /// message that simply never arrived.
+    ///
+    /// NB: `contains` on squashed whitespace rather than equality. What comes
+    /// back is what the composer held, and the client is free to fold a paste's
+    /// newlines on the way in; nothing here should turn that into a lost message.
+    async fn await_submitted(
+        &self,
+        acks: &mut watch::Receiver<Option<String>>,
+        wanted: &str,
+    ) -> Submission {
+        let until = Deadline::now() + self.timings.submit_grace;
+
+        loop {
+            // Cloned out: a `watch::Ref` is a lock, and this waits.
+            if let Some(seen) = acks.borrow_and_update().clone() {
+                return match seen.as_str() {
+                    // NB: `contains` and then a length test, rather than
+                    // equality alone. Equality is what says the box held
+                    // nothing else; falling back to `contains` means a client
+                    // that pads or decorates the prompt reports a merge rather
+                    // than a message that never arrived.
+                    s if s == wanted => Submission::Ours,
+                    s if s.contains(wanted) => Submission::Merged,
+                    _ => Submission::Foreign,
+                };
+            }
+
+            // The clearing `paste` does before its first write lands here as a
+            // change of its own, which is why this loops rather than taking the
+            // first wake as an answer.
+            if timeout_at(until, acks.changed()).await.is_err() {
+                return Submission::Nothing;
+            }
+        }
+    }
+
+    /// What the terminal is currently offering.
+    fn composer(&self) -> Composer {
+        composer_state(self.screen.lock().unwrap().screen())
+    }
+
+    /// Waits for the session's `SessionStart` ping, and says whether it came.
+    ///
+    /// The same budget `settled` gives a starting session, for the same reason:
+    /// a resumed card is often still drawing itself when a send is asked for.
+    async fn await_ready(&self) -> bool {
+        let until = Deadline::now() + self.timings.startup_timeout;
+        let mut pings = self.ready.subscribe();
+
+        loop {
+            if *pings.borrow_and_update() {
+                return true;
+            }
+            if timeout_at(until, pings.changed()).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    /// Waits for the client to draw its input box, and says what it drew.
+    ///
+    /// Only `Missing` is worth waiting on, and `startup_timeout` is the budget —
+    /// the same one `settled` gives a starting session, because that is the same
+    /// question. A dialog will not turn into a box by being waited on, and a box
+    /// with a draft in it is the user's to clear.
+    ///
+    /// NB: woken by the pty's own output rather than a tick. The screen can only
+    /// change when bytes arrive, and the pump feeds the parser *before* it fans a
+    /// chunk out here — so a chunk means the screen has already moved, and a
+    /// quiet terminal costs nothing to wait on.
+    async fn await_composer(&self) -> Composer {
+        let until = Deadline::now() + self.timings.startup_timeout;
+        let mut output = self.output.subscribe();
+
+        loop {
+            let state = self.composer();
+            if state != Composer::Missing {
+                return state;
+            }
+
+            match timeout_at(until, output.recv()).await {
+                // Dropped chunks are no loss: the screen is read, not replayed.
+                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {}
+                // Out of time, or the pty is finished. One last look either way.
+                Err(_) | Ok(Err(RecvError::Closed)) => return self.composer(),
+            }
+        }
     }
 
     /// Whether a dialog is holding the keyboard, which is the user's to answer.
@@ -360,11 +613,19 @@ fn settle(state: Dialog, blocked: bool, waited: Duration, grace: Duration) -> (D
 /// leaves out the transcript above, which echoes what was just submitted and
 /// would otherwise read as a message still sitting unsent in the box.
 fn composer_block<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
-    let window = lines.len().saturating_sub(COMPOSER_ROWS);
-    match lines.iter().rposition(|line| is_prompt_line(line)) {
-        Some(at) if at >= window => &lines[at..],
-        _ => &[],
+    match composer_anchor(lines) {
+        Some(at) => &lines[at..],
+        None => &[],
     }
+}
+
+/// Which row the input box's marker is on, if it is on screen.
+fn composer_anchor(lines: &[&str]) -> Option<usize> {
+    let window = lines.len().saturating_sub(COMPOSER_ROWS);
+    lines
+        .iter()
+        .rposition(|line| is_prompt_line(line))
+        .filter(|at| *at >= window)
 }
 
 /// Whether a line is one the TUI takes input on: its input box, or a dialog's
@@ -412,6 +673,89 @@ fn is_dialog(lines: &[&str]) -> bool {
         .is_some_and(|line| is_menu_option(line))
 }
 
+/// Collapses every run of whitespace to one space, so a prompt can be compared
+/// against what was sent without caring how the client folded its newlines.
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// What the terminal is offering, as one answer rather than three questions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Composer {
+    /// An input box with nothing in it: the only state a message can go into
+    /// and be the only thing that goes.
+    Empty,
+    /// An input box holding something, which is not ours to send.
+    Occupied,
+    /// A dialog standing where the box would be. The user's to answer.
+    Dialog,
+    /// No box drawn yet.
+    Missing,
+}
+
+/// Reads the screen once and says which of those it is.
+///
+/// Emptiness is asked of the *cursor*, not of the text. The cursor is the
+/// insertion point, so it sits past anything already typed: text on the marker's
+/// own row moves it along that row, and a draft beginning with a blank line
+/// moves it off the row altogether. Reading the text instead meant deciding
+/// whether each line below the marker was a message's continuation or the box's
+/// own bottom border and mode footer — and the client draws a greyed `Try "…"`
+/// hint into an empty box, which is text but is nobody's message. The text
+/// cannot answer the other question either: a long paste collapses to
+/// `[Pasted text #1 +N lines]`, a placeholder naming nobody, so a check that
+/// waited to see *this* message appear answered to anybody's and sent theirs.
+///
+/// NB: the dialog test comes first and keeps its own answer, though the cursor
+/// would refuse one anyway — the client parks it off the highlighted row. It is
+/// what lets a refusal say the box is somebody's to answer rather than that it
+/// has something in it, and it is the only live signal that a dialog is still up.
+fn composer_state(screen: &vt100::Screen) -> Composer {
+    let contents = screen.contents();
+    let lines: Vec<&str> = contents.lines().collect();
+
+    if is_dialog(&lines) {
+        return Composer::Dialog;
+    }
+    let Some(at) = composer_anchor(&lines) else {
+        return Composer::Missing;
+    };
+
+    let (row, col) = screen.cursor_position();
+    if usize::from(row) == at && col == input_column(lines[at]) {
+        Composer::Empty
+    } else {
+        Composer::Occupied
+    }
+}
+
+/// The column a message's first character would occupy: past the marker and the
+/// single space the client draws after it.
+///
+/// NB: one blank, not every blank that follows. Counting a padded row's
+/// trailing spaces would put the insertion point off the end of the text, which
+/// reads an empty box as one with something in it. And *any* blank: the client
+/// separates the marker from the text with a non-breaking space, so matching
+/// `' '` alone put the column one short of the cursor and read every empty box
+/// as occupied.
+fn input_column(line: &str) -> u16 {
+    let mut col = 0;
+    let mut chars = line.chars().peekable();
+
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+        col += 1;
+    }
+    if chars.next_if(|c| matches!(c, '❯' | '>')).is_none() {
+        return col;
+    }
+    col += 1;
+    if chars.next_if(|c| c.is_whitespace()).is_some() {
+        col += 1;
+    }
+    col
+}
+
 /// Whether that line is a numbered choice rather than the input box.
 fn is_menu_option(line: &str) -> bool {
     let rest = line
@@ -426,8 +770,8 @@ fn is_menu_option(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        composer_block, history_bytes, is_dialog, is_menu_option, is_prompt_line, settle, Dialog,
-        COMPOSER_ROWS,
+        composer_block, composer_state, history_bytes, input_column, is_dialog, is_menu_option,
+        is_prompt_line, settle, squash, Composer, Dialog, COMPOSER_ROWS,
     };
     use std::time::Duration;
 
@@ -448,6 +792,18 @@ mod tests {
 
         let contents = parser.screen().contents();
         is_dialog(&contents.lines().collect::<Vec<&str>>())
+    }
+
+    /// `composer_state` over a real screen, with the cursor left wherever the
+    /// rows happened to end — which is where a client that has just drawn them
+    /// leaves it.
+    fn state_on_screen(rows: &[&str]) -> Composer {
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(b"\x1b[2J\x1b[H");
+        for row in rows {
+            parser.process(format!("{row}\r\n").as_bytes());
+        }
+        composer_state(parser.screen())
     }
 
     /// The walk steps through the scrollback a screenful at a time, and the
@@ -569,17 +925,145 @@ mod tests {
         "  Enter to confirm · Esc to cancel",
     ];
 
+    /// The composer holding a pasted message, as the client actually draws it:
+    /// the marker on the first line only, the rest plain.
+    const PASTED: &[&str] = &[
+        "  ⏺ an earlier turn that also said Investigate",
+        "────────────────────────────────────────────",
+        "❯ The board flashes whenever the poll returns",
+        "",
+        "  Investigate the unpoly fragment swapping.",
+        "────────────────────────────────────────────",
+        "  -- INSERT -- ⏸ plan mode on (shift+tab to cycle)",
+    ];
+
+    /// The same message a moment later: submitted, so it has moved up into the
+    /// transcript and the box is empty again.
+    const SUBMITTED: &[&str] = &[
+        "  The board flashes whenever the poll returns",
+        "  Investigate the unpoly fragment swapping.",
+        "  ⏺ Worked for 1s",
+        "────────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────────",
+        "  -- INSERT -- ⏸ plan mode on (shift+tab to cycle)",
+    ];
+
+    /// Paints `rows` from the top of a real screen and leaves the cursor at
+    /// `(row, col)`, the way the client leaves it on its insertion point.
+    fn screen_with_cursor(rows: &[&str], row: u16, col: u16) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(b"\x1b[2J\x1b[H");
+        for line in rows {
+            parser.process(format!("{line}\r\n").as_bytes());
+        }
+        // 1-based, as the escape is.
+        parser.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        parser
+    }
+
+    /// Where the marker sits on a real screen, given the rows above it.
+    fn marker_row(rows: &[&str]) -> u16 {
+        rows.iter()
+            .rposition(|line| is_prompt_line(line))
+            .expect("a fixture with an input box") as u16
+    }
+
+    /// Whatever the box holds goes to the agent with the next submit key, so an
+    /// empty one is the only state a message can be written into and be the only
+    /// thing sent. The cursor is what says so: it is the insertion point, so it
+    /// sits past anything already there.
     #[test]
-    fn an_echo_of_an_earlier_turn_is_left_above_the_anchor() {
-        let pasted = &[
-            "  ⏺ an earlier turn that also said Investigate",
+    fn an_empty_box_is_one_whose_cursor_is_at_the_start() {
+        let at = marker_row(COMPOSING);
+        let parser = screen_with_cursor(COMPOSING, at, 2);
+        assert_eq!(composer_state(parser.screen()), Composer::Empty);
+
+        // The same box, cursor moved along it: something has been typed.
+        let parser = screen_with_cursor(COMPOSING, at, 9);
+        assert_eq!(composer_state(parser.screen()), Composer::Occupied);
+
+        // And a box the client has just emptied by submitting what was in it.
+        let at = marker_row(SUBMITTED);
+        let parser = screen_with_cursor(SUBMITTED, at, 2);
+        assert_eq!(composer_state(parser.screen()), Composer::Empty);
+    }
+
+    /// The case the text check could not see: the marker's own row is blank and
+    /// the draft is on the row below, where a bottom border and a mode footer
+    /// also live. The cursor is on that row, which settles it without having to
+    /// tell a continuation line from the client's furniture.
+    #[test]
+    fn a_draft_below_the_marker_is_not_an_empty_box() {
+        let rows = &[
             "────────────────────────────────────────────",
-            "❯ Investigate the unpoly fragment swapping.",
+            "❯ ",
+            "  second line only",
             "────────────────────────────────────────────",
         ];
-        assert!(!composer_block(pasted)
+        let parser = screen_with_cursor(rows, 2, 18);
+        assert_eq!(composer_state(parser.screen()), Composer::Occupied);
+        // And the same rows with the cursor back on the marker: empty.
+        let parser = screen_with_cursor(rows, 1, 2);
+        assert_eq!(composer_state(parser.screen()), Composer::Empty);
+    }
+
+    /// The hint the client draws into an empty box is text, and is nobody's
+    /// message. Reading the row would call this occupied and refuse every send.
+    #[test]
+    fn the_clients_own_hint_is_still_an_empty_box() {
+        let rows = &[
+            "────────────────────────────────────────────",
+            "❯ Try \"write a test for _drawer_card.html\"",
+            "────────────────────────────────────────────",
+        ];
+        let parser = screen_with_cursor(rows, 1, 2);
+        assert_eq!(composer_state(parser.screen()), Composer::Empty);
+    }
+
+    /// A screen with no box at all is not an empty one.
+    #[test]
+    fn a_client_still_drawing_itself_has_no_empty_box() {
+        let rows = &["  Loading…", "  ─────────"];
+        let parser = screen_with_cursor(rows, 0, 0);
+        assert_eq!(composer_state(parser.screen()), Composer::Missing);
+    }
+
+    #[test]
+    fn the_input_column_is_past_the_marker_and_one_blank() {
+        // Verbatim from claude 2.1.276: the blank after the marker is U+00A0,
+        // and taking it for an ordinary space is not optional — matching `' '`
+        // alone left the column one short of where the client puts the cursor,
+        // so every empty box read as one with something in it.
+        assert_eq!(input_column("❯\u{a0}"), 2);
+        assert_eq!(input_column("❯\u{a0}hello world this is a draft"), 2);
+
+        assert_eq!(input_column("❯ "), 2);
+        assert_eq!(input_column("> "), 2);
+        // Indented markers count their indent; a row of padding does not.
+        assert_eq!(input_column("  ❯ "), 4);
+        assert_eq!(input_column("❯     "), 2);
+    }
+
+    #[test]
+    fn an_echo_of_an_earlier_turn_is_left_above_the_anchor() {
+        assert!(!composer_block(PASTED)
             .iter()
             .any(|l| l.contains("an earlier turn")));
+    }
+
+    /// A prompt comes back as the composer held it, and the client is free to
+    /// fold a paste's newlines on the way in. Comparing on squashed whitespace
+    /// is what keeps that from reading as a message that never arrived.
+    #[test]
+    fn a_prompt_matches_however_its_newlines_were_folded() {
+        let sent = "Code review on main:\n\nmain.rs:3 (after)\nSay hello instead.";
+        assert_eq!(
+            squash(sent),
+            "Code review on main: main.rs:3 (after) Say hello instead."
+        );
+        assert!(squash(&sent.replace('\n', "\r")).contains(&squash(sent)));
+        assert!(squash(&format!("{sent}\n\nAddress each comment.")).contains(&squash(sent)));
     }
 
     #[test]
@@ -623,6 +1107,23 @@ mod tests {
     #[test]
     fn a_blank_screen_is_not_a_dialog() {
         assert!(!dialog_on_screen(&["", "  Loading…", ""]));
+    }
+
+    /// Nothing may be pasted into a dialog: it discards the text, and the
+    /// submit key behind it answers the dialog instead — which on both startup
+    /// prompts means "No, exit". Neither numbers its options, so a gate built on
+    /// `is_menu_option` alone read them as an input box; this one asks
+    /// `is_dialog`.
+    #[test]
+    fn a_dialog_is_not_something_to_paste_into() {
+        assert_eq!(state_on_screen(TRUST), Composer::Dialog);
+        assert_eq!(state_on_screen(CONSENT), Composer::Dialog);
+        assert_eq!(
+            state_on_screen(&["  Bash command needs approval", "❯ 1. Yes", "  2. No"]),
+            Composer::Dialog
+        );
+        // And a screen with nothing drawn on it is neither.
+        assert_eq!(state_on_screen(&["  Loading…"]), Composer::Missing);
     }
 
     #[test]
@@ -745,5 +1246,467 @@ mod tests {
         let out = parser.screen().state_formatted();
         assert!(out.windows(8).any(|w| w == b"\x1b[?2004h"));
         assert!(out.windows(8).any(|w| w == b"\x1b[?1000h"));
+    }
+
+    // ---- frames recorded from the real client ------------------------------
+
+    /// Paints a recorded frame back onto a screen.
+    ///
+    /// NB: each row is positioned rather than newline-separated. A newline on
+    /// the last row scrolls the screen, and every row then sits one above where
+    /// the cursor the fixture recorded is put.
+    fn replay(fixture: &str) -> vt100::Parser {
+        let (head, rows) = fixture
+            .split_once("\n--\n")
+            .expect("a cursor line, then rows");
+        let mut fields = head.split_whitespace();
+        assert_eq!(fields.next(), Some("cursor"));
+        let row: u16 = fields.next().unwrap().parse().unwrap();
+        let col: u16 = fields.next().unwrap().parse().unwrap();
+
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(b"\x1b[2J\x1b[H");
+        for (i, line) in rows.lines().enumerate() {
+            parser.process(format!("\x1b[{};1H{line}", i + 1).as_bytes());
+        }
+        parser.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        parser
+    }
+
+    /// Every frame, and what the heuristics are meant to make of it.
+    ///
+    /// These are screens the real client drew, which is the whole point: the
+    /// marker is followed by a non-breaking space and an empty box carries a
+    /// greyed hint, and a fixture somebody typed had neither. A failure here is
+    /// the client having moved — re-record with
+    /// `cargo test -- --ignored record_frames` and read the diff before
+    /// trusting it.
+    const FRAMES: &[(&str, &str, Composer)] = &[
+        (
+            "empty-box",
+            include_str!("frames/empty-box.txt"),
+            Composer::Empty,
+        ),
+        // The same box after ctrl+u, which the client honours.
+        (
+            "cleared",
+            include_str!("frames/cleared.txt"),
+            Composer::Empty,
+        ),
+        (
+            "draft",
+            include_str!("frames/draft.txt"),
+            Composer::Occupied,
+        ),
+        (
+            "draft-cursor-at-end",
+            include_str!("frames/draft-cursor-at-end.txt"),
+            Composer::Occupied,
+        ),
+        (
+            "trust-dialog",
+            include_str!("frames/trust-dialog.txt"),
+            Composer::Dialog,
+        ),
+    ];
+
+    #[test]
+    fn recorded_frames_read_as_they_should() {
+        for (name, fixture, want) in FRAMES {
+            let parser = replay(fixture);
+            assert_eq!(composer_state(parser.screen()), *want, "{name}");
+        }
+    }
+
+    /// The one frame that is read wrong, recorded so the gap is a fact rather
+    /// than a remark.
+    ///
+    /// `CSI H` puts the cursor back to the start of a draft, and the insertion
+    /// point is then exactly where an empty box's would be. Nothing on the
+    /// screen separates the two. What covers it is downstream: `END` goes in
+    /// ahead of the paste so the message lands after the draft rather than in
+    /// front of it, and the acknowledgement carries both, which reports as
+    /// `Paste::Merged` instead of a clean send.
+    #[test]
+    fn a_draft_with_its_cursor_at_the_start_reads_as_empty() {
+        let parser = replay(include_str!("frames/draft-cursor-at-start.txt"));
+        assert_eq!(composer_state(parser.screen()), Composer::Empty);
+    }
+
+    /// Rewrites `FRAMES` from a live client. Ignored: it needs `claude` on the
+    /// path, a directory the client already trusts (this repository), and about
+    /// half a minute.
+    ///
+    /// The trust prompt is not among what it records — a trusted directory will
+    /// not draw one. That fixture came from a fresh `mkdtemp`, and re-recording
+    /// it means doing the same by hand.
+    #[test]
+    #[ignore = "drives the real client"]
+    fn record_frames() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = env!("CARGO_MANIFEST_DIR");
+            let mut cmd = Command::new("claude");
+            cmd = cmd.arg("--permission-mode").arg("plan");
+            cmd = cmd.current_dir(root);
+            cmd = cmd.env("TERM", "xterm-256color");
+            // The same markers `AgentManager::command` strips. Leaving any of
+            // them makes the client think it is a nested agent, and it draws a
+            // warning row about it that the recording would then carry.
+            for marker in [
+                "CLAUDECODE",
+                "CLAUDE_CODE_CHILD_SESSION",
+                "CLAUDE_CODE_ENTRYPOINT",
+                "CLAUDE_CODE_SSE_PORT",
+                "CLAUDE_SESSION_ID",
+            ] {
+                cmd = cmd.env_remove(marker);
+            }
+
+            let (agent, reader) = Agent::attach(cmd, brisk()).unwrap();
+            let watcher: Arc<dyn Watcher> = Arc::new(Quiet);
+            tokio::spawn(pump(
+                reader,
+                Arc::clone(&agent),
+                Arc::downgrade(&watcher),
+                1,
+            ));
+
+            // The client spends seconds drawing itself.
+            for _ in 0..150 {
+                if agent.composer() != Composer::Missing {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            let draft = "hello world this is a draft";
+            for (name, keys) in [
+                ("empty-box", None),
+                ("draft", Some(format!("\x1b[200~{draft}\x1b[201~"))),
+                ("draft-cursor-at-start", Some("\x1b[H".to_owned())),
+                ("draft-cursor-at-end", Some("\x1b[F".to_owned())),
+                ("cleared", Some("\x15".to_owned())),
+            ] {
+                if let Some(keys) = keys {
+                    agent.write_input(keys.as_bytes()).await;
+                }
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                record(root, name, agent.screen.lock().unwrap().screen());
+            }
+            agent.kill();
+        });
+    }
+
+    /// Writes one frame, leaving out rows that say what account this was.
+    fn record(root: &str, name: &str, screen: &vt100::Screen) {
+        let noise = [
+            "Your login expires",
+            "Claude Max",
+            "Claude Pro",
+            "gh auth login",
+        ];
+        let contents = screen.contents();
+        let mut rows: Vec<&str> = contents
+            .lines()
+            .map(|line| {
+                if noise.iter().any(|n| line.contains(n)) {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect();
+        while rows.last().is_some_and(|r| r.trim().is_empty()) {
+            rows.pop();
+        }
+
+        let (row, col) = screen.cursor_position();
+        let body = format!("cursor {row} {col}\n--\n{}\n", rows.join("\n"));
+        std::fs::write(format!("{root}/src/agent/frames/{name}.txt"), body).unwrap();
+        println!("recorded {name}: cursor=({row},{col})");
+    }
+
+    // ---- the stand-in, against the same heuristics -------------------------
+
+    /// Attaches the end-to-end suite's own stand-in, with nothing to submit and
+    /// no hooks to call.
+    ///
+    /// The point is that one stand-in answers to the recordings above. It is
+    /// what every end-to-end assertion about delivery runs against, so a screen
+    /// it draws that the heuristics read differently from the real client's is a
+    /// suite that passes while the product is broken — which is how the
+    /// non-breaking space after the marker got in.
+    async fn stand_in() -> (Arc<Agent>, Arc<dyn Watcher>) {
+        let dir = std::env::temp_dir().join(format!("ledecky-stand-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!("{}/tests/fake-agent.mjs", env!("CARGO_MANIFEST_DIR"));
+
+        let mut cmd = Command::new("node");
+        cmd = cmd.arg(&script);
+        // An empty settings object leaves every hook URL undefined, so the
+        // stand-in's `hook()` is a no-op and nothing has to be listening.
+        cmd = cmd.arg("--settings").arg("{}");
+        cmd = cmd.current_dir(&dir);
+        cmd = cmd.env("TERM", "xterm-256color");
+        cmd = cmd.env("XDG_DATA_HOME", &dir);
+        cmd = cmd.env("FAKE_AGENT_BOOT_MS", "150");
+
+        let (agent, reader) = Agent::attach(cmd, brisk()).unwrap();
+        let watcher: Arc<dyn Watcher> = Arc::new(Quiet);
+        tokio::spawn(pump(
+            reader,
+            Arc::clone(&agent),
+            Arc::downgrade(&watcher),
+            1,
+        ));
+        (agent, watcher)
+    }
+
+    /// Waits for the stand-in's screen to read as `want`.
+    async fn settles_to(agent: &Arc<Agent>, want: Composer) -> Composer {
+        for _ in 0..200 {
+            let state = agent.composer();
+            if state == want {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        agent.composer()
+    }
+
+    #[tokio::test]
+    async fn the_stand_in_draws_what_the_recordings_do() {
+        let (agent, _w) = stand_in().await;
+
+        // Boots with nothing in its box, like `frames/empty-box.txt`.
+        assert_eq!(settles_to(&agent, Composer::Empty).await, Composer::Empty);
+
+        // Holds a draft the same way `frames/draft.txt` does.
+        agent
+            .write_input(b"\x1b[200~hello world this is a draft\x1b[201~")
+            .await;
+        assert_eq!(
+            settles_to(&agent, Composer::Occupied).await,
+            Composer::Occupied
+        );
+
+        // And puts a dialog where the box was, like `frames/trust-dialog.txt`.
+        // The marker is the stand-in's way of being asked for one.
+        agent.write_input(b"\r").await;
+        agent
+            .write_input(b"\x1b[200~[needs-permission] run it\x1b[201~")
+            .await;
+        agent.write_input(b"\r").await;
+        assert_eq!(settles_to(&agent, Composer::Dialog).await, Composer::Dialog);
+
+        agent.kill();
+    }
+
+    // ---- the paste itself, against a real pty -------------------------------
+
+    use super::{pump, Agent, Paste, Watcher};
+    use crate::config::Timings;
+    use pty_process::Command;
+    use std::sync::Arc;
+
+    /// A watcher that wants nothing. `pump` reports a cleared dialog and an EOF
+    /// through it, and neither is what these tests are about.
+    struct Quiet;
+    impl Watcher for Quiet {
+        fn dialog_cleared(&self, _: i64) {}
+        fn exited(&self, _: i64) {}
+    }
+
+    /// Timings small enough that a refusal costs milliseconds, with the submit
+    /// grace well clear of the poll so a confirmation cannot be raced.
+    fn brisk() -> Timings {
+        Timings {
+            hook_grace: Duration::from_millis(50),
+            startup_timeout: Duration::from_millis(60),
+            dialog_grace: Duration::from_millis(50),
+            submit_grace: Duration::from_millis(400),
+        }
+    }
+
+    /// A full screen with `rows` at the bottom and the cursor left at
+    /// `(cursor_row, cursor_col)` — counted within `rows`, as the client leaves
+    /// it on its insertion point.
+    fn frame(rows: &[&str], cursor_row: usize, cursor_col: u16) -> Vec<u8> {
+        let top = 40 - rows.len();
+        let mut out = b"\x1b[2J\x1b[H".to_vec();
+        for _ in 0..top {
+            out.extend_from_slice(b"\r\n");
+        }
+        // NB: no newline after the last row. A fortieth one on a forty-row
+        // screen scrolls it, and every row — the input box included — would sit
+        // one above where the cursor is then put.
+        for (i, row) in rows.iter().enumerate() {
+            out.extend_from_slice(row.as_bytes());
+            if i + 1 < rows.len() {
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        // 1-based, as the escape is.
+        let (row, col) = (top + cursor_row + 1, cursor_col + 1);
+        out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
+        out
+    }
+
+    /// An agent attached to a stand-in that paints `screen` and then sits still.
+    ///
+    /// `sleep` rather than anything interactive: what `paste` reacts to is the
+    /// screen and `record_prompt`, both of which a test drives, so the child only
+    /// has to hold the pty open and leave the frame alone. The watcher comes back
+    /// with it because `pump` holds only a `Weak`.
+    async fn attached(screen: Vec<u8>) -> (Arc<Agent>, Arc<dyn Watcher>) {
+        // NB: a counter, not the thread id. That formats as `ThreadId(2)`, and
+        // the parentheses end the shell's word.
+        static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("ledecky-frame-{}-{nth}.bin", std::process::id()));
+        std::fs::write(&path, &screen).unwrap();
+
+        let mut cmd = Command::new("sh");
+        cmd = cmd.arg("-c");
+        cmd = cmd.arg(format!("cat {}; sleep 120", path.display()));
+        let (agent, reader) = Agent::attach(cmd, brisk()).unwrap();
+
+        let watcher: Arc<dyn Watcher> = Arc::new(Quiet);
+        tokio::spawn(pump(
+            reader,
+            Arc::clone(&agent),
+            Arc::downgrade(&watcher),
+            1,
+        ));
+
+        // The frame has to be on the screen before anything asks about it.
+        for _ in 0..200 {
+            if !agent
+                .screen
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .trim()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        (agent, watcher)
+    }
+
+    const MESSAGE: &str = "Code review on main:\n\nmain.rs:3 (after)\nSay hello instead.";
+
+    /// An empty box: a border, the marker, a border, the mode footer.
+    fn empty_box() -> Vec<u8> {
+        frame(
+            &["────────────", "❯ ", "────────────", "  -- INSERT --"],
+            1,
+            2,
+        )
+    }
+
+    /// Answers as the client's `UserPromptSubmit` hook would, for as long as the
+    /// send is still running.
+    ///
+    /// NB: repeatedly. `paste` clears the slot before its first write, so a
+    /// single answer timed against it would be a race; answering until it
+    /// settles cannot be.
+    fn acknowledge(agent: &Arc<Agent>, prompt: &'static str) -> tokio::task::JoinHandle<()> {
+        let agent = Arc::clone(agent);
+        tokio::spawn(async move {
+            loop {
+                agent.record_prompt(prompt);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_message_is_delivered_when_the_session_acknowledges_it() {
+        let (agent, _w) = attached(empty_box()).await;
+        agent.mark_ready();
+
+        let answering = acknowledge(&agent, MESSAGE);
+        assert_eq!(agent.paste(MESSAGE).await, Paste::Submitted);
+        answering.abort();
+    }
+
+    /// Nothing says the message landed, so nothing may report it as sent.
+    #[tokio::test]
+    async fn a_message_nothing_acknowledges_is_unconfirmed() {
+        let (agent, _w) = attached(empty_box()).await;
+        agent.mark_ready();
+
+        assert_eq!(agent.paste(MESSAGE).await, Paste::Unconfirmed);
+    }
+
+    /// A prompt came back, and it was not this one: the box held a draft the
+    /// cursor did not give away and the submit key has just sent it. Worth
+    /// saying so rather than reporting a message that never arrived.
+    #[tokio::test]
+    async fn a_prompt_that_is_not_ours_reads_as_displaced() {
+        let (agent, _w) = attached(empty_box()).await;
+        agent.mark_ready();
+
+        let answering = acknowledge(&agent, "whatever was already in the box");
+        assert_eq!(agent.paste(MESSAGE).await, Paste::Displaced);
+        answering.abort();
+    }
+
+    /// The cursor is along the marker's row, so something is already typed.
+    /// Writing now would send it with the message, and the box cannot say what
+    /// it is — a collapsed paste names nobody.
+    #[tokio::test]
+    async fn a_box_with_something_in_it_is_refused() {
+        let held = frame(
+            &[
+                "────────────",
+                "❯ [Pasted text #1 +11 lines]",
+                "────────────",
+            ],
+            1,
+            28,
+        );
+        let (agent, _w) = attached(held).await;
+        agent.mark_ready();
+
+        assert_eq!(agent.paste(MESSAGE).await, Paste::Occupied);
+    }
+
+    /// The workspace-trust prompt, which numbers nothing and defaults to "No,
+    /// exit" — so the submit key behind a paste would kill the session.
+    #[tokio::test]
+    async fn a_startup_dialog_is_refused() {
+        let dialog = frame(
+            &[
+                "  Quick safety check: Is this a project you created or one you trust?",
+                "❯ No, exit",
+                "  Yes, I trust this folder",
+                "",
+                "  Enter to confirm · Esc to cancel",
+            ],
+            1,
+            0,
+        );
+        let (agent, _w) = attached(dialog).await;
+        agent.mark_ready();
+
+        assert_eq!(agent.paste(MESSAGE).await, Paste::NoBox);
+    }
+
+    /// A session that has not reported in is either still drawing itself or held
+    /// by a dialog drawn in a shape no screen check is sure to know. The ping is
+    /// hook-derived and cannot be fooled by either.
+    #[tokio::test]
+    async fn a_session_that_has_not_reported_in_is_refused() {
+        let (agent, _w) = attached(empty_box()).await;
+        // Deliberately not `mark_ready`.
+        assert_eq!(agent.paste(MESSAGE).await, Paste::NoBox);
     }
 }

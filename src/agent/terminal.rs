@@ -79,15 +79,28 @@ pub async fn stop(manager: &State<Arc<AgentManager>>, id: i64) -> Redirect {
     Redirect::to(format!("/cards/{id}"))
 }
 
+/// NB: a refusal answers with the card rather than a bare status. This posts
+/// with the whole page as its target, so a `409` carrying no body was swapped
+/// in like any other response and took the board with it.
 #[post("/cards/<id>/merge")]
-pub async fn merge(manager: &State<Arc<AgentManager>>, id: i64) -> Result<Redirect, Status> {
-    match manager.request_merge(id).await {
-        Ok(()) => Ok(Redirect::to(format!("/cards/{id}"))),
-        Err(err) => {
-            warn!("card {id}: merge request failed: {err:#}");
-            Err(Status::Conflict)
-        }
+pub async fn merge(
+    db: &State<DB>,
+    manager: &State<Arc<AgentManager>>,
+    settings: &State<Settings>,
+    cache: &State<DiffCache>,
+    worktrees: &State<Worktrees>,
+    id: i64,
+) -> Result<Result<Redirect, (Status, Tmpl)>, Status> {
+    if let Err(err) = manager.request_merge(worktrees, id).await {
+        warn!("card {id}: merge request failed: {err:#}");
+
+        let error = "The merge request could not be delivered. The agent may be \
+                     waiting on you — answer what is on its terminal, then try again.";
+        let page = board::card_view(db, manager, settings, cache, id, None, Some(error)).await?;
+        return Ok(Err((Status::Conflict, page)));
     }
+
+    Ok(Ok(Redirect::to(format!("/cards/{id}"))))
 }
 
 #[derive(rocket::FromForm)]

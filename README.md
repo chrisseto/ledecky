@@ -129,26 +129,49 @@ by redrawing the pane around them. Which line is open is in the pane's own fetch
 URL too, so the stream's resync brings the box back instead of morphing it away.
 Clicking away saves it as a draft. *Send N to
 agent* formats the batch into one message and pastes it into the agent's
-terminal.
+terminal, starting an agent for it if none is running. A send that cannot land
+says so above the batch, which stays drafts.
 
-**Talking to the agent.** Nothing the server sends is typed at the terminal; a
-paste is the one thing that arrives that way, and it is the user's own.
-The opening task is a command-line argument, so it is the user's own prompt and
-the session names itself from it; the client holds it behind the workspace-trust
-dialog and submits it once that is answered. Anything
-later — a review batch, a merge request — goes to the session's inbox socket,
-whose path it reports through a `SessionStart` hook. That event is the only
-place `CLAUDE_CODE_MESSAGING_SOCKET` is exported, and only to a `command`
-handler, so the hook runs `ledecky hook session-start <url>` — this same binary,
-re-executed, posting the socket back to `/inbox` and exiting. Running ourselves
-rather than `curl` keeps the hook free of anything that has to be installed
-where the agent runs. It needs claude 2.1.224 or newer.
+**Talking to the agent.** The opening task is a command-line argument, so it is
+the user's own prompt and the session names itself from it; the client holds it
+behind the workspace-trust dialog and submits it once that is answered.
 
-A message that arrives this way is framed to the agent as coming from another
-session rather than from the user — right for relayed review comments, which is
-why the opening task does not take the same road. The session reads its inbox
-between tool calls, so a dialog holding the keyboard no longer blocks a review
-from landing.
+Everything later — a review batch, a merge request — goes to a running session
+by being typed at its terminal, the same way the user's own paste is: bracketed,
+then a bare `\r`, because the TUI reads a newline as submit. Nothing is sent
+blind. The session has to have reported in, the input box has to be empty, and
+the session's own `UserPromptSubmit` hook has to come back carrying the text
+before the message counts as delivered — the screen is not asked to confirm
+anything, because a paste collapses to a placeholder that names nobody. What
+each of those reads, and why it is that rather than the obvious thing, is in
+`Agent::paste` and `composer_state`.
+
+A card whose agent has stopped is not a reason to refuse. It gets one, and the
+message rides in as that session's opening task — a positional argument beside
+`--resume`, which the client accepts — so a cold start costs the send no waiting
+and nothing has to watch the screen at all. The message wins over the card's own
+task, which is only ever the first session's; a card still waiting for that has
+no turns, so nothing to review and nothing to merge. The exception is a
+`--resume` that finds nothing: the fresh session that replaces it gets the
+card's task, which it needs and which nothing would offer again, and the message
+is typed at it once it is up.
+
+So a send can be turned down four ways — a session not reporting in or holding a
+dialog, a box with something already in it, a write nothing acknowledged, and a
+write something else was acknowledged in place of — and each says which on the
+pane it came from, leaving the batch as drafts. A refused review answers `409`
+*with the pane*: htmx swaps a failed response into the target like any other, so
+a status with no body took the batch away with it. A refused merge answers the
+card the same way.
+
+A session still says when it is up, through a `SessionStart` hook: that event is
+the one Claude Code will not deliver over HTTP, so the hook runs
+`ledecky hook session-start <url>` — this same binary, re-executed, posting to
+`/ready` and exiting. Running ourselves rather than `curl` keeps the hook free of
+anything that has to be installed where the agent runs. It is worth having
+because it fires past the workspace-trust and `bypassPermissions` dialogs, which
+have no hook of their own, so a session that never reports in is one somebody has
+to answer.
 
 The screen still answers one question the hooks cannot. `Notification` says a
 dialog is coming — a tool permission, a question, a plan to approve, an MCP server
@@ -217,7 +240,7 @@ documents every key at its default; nothing reads it unless named.
 | `hook_port` | `8771` | The hook port; `0` takes a free one |
 | `app_slug` | `ledecky` | Names the data directory and the `refs/<slug>/` namespace |
 | `data_dir` | `/<slug>` | Database, worktrees, per-card scratch |
-| `agent_bin` | `claude` | The executable spawned for an agent. 2.1.224 or newer, for the inbox socket |
+| `agent_bin` | `claude` | The executable spawned for an agent |
 | `watch_debounce` | `250` | How long a burst of worktree writes settles before the diff is announced, in ms |
 | `head_ttl` | `30000` | How long a staged worktree head stands without the watcher, in ms |
 | `gzip` | release builds | Whether to gzip responses |
@@ -358,13 +381,14 @@ puts it somewhere you choose (and leaves it to you to delete).
 
 `tests/fake-agent.mjs` stands in for `claude`, selected through
 `LEDECKY_AGENT_BIN`. It imitates only what the app couples to: an opening task
-taken as a positional argument and held while a modal is up, an inbox socket
-whose path it reports by running the `SessionStart` command hook out of its own
-`--settings` — whatever that command is, which is how the real handshake gets
-covered without the stand-in knowing anything about it — a startup window where it has drawn nothing and reported nothing,
-an input box at the bottom of the screen, a modal that owns the keyboard and
-reads a bare Enter as "exit", bracketed paste, mouse reporting, OSC 52, and the
-HTTP hooks named in that same `--settings`. That makes worktrees, turn
+taken as a positional argument and held while a modal is up, a readiness ping it
+sends by running the `SessionStart` command hook out of its own `--settings` —
+whatever that command is, which is how the real handshake gets covered without
+the stand-in knowing anything about it — a startup window where it has drawn
+nothing and reported nothing, an input box at the bottom of the screen, a modal
+that owns the keyboard and discards everything but its own choices, bracketed
+paste that goes nowhere while it is still drawing itself or a modal is up, mouse
+reporting, OSC 52, and the HTTP hooks named in that same `--settings`. That makes worktrees, turn
 snapshots, lane transitions, review submission and merge deterministic and free
 to run.
 

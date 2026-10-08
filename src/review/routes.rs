@@ -6,12 +6,12 @@ use minijinja::context;
 use rocket::form::Form;
 use rocket::http::Status;
 use rocket::serde::Serialize;
-use rocket::tokio::task::spawn_blocking;
 use rocket::{delete, get, post, State};
 
-use crate::agent::{messaging, AgentManager};
+use crate::agent::AgentManager;
 use crate::config::Settings;
 use crate::db::DB;
+use crate::project::lifecycle::{self, Delivery};
 use crate::project::{Card, Lane, Project};
 use crate::review::comment::{format_review, Side};
 use crate::review::diff::{Line, ParsedFile, Segment};
@@ -21,6 +21,7 @@ use crate::review::{Comment, DiffCache, Expansion, Scope, Turn, Viewed};
 use crate::tmpl::Tmpl;
 use crate::vcs;
 use crate::vcs::git;
+use crate::watch::Worktrees;
 
 /// Rendered lines beyond which a file is held back behind a button.
 ///
@@ -825,16 +826,37 @@ pub async fn toggle_viewed(db: &State<DB>, id: i64, form: Form<ViewedForm>) -> S
     Status::NoContent
 }
 
+/// What a batch that did not go anywhere says, in the pane it came from.
+const BLOCKED: &str =
+    "The agent is waiting on you. Answer what is on its terminal, then send again.";
+const OCCUPIED: &str =
+    "There is unsent text in the agent's terminal. Send or clear it, then send this.";
+const UNCONFIRMED: &str = "The agent never acknowledged this. Check its terminal, then send again.";
+const DISPLACED: &str =
+    "The agent's terminal submitted something else that was in it. This is still a draft.";
+/// Not a refusal: this one was delivered, and says what went with it.
+const MERGED: &str = "Sent — and unsent text that was in the agent's terminal went with it.";
+const NO_AGENT: &str = "No agent could be started to take this, so it is still a draft.";
+
 /// Hands every draft comment to the agent as one message and marks them sent.
+///
+/// A stopped card starts an agent to take the batch rather than turning the send
+/// down — see [`lifecycle::deliver`], which hands it over the way an opening task
+/// arrives and so needs no agent on screen yet.
+///
+/// NB: answers with the pane either way, and only the status differs. A bare
+/// `409` is swapped into the target like any other response, so returning one
+/// without a body replaced the batch the user was looking at with an error page.
 #[post("/cards/<id>/review", data = "<form>")]
 pub async fn submit_review(
     db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
+    worktrees: &State<Worktrees>,
     id: i64,
     form: Form<ViewForm>,
-) -> Result<Tmpl, Status> {
+) -> Result<(Status, Tmpl), Status> {
     let scope = Scope::parse(Some(&form.scope));
     let turns = Turn::for_card(db, id).await;
     let drafts = Comment::drafts(db, id)
@@ -842,32 +864,57 @@ pub async fn submit_review(
         .map_err(|err| failed(id, "reading the drafts", err))?;
     let turn = viewing_turn(&scope, &turns);
 
+    // What the pane says about the send, and whether the send was turned down.
+    // Not the same question: a batch can land and still be worth a note.
+    let mut note = None;
+    let mut refused = false;
+
     if !drafts.is_empty() {
-        let inbox = manager
-            .running(id)
-            .and_then(|agent| agent.inbox())
-            .ok_or(Status::Conflict)?;
-
-        // NB: a dialog holding the terminal is no longer a reason this fails —
-        // the session reads its inbox between tool calls. What is left is the
-        // socket itself, so leave the drafts alone to be retried.
-        //
-        // NB: on the blocking pool. The inbox is a unix socket written under a
-        // timeout, which blocks the thread it is on however short it is.
         let message = format_review(&drafts, &scope.label());
-        let sent = spawn_blocking(move || messaging::send(&inbox, &message))
-            .await
-            .expect("sending a review panicked");
-        if let Err(err) = sent {
-            warn!("card {id}: sending the review failed: {err:#}");
-            return Err(Status::Conflict);
-        }
 
-        Comment::mark_submitted(db, id, turn).await;
+        match lifecycle::deliver(manager, settings, worktrees, id, &message).await {
+            Delivery::Pasted | Delivery::Opened => Comment::mark_submitted(db, id, turn).await,
+            // Delivered, so the batch is marked sent either way; the note is
+            // about what travelled with it, which is the user's to see on the
+            // terminal rather than something to guess at from a status.
+            Delivery::Merged => {
+                Comment::mark_submitted(db, id, turn).await;
+                warn!("card {id}: the review went with unsent text from the terminal");
+                note = Some(MERGED);
+            }
+            // The rest leave the batch as drafts, so it goes once whatever is in
+            // the way has been dealt with.
+            Delivery::Blocked => {
+                warn!("card {id}: the review could not be pasted");
+                (note, refused) = (Some(BLOCKED), true);
+            }
+            // Writing into a box that already holds something would send that
+            // with it, and the box cannot say what it holds: a paste collapses
+            // to a placeholder that names nobody.
+            Delivery::Occupied => (note, refused) = (Some(OCCUPIED), true),
+            Delivery::Unconfirmed => {
+                warn!("card {id}: the review was written but never acknowledged");
+                (note, refused) = (Some(UNCONFIRMED), true);
+            }
+            // The box held a draft the cursor did not give away, and the submit
+            // key sent that instead. Nothing can take it back; saying so beats
+            // reporting a message that merely never arrived.
+            Delivery::Displaced => {
+                warn!("card {id}: the terminal submitted something other than the review");
+                (note, refused) = (Some(DISPLACED), true);
+            }
+            Delivery::Failed => (note, refused) = (Some(NO_AGENT), true),
+        }
     }
 
-    Ok(Tmpl(
-        "_review.html",
-        pane(db, settings, cache, id, form.view()).await?,
+    let status = if refused {
+        Status::Conflict
+    } else {
+        Status::Ok
+    };
+    let pane = pane(db, settings, cache, id, form.view()).await?;
+    Ok((
+        status,
+        Tmpl("_review.html", context! { review_note => note, ..pane }),
     ))
 }

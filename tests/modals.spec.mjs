@@ -3,6 +3,7 @@ import { SLOW } from "../playwright.config.mjs";
 
 import {
   addCard,
+  draftBox,
   addProject,
   cardIn,
   comment,
@@ -35,6 +36,10 @@ test.beforeAll(async ({ browser }) => {
  * the card until the turn ended — minutes of work reported as blocked. The
  * terminal is the only signal, and the fake agent holds the turn open between
  * answering the dialog and `f` so that gap can be inspected rather than raced.
+ *
+ * The dialog is also the one thing that can turn a send down, which is why the
+ * refused batch is checked here rather than on a card of its own: this is the
+ * only place a dialog is up with a diff to comment on behind it.
  */
 test("a tool permission prompt shows on the card and resumes when answered", async ({ page }) => {
   await openCard(page, cardId);
@@ -50,6 +55,34 @@ test("a tool permission prompt shows on the card and resumes when answered", asy
 
   await expect(page.locator("#agent-state")).toContainText("needs you");
   await expect(cardIn(page, "in_review", TITLE)).toBeVisible();
+
+  // The dialog owns the keyboard: there is no input box to paste a review into,
+  // and the submit key behind one would answer the dialog instead — on the
+  // startup prompts, with "No, exit". So the send is turned down and the batch
+  // stays where it was written, rather than being marked delivered.
+  const line = fileSection(page, "main.rs").locator(".line.l-added").first();
+  await comment(page, line, "And rename it while you are in there.");
+  await expect(page.locator("#review .batch-label")).toContainText("1 comment pending");
+
+  const [answer] = await Promise.all([
+    page.waitForResponse((res) => res.url().endsWith(`/cards/${cardId}/review`)),
+    page.getByRole("button", { name: /Send \d+ to agent/ }).click(),
+  ]);
+  expect(answer.status()).toBe(409);
+
+  // The pane comes back saying so, with the batch still under it. A bare 409 is
+  // swapped into the target like any other answer, which replaced both with an
+  // error page.
+  await expect(page.locator("#review .review-note")).toContainText("waiting on you");
+  await expect(page.locator("#review .batch-label")).toContainText("1 comment pending");
+  await expect(draftBox(line)).toHaveValue("And rename it while you are in there.");
+  expect(turnRefs(cardId)).toHaveLength(1);
+
+  // Discarded rather than left to land on the next paragraph's send: a batch
+  // arriving once the dialog is gone is `lifecycle.spec`'s to prove, and an
+  // extra prompt here would be an extra turn under the assertions below.
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(page.locator("#review .batch-label")).toContainText("Click a line to comment");
 
   await showTab(page, "agent");
   const rows = terminalRows(page);
