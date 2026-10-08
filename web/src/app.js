@@ -209,16 +209,3 @@ document.addEventListener("click", (event) => {
 
   htmx.ajax("GET", url, block ? { target: block, swap: "outerHTML" } : { target: line, swap: "afterend" });
 });
-
-// A field the server drew has to be focused once it arrives: the base search
-// when a refusal reopened the menu around it.
-document.addEventListener("htmx:after:settle", () => {
-  const field = document.querySelector(".branch-menu[open] .search[data-autofocus]");
-  if (!field) return;
-  if (document.activeElement !== field) field.focus();
-
-  // NB: the search box outlives the response that asked for it — the menu
-  // stays open and re-filters in place — so the ask has to be spent, or every
-  // later settle drags the cursor back out of whatever it moved to.
-  field.removeAttribute("data-autofocus");
-});

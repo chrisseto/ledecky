@@ -28,9 +28,11 @@
            aria-label="Search branches"
            data-commit-url="{{ picker.post_to or picker.pick_to }}"
            {% if picker.post_to %}data-commit-post{% endif %}
-           {# NB: `open` is set in the markup, so no `toggle` is raised to focus
-              off — a menu the server reopened has to be focused on arrival. #}
-           {% if picker.open %}data-autofocus{% endif %}
+           {# NB: the markup sets `open`, so the `toggle` above does not run. A
+              menu that the server reopens must get the focus when it arrives,
+              and htmx focuses an `autofocus` element in content that it
+              inserts. #}
+           {% if picker.open %}autofocus{% endif %}
            hx-get="{{ picker.search_to }}"
            hx-trigger="input changed delay:120ms"
            {# The form's choice rides along so a re-filter cannot take it out of
