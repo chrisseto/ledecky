@@ -1,8 +1,8 @@
 import { expect, test } from "./support/fixtures.mjs";
 
 import {
-  addCard, addProject, cardIn, git, lane, moveCard, openCard, pollsOf,
-  showTab,
+  addCard, addProject, cardIn, git, lane, moveCard, openCard, pickBranch,
+  pollsOf, showTab,
 } from "./support/board.mjs";
 
 test.describe.configure({ mode: "serial" });
@@ -18,17 +18,20 @@ test.beforeAll(async ({ browser }) => {
 test("a new card offers the repository's branches and lands in To Do", async ({ page }) => {
   await page.goto(`${projectUrl}/cards/new`);
 
-  // Branches come from the repository, with the checked-out one first, and the
-  // option is the field: nothing has to be copied into one.
-  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main", "release"]);
-  await expect(page.getByRole("radio", { name: "main", exact: true })).toBeChecked();
+  // The chip is the same control the card drawer carries, and it opens on the
+  // checked-out branch. What it offers is the repository's own branches, and
+  // somewhere to look for a remote's.
+  const picker = page.locator(".branch-menu");
+  await expect(picker.locator("summary")).toContainText("main");
+  await picker.locator("summary").click();
+  await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main", "release", "origin/"]);
 
   // The server is what narrows the list — but never past what is chosen, which
-  // here is also the form's only field for the base. The drawer's menu, with no
-  // field to keep, narrows to the matches alone.
+  // here is what the form will submit. The drawer's menu, with no field to
+  // keep, narrows to the matches alone.
   const search = page.getByLabel("Search branches");
   await search.fill("nope");
-  await expect(page.locator("#branch-menu .empty-match")).toBeVisible();
+  await expect(page.locator("#branch-menu .ref-status.bad")).toContainText("resolves “nope”");
   await expect(page.locator("#branch-menu .menu-item")).toHaveText(["main"]);
 
   await expect(page.getByLabel("Permissions")).toHaveValue("plan");
@@ -299,11 +302,11 @@ test("a card waiting in To Do can have its task rewritten", async ({ page }) => 
   // The form opens on the task exactly as it was typed.
   const form = page.locator(".modal-card");
   await expect(form.getByLabel("Task")).toHaveValue("Draft errand\n\nFirst attempt.");
-  await expect(form.getByRole("radio", { name: "main", exact: true })).toBeChecked();
+  await expect(form.locator(".branch-menu summary")).toContainText("main");
   await expect(form.getByLabel("Permissions")).toHaveValue("acceptEdits");
 
   await form.getByLabel("Task").fill("Rewritten errand\n\nSecond attempt.");
-  await form.getByRole("radio", { name: "release", exact: true }).check();
+  await pickBranch(page, "release");
   await form.getByLabel("Permissions").selectOption("plan");
   await form.getByRole("button", { name: "Save" }).click();
 
@@ -352,7 +355,7 @@ test("the base branch is still a card's to change once it is not", async ({ page
   const menu = page.locator(".branch-menu");
   await expect(chip).toContainText("release");
   await chip.click();
-  await expect(menu.locator(".menu-item")).toHaveText(["main", "release"]);
+  await expect(menu.locator(".menu-item")).toHaveText(["main", "release", "origin/"]);
 
   // Opening it puts the cursor in the search box, so narrowing is typing rather
   // than a second click. Waited for: `toggle` is queued rather than raised in
@@ -369,14 +372,30 @@ test("the base branch is still a card's to change once it is not", async ({ page
   await expect(cardIn(page, "done", "Rewritten errand")).toContainText("main");
 });
 
-test("a base branch git will not resolve is turned down", async ({ page }) => {
+test("a base is anything git resolves", async ({ page }) => {
   await page.goto(projectUrl);
   const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
 
-  // A tag and a raw sha resolve as revisions, but everything downstream hands
-  // this to git as a branch.
+  // Everything downstream hands the base to git as a bare revision, so a tag, a
+  // remote-tracking ref and a raw sha are bases like any other.
   git("tag", "-f", "v1");
-  for (const base_branch of ["nope", "", "v1", git("rev-parse", "main")]) {
+  for (const base_branch of ["v1", "origin/upstream-only", git("rev-parse", "main")]) {
+    const taken = await page.request.post(`/cards/${id}/base`, { form: { base_branch } });
+    expect(taken.status()).toBe(200);
+    await openCard(page, id);
+    await expect(page.locator(".branch-menu summary")).toContainText(base_branch);
+  }
+
+  await page.request.post(`/cards/${id}/base`, { form: { base_branch: "main" } });
+});
+
+test("a base git cannot resolve is turned down", async ({ page }) => {
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "done", "Rewritten errand").getAttribute("data-card-id");
+
+  // NB: `-C` among them. `rev-parse --verify` stops git guessing at a name but
+  // not git reading a leading dash as a flag of its own.
+  for (const base_branch of ["nope", "", "-C"]) {
     const refused = await page.request.post(`/cards/${id}/base`, { form: { base_branch } });
     expect(refused.status()).toBe(422);
   }
@@ -392,7 +411,7 @@ test("a base branch git will not resolve is turned down", async ({ page }) => {
 
   git("branch", "-D", "doomed");
   await doomed.click();
-  await expect(page.locator(".drawer-error")).toContainText("No branch called doomed");
+  await expect(page.locator(".drawer-error")).toContainText("resolves doomed");
 
   await page.goto(projectUrl);
   await expect(cardIn(page, "done", "Rewritten errand")).toContainText("main");
@@ -454,22 +473,139 @@ test("a card cannot be moved into the collected lane by hand", async ({ page }) 
   await expect(cardIn(page, "todo", "Stays put")).toBeVisible();
 });
 
-test("a search cannot take the chosen branch out of the form", async ({ page }) => {
+test("a search cannot take the chosen base out of the form", async ({ page }) => {
   await page.goto(`${projectUrl}/cards/new`);
   await page.getByLabel("Task").fill("Chosen then searched past");
-  const release = page.getByRole("radio", { name: "release", exact: true });
-  await release.check();
+  await pickBranch(page, "release");
 
-  // The option is the only thing carrying the base, so a search that filtered
-  // it away would leave the form with no branch in it at all — refused on
-  // arrival, with nothing on screen to say the button had done anything. What
-  // is chosen stays, however little it matches.
+  // A row stays on offer however little it matches once it is the choice, so a
+  // search never reads as having dropped it — and what the form submits is the
+  // chip's own field, which a re-filter never touches.
+  await page.locator(".branch-menu summary").click();
   await page.getByLabel("Search branches").fill("nope");
-  await expect(page.locator("#branch-menu .empty-match")).toBeVisible();
+  await expect(page.locator("#branch-menu .ref-status.bad")).toBeVisible();
   await expect(page.locator("#branch-menu .menu-item")).toHaveText(["release"]);
-  await expect(release).toBeChecked();
 
   await page.getByRole("button", { name: "Create", exact: true }).click();
   await expect(page).toHaveURL(projectUrl);
   await expect(cardIn(page, "todo", "Chosen then searched past")).toContainText("release");
+});
+
+test("a pasted revision is a base, and the picker says what it is", async ({ page }) => {
+  const sha = git("rev-parse", "main");
+  await addCard(page, projectUrl, { title: "Based on a sha" });
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "todo", "Based on a sha").getAttribute("data-card-id");
+  await openCard(page, id);
+
+  // Pasting is the gesture a sha wants: there is no row to go looking for, the
+  // server says what it made of it, and Enter sends what was typed rather than
+  // waiting for a row to be offered back.
+  const chip = page.locator(".branch-menu summary");
+  await chip.click();
+  const search = page.getByLabel("Search branches");
+  await search.fill(sha);
+  await expect(page.locator("#branch-menu .ref-status.ok")).toHaveText(`commit ${sha.slice(0, 7)}`);
+
+  // It is a row like any other, too, carrying what the server made of it.
+  const row = page.locator("#branch-menu .menu-item").first();
+  await expect(row).toContainText(sha);
+  await expect(row.locator(".ref-kind")).toHaveText(`commit ${sha.slice(0, 7)}`);
+
+  await search.press("Enter");
+  await expect(chip).toContainText(sha);
+  // The commit is a write like the rows' own, so it leaves the address bar
+  // where they do — on the card, reloadable.
+  await expect(page).toHaveURL(new RegExp(`/cards/${id}$`));
+
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "todo", "Based on a sha")).toContainText(sha);
+});
+
+test("a remote is somewhere to look, and its branches are bases", async ({ page }) => {
+  await page.goto(`${projectUrl}/cards/new`);
+  await page.getByLabel("Task").fill("Based on a remote");
+  await page.locator(".branch-menu summary").click();
+
+  // A remote's name is a row but not a base. Taking it types its prefix into
+  // the search box, the way a directory completion steps into a directory, and
+  // what comes back is what is under it.
+  const search = page.getByLabel("Search branches");
+  const rows = page.locator("#branch-menu .menu-item");
+  await search.fill("ori");
+  await expect(rows).toHaveText(["main", "origin/"]);
+
+  await page.locator("#branch-menu .remote").click();
+  await expect(search).toHaveValue("origin/");
+  await expect(rows).toHaveText(["origin/main", "origin/upstream-only", "main"]);
+
+  await page.getByRole("button", { name: "origin/upstream-only", exact: true }).click();
+  await expect(page.locator(".branch-menu summary")).toContainText("origin/upstream-only");
+
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(page).toHaveURL(projectUrl);
+  await expect(cardIn(page, "todo", "Based on a remote")).toContainText("origin/upstream-only");
+});
+
+test("a base git cannot resolve never becomes a card", async ({ page }) => {
+  const path = new URL(projectUrl).pathname;
+  const refused = await page.request.post(`${path}/cards`, {
+    form: { task: "Never created", base_branch: "nope", permission_mode: "plan", model: "" },
+  });
+  expect(await refused.text()).toContain("not something git can resolve");
+
+  await page.goto(projectUrl);
+  await expect(cardIn(page, "todo", "Never created")).toHaveCount(0);
+
+  // Through the form the field cannot reach that state at all: a revision
+  // nothing resolves is not adopted, and the menu stays open saying why.
+  await page.goto(`${projectUrl}/cards/new`);
+  await page.locator(".branch-menu summary").click();
+  const search = page.getByLabel("Search branches");
+  await search.fill("nope");
+  await search.press("Enter");
+
+  await expect(page.locator("#branch-menu .ref-status.bad")).toBeVisible();
+  await expect(page.locator(".branch-menu summary")).toContainText("main");
+  await expect(search).toBeFocused();
+
+  // And again: a base already standing and already refused is still a refusal,
+  // not a no-op that shuts the menu saying nothing.
+  await search.press("Enter");
+  await expect(page.locator("#branch-menu .ref-status.bad")).toBeVisible();
+});
+
+test("a base that goes away says so on the chip", async ({ page }) => {
+  git("branch", "doomed-base");
+  await addCard(page, projectUrl, { title: "Based on the doomed", base: "doomed-base" });
+  await page.goto(projectUrl);
+  const id = await cardIn(page, "todo", "Based on the doomed").getAttribute("data-card-id");
+
+  // Nothing resolves it any more, and a card that cannot be started is worth
+  // seeing before Start rather than after it — `relane` answers either way.
+  git("branch", "-D", "doomed-base");
+  await openCard(page, id);
+  await expect(page.locator(".branch-menu summary")).toHaveClass(/invalid/);
+  await expect(page.locator(".branch-menu summary")).toHaveAttribute("title", /git can resolve/);
+});
+
+test("a row that went away leaves the form's base alone", async ({ page }) => {
+  git("branch", "fleeting");
+  await page.goto(`${projectUrl}/cards/new`);
+  await page.locator(".branch-menu summary").click();
+
+  // The same staleness the drawer's rows are refused for: the list is a
+  // snapshot. Here there is a field behind it, and emptying that would leave
+  // the form with no base at all — refused on arrival, with nothing on screen
+  // to say the row had done anything.
+  const fleeting = page.getByRole("button", { name: "fleeting", exact: true });
+  await expect(fleeting).toBeVisible();
+  git("branch", "-D", "fleeting");
+  await fleeting.click();
+
+  // Waited on first: only the response carries the refused name, so the chip
+  // below cannot be read before the swap that would have emptied it.
+  await expect(page.getByLabel("Search branches")).toHaveValue("fleeting");
+  await expect(page.locator(".branch-menu summary")).toContainText("main");
+  await expect(page.locator("#branch-menu .ref-status.bad")).toBeVisible();
 });

@@ -44,6 +44,13 @@ test("capture the whole flow @shots", async ({ page }) => {
   await page.getByLabel("Task").fill("Teach the CLI to speak JSON");
   await shot(page, "04-new-card");
 
+  // The base picker is the same chip here as on a card, and a remote's prefix
+  // is how its branches are reached.
+  await page.locator(".branch-menu summary").click();
+  await page.getByLabel("Search branches").fill("origin/");
+  await expect(page.locator("#branch-menu .menu-item").first()).toHaveText("origin/main");
+  await shot(page, "04b-new-card-base");
+
   await page.goto(projectUrl);
   cardId = await cardIn(page, "todo", "Add a build banner").getAttribute("data-card-id");
   await shot(page, "05-board");

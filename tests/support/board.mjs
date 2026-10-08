@@ -102,7 +102,7 @@ export async function addCard(
 ) {
   await page.goto(`${projectUrl}/cards/new`);
   await page.getByLabel("Task").fill(description ? `${title}\n\n${description}` : title);
-  await page.getByRole("radio", { name: base, exact: true }).check();
+  await pickBranch(page, base);
   if (permissions) await page.getByLabel("Permissions").selectOption(permissions);
   if (model) await page.getByLabel("Model").selectOption(model);
   // Only rendered where the project offers more than one, so only named when a
@@ -110,6 +110,21 @@ export async function addCard(
   if (vcs) await page.getByLabel("Version control").selectOption(vcs);
   await page.getByRole("button", { name: "Create", exact: true }).click();
   await expect(page).toHaveURL(projectUrl);
+}
+
+/**
+ * Takes a base out of the picker, wherever it is drawn.
+ *
+ * The chip is the same control in the card form and in a card's drawer, so this
+ * is one helper: open it, take the row, and wait for the chip to say so. In the
+ * form that is the server handing the picker back with the choice in it; on a
+ * card it is the whole page coming back.
+ */
+export async function pickBranch(page, base) {
+  const picker = page.locator(".branch-menu");
+  await picker.locator("summary").click();
+  await picker.getByRole("button", { name: base, exact: true }).click();
+  await expect(picker.locator("summary")).toContainText(base);
 }
 
 export const lane = (page, key) => page.locator(`[data-lane="${key}"]`);

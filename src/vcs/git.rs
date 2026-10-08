@@ -180,16 +180,48 @@ pub async fn head_branch(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Every remote the repository knows, in the order git lists them.
+pub async fn remotes(repo: &Path) -> Vec<String> {
+    run(repo, &["remote"])
+        .await
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// One remote's branches, named the way git names them: `<remote>/<branch>`.
+///
+/// `<remote>/HEAD` is left out. It is a symbolic ref at whichever branch the
+/// remote calls default, so offering it is the same commit twice under two
+/// names — and the picker is a list of things to tell apart.
+pub async fn remote_branches(repo: &Path, remote: &str) -> Vec<String> {
+    let head = format!("{remote}/HEAD");
+    run(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            &format!("refs/remotes/{remote}"),
+        ],
+    )
+    .await
+    .map(|s| {
+        s.lines()
+            .filter(|n| *n != head)
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// What [`rev_parse`] is being asked to resolve.
 ///
-/// A kind rather than a string, because git reads a bare name generously: the
-/// same word can be a branch, a tag or a file, and `HEAD~3` is a revision too.
-/// Naming the kind is what makes "is this a branch?" answerable.
+/// `Head` is named rather than spelt because it is per-worktree: which
+/// repository it is asked in is the whole of what it means.
 #[derive(Clone, Copy, Debug)]
 pub enum Rev<'a> {
-    /// A local branch, and only a branch: `refs/heads/<name>`.
-    Branch(&'a str),
-    /// A ref by its full name — `refs/{APP_SLUG}/<card>/base` and its siblings.
+    /// A revision as git reads it — `refs/{APP_SLUG}/<card>/base`, a branch, a
+    /// tag, a sha, `HEAD~3`. Git reads a bare name generously, and this is that
+    /// reading; [`resolve`] is where input someone typed goes.
     Ref(&'a str),
     /// Whatever the repository or worktree has checked out.
     Head,
@@ -199,7 +231,6 @@ impl Rev<'_> {
     /// The revision as git should read it.
     fn spec(&self) -> String {
         match self {
-            Rev::Branch(name) => format!("refs/heads/{name}"),
             Rev::Ref(name) => (*name).to_owned(),
             Rev::Head => "HEAD".to_owned(),
         }
@@ -219,6 +250,59 @@ pub async fn rev_parse(repo: &Path, rev: Rev<'_>) -> Option<String> {
     .await
     .ok()
     .filter(|sha| !sha.is_empty())
+}
+
+/// What a revision turned out to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    Branch,
+    Remote,
+    Tag,
+    /// A revision that names no ref: a sha, or an expression like `HEAD~3`.
+    Commit,
+}
+
+/// A revision that resolved, and what kind of thing it named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub sha: String,
+    pub kind: RefKind,
+}
+
+/// Reads `rev` as generously as git does, and says what it was.
+///
+/// [`rev_parse`] answers "what commit is this?". This answers "can a card be
+/// based on what someone typed?" — and says what it turned out to be, which is
+/// the difference between a picker that validates and one that only accepts.
+/// Everything downstream of a card's base hands it to git as a bare revision,
+/// so whatever resolves here is usable.
+pub async fn resolve(repo: &Path, rev: &str) -> Option<Resolved> {
+    // NB: this is form input. `--verify` stops git guessing at a name, but not
+    // git reading a leading dash as a flag of its own — and an empty revision
+    // is `HEAD`, which would make "nothing typed" resolve.
+    if rev.is_empty() || rev.starts_with('-') {
+        return None;
+    }
+
+    let sha = rev_parse(repo, Rev::Ref(rev)).await?;
+
+    // Already resolved, so a name that is not a ref is a revision rather than a
+    // failure: `--symbolic-full-name` prints nothing for a sha.
+    let full = run(repo, &["rev-parse", "--symbolic-full-name", rev])
+        .await
+        .unwrap_or_default();
+
+    let kind = if full.starts_with("refs/heads/") {
+        RefKind::Branch
+    } else if full.starts_with("refs/remotes/") {
+        RefKind::Remote
+    } else if full.starts_with("refs/tags/") {
+        RefKind::Tag
+    } else {
+        RefKind::Commit
+    };
+
+    Some(Resolved { sha, kind })
 }
 
 /// Creates a detached worktree at `path` based on `base_branch`, and records the
@@ -932,34 +1016,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asking_for_a_branch_gets_a_branch_and_nothing_else() {
+    async fn resolve_reads_a_revision_and_says_what_it_was() {
         let (settings, repo) = scratch("rev-parse").await;
         let head = run(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         run(&repo, &["tag", "v1"]).await.unwrap();
+        run(&repo, &["update-ref", "refs/remotes/origin/main", &head])
+            .await
+            .unwrap();
 
-        assert_eq!(
-            rev_parse(&repo, Rev::Branch("main")).await,
-            Some(head.clone())
-        );
-        assert_eq!(rev_parse(&repo, Rev::Head).await, Some(head.clone()));
-        assert_eq!(rev_parse(&repo, Rev::Branch("nope")).await, None);
-        assert_eq!(rev_parse(&repo, Rev::Branch("")).await, None);
-        // A tag and a raw sha are revisions, but they are not branches — which
-        // is the whole reason the caller says which kind it means.
-        assert_eq!(rev_parse(&repo, Rev::Branch("v1")).await, None);
-        assert_eq!(rev_parse(&repo, Rev::Branch(&head)).await, None);
+        let kind = async |rev: &str| resolve(&repo, rev).await.map(|r| (r.sha, r.kind));
+        let at = |k| Some((head.clone(), k));
 
-        run(&repo, &["branch", "feature"]).await.unwrap();
-        assert_eq!(
-            rev_parse(&repo, Rev::Branch("feature")).await,
-            Some(head.clone())
-        );
-        run(&repo, &["branch", "-D", "feature"]).await.unwrap();
-        assert_eq!(rev_parse(&repo, Rev::Branch("feature")).await, None);
+        assert_eq!(kind("main").await, at(RefKind::Branch));
+        assert_eq!(kind("origin/main").await, at(RefKind::Remote));
+        assert_eq!(kind("v1").await, at(RefKind::Tag));
+        assert_eq!(kind(&head).await, at(RefKind::Commit));
+        // `HEAD` is symbolic here, so it reads as the branch it is at — which
+        // is what it is, and what the chip should say about it.
+        assert_eq!(kind("HEAD").await, at(RefKind::Branch));
+        assert_eq!(kind("nope").await, None);
 
-        // A ref of ours, by its full name.
+        // NB: both would otherwise be answered by git rather than refused —
+        // the empty revision is `HEAD`, and a leading dash is a flag.
+        assert_eq!(kind("").await, None);
+        assert_eq!(kind("-C").await, None);
+
+        // A ref of ours, by its full name, is still the narrow question.
         let base = settings.base_ref(1);
         assert_eq!(rev_parse(&repo, Rev::Ref(&base)).await, None);
+        assert_eq!(rev_parse(&repo, Rev::Head).await, Some(head.clone()));
         run(&repo, &["update-ref", &base, &head]).await.unwrap();
         assert_eq!(rev_parse(&repo, Rev::Ref(&base)).await, Some(head));
     }

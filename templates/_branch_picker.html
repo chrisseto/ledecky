@@ -1,0 +1,49 @@
+{#
+  The base a card is on, and how it is changed: a chip that says what the base
+  is, and a menu that re-points it. The same control in the card drawer and in
+  the card form — `picker.post_to` is what tells them apart.
+
+  On a card each row posts itself, the way the lane menu moves a card. In the
+  form there is nothing to post to yet, so a row asks for this fragment back
+  with its value as the base: the chip, what is said about it and the hidden
+  field the form submits are re-rendered together and cannot disagree.
+#}
+<details class="branch-menu" id="branch-picker" {% if picker.open %}open{% endif %}
+         hx-on:toggle="if (this.open) this.querySelector('.search').focus()">
+  <summary class="chip mono {% if not picker.base_valid %}invalid{% endif %}"
+           title="{% if not picker.base_branch %}No base chosen yet{% elif not picker.base_valid %}{{ picker.base_branch }} is not something git can resolve{% elif picker.base_note %}{{ picker.base_note }}{% else %}Change the base{% endif %}">
+    {% if picker.base_valid %}{{ icon("git-branch") }}{% else %}{{ icon("alert-triangle") }}{% endif %}
+    <span class="name">{{ picker.base_branch or "Pick a base" }}</span>
+    {{ icon("chevron-down") }}
+  </summary>
+
+  <div class="menu">
+    {# NB: `form="not-a-form"`, so the search box belongs to no form and is
+       never submitted with the card. It still carries its own `hx-get`, which
+       sends the field's value whatever owns it. `data-commit-url` is where
+       Enter sends what has been typed — the one gesture a pasted sha wants. #}
+    <input class="mono search" type="search" name="q" form="not-a-form"
+           value="{{ picker.q }}"
+           placeholder="Branch, tag, sha…" autocomplete="off" spellcheck="false"
+           aria-label="Search branches"
+           data-commit-url="{{ picker.post_to or picker.pick_to }}"
+           {% if picker.post_to %}data-commit-post{% endif %}
+           {# NB: `open` is set in the markup, so no `toggle` is raised to focus
+              off — a menu the server reopened has to be focused on arrival. #}
+           {% if picker.open %}data-autofocus{% endif %}
+           hx-get="{{ picker.search_to }}"
+           hx-trigger="input changed delay:120ms"
+           {# The form's choice rides along so a re-filter cannot take it out of
+              the list. The drawer has nothing to keep — its rows post rather
+              than carry — so its menu narrows to the matches alone. #}
+           {% if not picker.post_to %}hx-include="#base-branch"{% endif %}
+           hx-target="#branch-menu" hx-swap="outerHTML" hx-sync="this:replace" />
+
+    {% include "_branch_menu.html" %}
+  </div>
+
+  {# The form's actual field. The chip is what shows it; this is what submits. #}
+  {% if not picker.post_to %}
+    <input type="hidden" id="base-branch" name="base_branch" value="{{ picker.base_branch }}" />
+  {% endif %}
+</details>

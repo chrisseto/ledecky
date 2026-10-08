@@ -59,8 +59,16 @@ export function provision(root) {
   git(repo, "add", "-A");
   git(repo, "commit", "-qm", "init");
 
-  // A second branch so the base-branch picker has something to choose between.
+  // A second branch so the base picker has something to choose between.
   git(repo, "branch", "release");
+
+  // A remote, and branches under it. NB: refs written by hand rather than
+  // fetched — the picker reads `refs/remotes/`, and nothing here should need a
+  // network or a second repository on disk to have something to read.
+  git(repo, "remote", "add", "origin", "https://ledecky.test/scratch.git");
+  for (const name of ["main", "upstream-only"]) {
+    git(repo, "update-ref", `refs/remotes/origin/${name}`, "HEAD");
+  }
 
   // An empty config, so jj never reads the developer's own. Not about the
   // identity — jj warns and carries on without one — but about `git.colocate`,

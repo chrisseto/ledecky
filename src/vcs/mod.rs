@@ -489,7 +489,9 @@ mod tests {
         jj::run(&repo, &["bookmark", "set", "main", "-r", "@-"])
             .await
             .unwrap();
-        let upstream = git::rev_parse(&repo, Rev::Branch("main")).await.unwrap();
+        let upstream = git::rev_parse(&repo, Rev::Ref("refs/heads/main"))
+            .await
+            .unwrap();
         assert_ne!(upstream, base);
 
         jj::run(&path, &["rebase", "-d", "main"]).await.unwrap();

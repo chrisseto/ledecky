@@ -1,28 +1,45 @@
 {#
-  The branches matching what has been typed, and how one is picked.
-
-  On a card it is picked by posting it, the way the lane menu moves a card. In
-  the card form there is nothing to post to yet, so the option *is* the field:
-  a radio the form carries when it is submitted.
+  What matches, and what the server makes of it. Rewritten on every keystroke;
+  `_branch_picker.html` holds the chip and the search box around it.
 #}
 <div class="branch-options" id="branch-menu">
-  {# Said whether or not the list is empty, because the branch already chosen
-     stays in it however little it matches. #}
-  {% if not matched %}<p class="empty-match">No branch matches</p>{% endif %}
-  {% for branch in branches %}
-    {% if post_to %}
-      <form method="post" action="{{ post_to }}"
-            hx-post="{{ post_to }}" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
-        <button class="menu-item mono" type="submit" name="base_branch" value="{{ branch }}">
-          {{ branch }}
+  {% if picker.status %}
+    <p class="ref-status {% if picker.status_ok %}ok{% else %}bad{% endif %}">
+      {% if picker.status_ok %}{{ icon("check") }}{% endif %}{{ picker.status }}
+    </p>
+  {% endif %}
+
+  {% for choice in picker.choices %}
+    {% if choice.fill %}
+      {# A remote is somewhere to look. Picking it types its prefix into the
+         search box, which is what lists the branches under it. #}
+      <button class="menu-item mono remote" type="button"
+              data-fill="{{ choice.value }}">
+        {{ choice.value }}{{ icon("chevron-right") }}
+      </button>
+    {% elif picker.post_to %}
+      <form method="post" action="{{ picker.post_to }}"
+            hx-post="{{ picker.post_to }}" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
+        <button class="menu-item mono" type="submit" name="base_branch" value="{{ choice.value }}">
+          {{ choice.value }}
+          {% if choice.note %}<span class="ref-kind">{{ choice.note }}</span>{% endif %}
         </button>
       </form>
     {% else %}
-      <label class="menu-item mono">
-        <input type="radio" name="base_branch" value="{{ branch }}"
-               {% if branch == base_branch %}checked{% endif %} />
-        {{ branch }}
-      </label>
+      {# `chosen` so a row whose ref went away between the draw and the click
+         leaves the base alone rather than emptying the field — the list is a
+         snapshot, and the one already chosen is on it however little it
+         matches. #}
+      <button class="menu-item mono" type="button"
+              hx-get="{{ picker.pick_to }}?base_branch={{ choice.value | urlencode }}&chosen={{ picker.base_branch | urlencode }}"
+              hx-target="#branch-picker" hx-swap="outerHTML">
+        {{ choice.value }}
+        {% if choice.note %}<span class="ref-kind">{{ choice.note }}</span>{% endif %}
+      </button>
     {% endif %}
   {% endfor %}
+
+  {% if picker.truncated %}
+    <p class="ref-status">More than this match — keep typing.</p>
+  {% endif %}
 </div>

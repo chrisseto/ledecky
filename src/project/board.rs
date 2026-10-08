@@ -6,6 +6,7 @@ use minijinja::context;
 use rocket::form::Form;
 use rocket::http::Status;
 use rocket::response::Redirect;
+use rocket::serde::Serialize;
 use rocket::{get, post, State};
 
 use crate::agent::AgentManager;
@@ -35,6 +36,14 @@ pub const MODELS: &[(&str, &str)] = &[
 ];
 
 const EMPTY_TASK: &str = "A card needs a task for the agent.";
+
+/// Said when the base does not resolve. The picker will not offer one that
+/// does not, so this is a base that went away while the form was open, or a
+/// post that never came from the form at all.
+const BAD_BASE: &str = "That base is not something git can resolve.";
+
+/// How many rows the picker will offer before it asks for more typing.
+const MAX_CHOICES: usize = 50;
 
 /// What is open over the board.
 ///
@@ -268,7 +277,7 @@ pub async fn card_view(
     let review = review::routes::initial(db, settings, cache, id, scope).await?;
     // The chip's menu opens on what the page already holds, so there is nothing
     // to wait for; the search box re-renders it from there.
-    let branches = git::branches(&project.repo()).await;
+    let picker = picker(&project, "", &card.base_branch, Some(id)).await;
 
     Ok(Shell {
         db,
@@ -278,7 +287,7 @@ pub async fn card_view(
     .render(
         Some(project),
         CARD,
-        context! { live, branches, error, editable => card.editable(), ..review },
+        context! { live, picker, error, editable => card.editable(), ..review },
     )
     .await)
 }
@@ -341,15 +350,181 @@ impl Fields {
     }
 }
 
-/// The base branches matching `q`, and how one of them is picked.
+/// One row of the picker's list.
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde")]
+struct Choice {
+    /// The base this sets, or — for a remote — the prefix it fills the search
+    /// box with.
+    value: String,
+    /// What the value is, when its name does not say: `commit a1b2c3d`.
+    note: Option<String>,
+    /// A remote to look inside rather than a base to pick.
+    fill: bool,
+}
+
+/// How a resolved revision reads beside its name.
+fn describe(resolved: &git::Resolved) -> String {
+    let short = resolved.sha.get(..7).unwrap_or(&resolved.sha);
+    match resolved.kind {
+        git::RefKind::Branch => format!("branch {short}"),
+        git::RefKind::Remote => format!("remote branch {short}"),
+        git::RefKind::Tag => format!("tag {short}"),
+        git::RefKind::Commit => format!("commit {short}"),
+    }
+}
+
+/// Everything the branch picker renders from, wherever it is drawn: the chip,
+/// what it says about the base, the rows under the search box, and the verdict
+/// on what has been typed.
 ///
-/// `card` says the menu belongs to a card, whose options post themselves at it;
-/// without one they are the card form's own field, and `base_branch` is which
-/// of them a re-filter has to leave checked.
+/// One helper for all four sites — both fragment routes and both pages — so
+/// that what is chosen and what is said about it cannot disagree. Rendering a
+/// page and rendering the fragment it will later swap used to be two different
+/// contexts, and the half the pages left out is what put "No branch matches"
+/// above a full list on every first paint.
 ///
-/// NB: `git::branches` on every keystroke, the way `project::complete` lists a
-/// directory on every one. Two short-lived git processes against a repository
-/// that is almost certainly warm.
+/// NB: git on every keystroke, the way `project::complete` lists a directory on
+/// every one. Up to six short-lived processes now — the remotes, one ref
+/// listing, and a resolve each for what is typed and what is chosen — against a
+/// repository that is almost certainly warm. The resolves only run when there
+/// is something to resolve.
+async fn picker(project: &Project, q: &str, base: &str, card: Option<i64>) -> minijinja::Value {
+    let repo = project.repo();
+    let wanted = q.trim();
+    let lowered = wanted.to_lowercase();
+    let remotes = git::remotes(&repo).await;
+
+    // `origin/` reads the way a trailing slash reads in the directory
+    // completion: the prefix says where to look, and the whole of it still
+    // filters inside. Only a name git knows drills in — a branch called
+    // `feature/x` is not a remote called `feature`.
+    let drilled = wanted
+        .split_once('/')
+        .map(|(remote, _)| remote)
+        .filter(|remote| remotes.iter().any(|known| known == remote));
+
+    let listed = match drilled {
+        Some(remote) => git::remote_branches(&repo, remote).await,
+        None => git::branches(&repo).await,
+    };
+
+    let mut names: Vec<String> = listed
+        .into_iter()
+        .filter(|name| name.to_lowercase().contains(&lowered))
+        .collect();
+
+    // A remote is somewhere to look, not something to base a card on — and
+    // only offered when the search is not already inside one.
+    let stepping: Vec<String> = match drilled {
+        Some(_) => Vec::new(),
+        None => remotes
+            .iter()
+            .filter(|remote| remote.to_lowercase().contains(&lowered))
+            .map(|remote| format!("{remote}/"))
+            .collect(),
+    };
+
+    // Whether the *search* found anything, which is a different question once
+    // the chosen base is in the list regardless. A remote counts: `ori` is a
+    // search that got somewhere, whether or not it is itself a revision.
+    let matched = !names.is_empty() || !stepping.is_empty();
+
+    // NB: the cap falls on the branches alone. The chosen base goes on after it
+    // and the remotes are a handful, so what a long list drops is only ever a
+    // branch nobody has narrowed down to yet.
+    let truncated = names.len() > MAX_CHOICES;
+    names.truncate(MAX_CHOICES);
+
+    // The base stays on offer however little it matches, so a re-filter never
+    // reads as having dropped the choice.
+    if !base.is_empty() && !names.iter().any(|name| name == base) {
+        names.push(base.to_owned());
+    }
+
+    let typed = match wanted.is_empty() {
+        true => None,
+        false => git::resolve(&repo, wanted).await,
+    };
+
+    let mut choices = Vec::new();
+
+    // What was typed, when git resolves it and it is not already on offer. This
+    // is the whole of pasting a sha: the server says what it is, and the row
+    // carries it verbatim.
+    if let Some(resolved) = &typed {
+        if !names.iter().any(|name| name == wanted) {
+            choices.push(Choice {
+                value: wanted.to_owned(),
+                note: Some(describe(resolved)),
+                fill: false,
+            });
+        }
+    }
+
+    choices.extend(names.into_iter().map(|value| Choice {
+        value,
+        note: None,
+        fill: false,
+    }));
+
+    choices.extend(stepping.into_iter().map(|value| Choice {
+        value,
+        note: None,
+        fill: true,
+    }));
+
+    // Said only when it is news. A search that resolves is worth confirming; a
+    // prefix that matches branches is working, whether or not it is itself a
+    // revision; and nothing matching is the one thing that needs explaining.
+    let status = match (&typed, matched) {
+        (Some(resolved), _) => Some(describe(resolved)),
+        (None, true) => None,
+        (None, false) if wanted.is_empty() => None,
+        (None, false) => Some(format!("Nothing in {} resolves “{wanted}”", project.name)),
+    };
+    let status_ok = typed.is_some();
+
+    // The chip's own marker. A base that does not resolve can never start a
+    // card, and that is worth seeing before Start rather than after it.
+    let chosen = match base == wanted {
+        true => typed,
+        false => match base.is_empty() {
+            true => None,
+            false => git::resolve(&repo, base).await,
+        },
+    };
+
+    let search_to = match card {
+        Some(card) => format!("/projects/{}/branches?card={card}", project.id),
+        None => format!("/projects/{}/branches", project.id),
+    };
+
+    context! {
+        choices, truncated, status_ok,
+        q => wanted,
+        // A complaint is the one thing worth staying open for: it is about what
+        // was typed, and closing the menu would take both away.
+        open => status.is_some() && !status_ok,
+        status,
+        base_branch => base,
+        base_valid => chosen.is_some(),
+        // Said on the chip only when the name does not already say it: a local
+        // branch is what the icon beside it means.
+        base_note => chosen
+            .as_ref()
+            .filter(|resolved| resolved.kind != git::RefKind::Branch)
+            .map(describe),
+        search_to,
+        // A card's rows post themselves at the card. The form has nothing to
+        // post to, so a row re-renders the picker instead and the server is
+        // what puts the choice in the field.
+        post_to => card.map(|card| format!("/cards/{card}/base")),
+        pick_to => format!("/projects/{}/branch-picker", project.id),
+    }
+}
+
+/// The rows matching `q`, which is what the search box re-renders.
 #[get("/projects/<id>/branches?<q>&<card>&<base_branch>")]
 pub async fn branch_menu(
     db: &State<DB>,
@@ -359,33 +534,58 @@ pub async fn branch_menu(
     base_branch: Option<&str>,
 ) -> Result<Tmpl, Status> {
     let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
-    let wanted = q.unwrap_or_default().trim().to_lowercase();
-    let all = git::branches(&project.repo()).await;
+    let context = picker(
+        &project,
+        q.unwrap_or_default(),
+        base_branch.unwrap_or_default(),
+        card,
+    )
+    .await;
 
-    // An option is shown if it matches, or if it is the one already chosen.
+    Ok(Tmpl("_branch_menu.html", context! { picker => context }))
+}
+
+/// The whole picker, which is how the card form adopts a choice.
+///
+/// There is nothing to post to before the card exists, so a row asks for the
+/// picker back with its value as the base: the chip, the verdict on it and the
+/// hidden field the form submits are all re-rendered together, and so cannot
+/// disagree. A base git will not resolve is not adopted — the previous one
+/// stands and the status line says why, which keeps the field always valid.
+#[get("/projects/<id>/branch-picker?<base_branch>&<chosen>")]
+pub async fn branch_picker(
+    db: &State<DB>,
+    id: i64,
+    base_branch: Option<&str>,
+    chosen: Option<&str>,
+) -> Result<Tmpl, Status> {
+    let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
+    let repo = project.repo();
+
+    let asked = base_branch.unwrap_or_default().trim();
+    let standing = chosen.unwrap_or_default().trim();
+    let taken = git::resolve(&repo, asked).await.is_some();
+    let base = match taken {
+        true => asked,
+        false => standing,
+    };
+
+    // The ask is dropped from the search box once it lands: the box has done its
+    // job, and leaving it filled would re-open on a filtered list. A refusal
+    // keeps it, because that is what the complaint is about — and a row that
+    // went stale is a refusal nobody typed, so the box is where its name
+    // surfaces.
     //
-    // NB: the second half is not a nicety. In the card form the option *is* the
-    // field carrying the base, so a search that filtered the chosen one away
-    // would submit a card with no base at all — refused on arrival, and from
-    // the outside indistinguishable from the button doing nothing.
-    let branches: Vec<String> = all
-        .iter()
-        .filter(|b| b.to_lowercase().contains(&wanted) || Some(b.as_str()) == base_branch)
-        .cloned()
-        .collect();
+    // NB: on whether it resolved, not on whether the base changed. Re-sending a
+    // base that is already standing and already broken is a refusal too, and
+    // reading it as a no-op would shut the menu saying nothing.
+    let typed = match taken {
+        true => "",
+        false => asked,
+    };
 
-    // Whether the *search* found anything, which is a different question once
-    // the chosen one is in the list regardless.
-    let matched = all.iter().any(|b| b.to_lowercase().contains(&wanted));
-
-    // A card's menu posts each option at the card; the form's has nothing to
-    // post to yet, and carries the choice as a radio instead.
-    let post_to = card.map(|card| format!("/cards/{card}/base"));
-
-    Ok(Tmpl(
-        "_branch_menu.html",
-        context! { branches, matched, post_to, base_branch },
-    ))
+    let context = picker(&project, typed, base, None).await;
+    Ok(Tmpl("_branch_picker.html", context! { picker => context }))
 }
 
 /// Everything `_modal_card.html` renders from. `card` is what makes it an edit
@@ -396,9 +596,14 @@ async fn form_context(
     fields: Fields,
     error: Option<&str>,
 ) -> minijinja::Value {
-    let branches = git::branches(&project.repo()).await;
+    // `branches` puts the checked-out one first, which is what makes it the
+    // default a new card opens on.
     let base_branch = match fields.base_branch.is_empty() {
-        true => branches.first().cloned().unwrap_or_default(),
+        true => git::branches(&project.repo())
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_default(),
         false => fields.base_branch,
     };
 
@@ -416,7 +621,8 @@ async fn form_context(
     };
 
     context! {
-        card, error, branches, base_branch, vcs_options,
+        card, error, vcs_options,
+        picker => picker(project, "", &base_branch, None).await,
         task => fields.task,
         permission_mode => fields.permission_mode,
         model => fields.model,
@@ -467,9 +673,20 @@ async fn create(
     };
 
     let task = form.task.trim();
-    if task.is_empty() {
-        let context =
-            form_context(&project, None, Fields::submitted(&form), Some(EMPTY_TASK)).await;
+    let base_branch = form.base_branch.trim();
+    // Validate, then mutate. A base nothing resolves is a card that can never
+    // be started, and `relane` answers 204 whether or not the worktree it then
+    // asks for could be made — so refused here is the only place it is said.
+    let complaint = match task.is_empty() {
+        true => Some(EMPTY_TASK),
+        false => match git::resolve(&project.repo(), base_branch).await {
+            Some(_) => None,
+            None => Some(BAD_BASE),
+        },
+    };
+
+    if let Some(complaint) = complaint {
+        let context = form_context(&project, None, Fields::submitted(&form), Some(complaint)).await;
         return Err(Shell {
             db,
             settings,
@@ -484,7 +701,7 @@ async fn create(
         NewCard {
             project_id: id,
             task,
-            base_branch: form.base_branch.trim(),
+            base_branch,
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
             vcs: chosen_vcs(&project, form.vcs.as_deref()),
@@ -532,12 +749,21 @@ async fn update(
         .ok_or(Status::NotFound)?;
 
     let task = form.task.trim();
-    if task.is_empty() {
+    let base_branch = form.base_branch.trim();
+    let complaint = match task.is_empty() {
+        true => Some(EMPTY_TASK),
+        false => match git::resolve(&project.repo(), base_branch).await {
+            Some(_) => None,
+            None => Some(BAD_BASE),
+        },
+    };
+
+    if let Some(complaint) = complaint {
         let context = form_context(
             &project,
             Some(&card),
             Fields::submitted(&form),
-            Some(EMPTY_TASK),
+            Some(complaint),
         )
         .await;
         return Ok(Err(Shell {
@@ -554,7 +780,7 @@ async fn update(
         id,
         CardEdit {
             task,
-            base_branch: form.base_branch.trim(),
+            base_branch,
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
         },
@@ -578,10 +804,11 @@ pub struct BaseForm {
     base_branch: String,
 }
 
-/// Re-points a card at another base branch, from the chip in its drawer.
+/// Re-points a card at another base, from the chip in its drawer.
 ///
-/// Unlike the form's `update`, this lands on a card an agent is already working
-/// in — so the name is resolved against git rather than against the list the
+/// Anything git resolves will do — a branch, a tag, a remote-tracking ref, a
+/// pasted sha — because everything downstream hands the base to git as a bare
+/// revision. The name is resolved against git rather than against the list the
 /// page was drawn from, which can be stale by the time the form comes back.
 /// Nothing is written until it resolves.
 ///
@@ -629,13 +856,10 @@ pub async fn set_base(
     }
 
     let branch = form.base_branch.trim();
-    if git::rev_parse(&project.repo(), git::Rev::Branch(branch))
-        .await
-        .is_none()
-    {
+    if git::resolve(&project.repo(), branch).await.is_none() {
         return refused(
             Status::UnprocessableEntity,
-            format!("No branch called {branch} in {}.", project.name),
+            format!("Nothing in {} resolves {branch}.", project.name),
         )
         .await;
     }

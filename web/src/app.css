@@ -2,7 +2,7 @@
 
 /* Came from unpoly's stylesheet, which this replaced; several things here
    still lean on it:
-   `.combo-menu`, `.empty-match`, `#tab-stat`, `.badge` and `#pane-stale` are
+   `.combo-menu`, `.ref-status`, `#tab-stat`, `.badge` and `#pane-stale` are
    all shown and hidden by the attribute alone, against rules that set `display`
    themselves. Doubling the selector is what outweighs them. */
 [hidden][hidden] { display: none !important; }
@@ -699,31 +699,46 @@ header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; 
   font-size: 12.5px;
   font-weight: 500;
 }
-/* NB: out from under the blanket `input` rule above, which is written for text
-   fields and would otherwise make each radio a 36px-tall bordered box. */
-.branch-options input[type="radio"] {
-  appearance: auto;
-  flex: none;
-  width: 13px;
-  height: 13px;
+/* What a row is, when its name does not say: a sha, a kind. Pushed right, so
+   the names still read as a column. */
+.branch-options .ref-kind {
+  margin-left: auto;
+  padding-left: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+/* A remote is somewhere to step into rather than a base to pick. */
+.branch-options .remote .icon { margin-left: auto; width: 11px; height: 11px; opacity: 0.7; }
+
+/* What the server makes of what has been typed. */
+.ref-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   margin: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  accent-color: var(--accent);
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
 }
-.empty-match { margin: 0; padding: 6px 8px; font-size: 12px; color: var(--fg-dim); }
+.ref-status .icon { width: 12px; height: 12px; }
+.ref-status.ok { font-family: var(--mono); color: var(--accent); }
+.ref-status.bad { color: var(--del); }
 
-/* In the card form the list stands on the page and needs its own frame; in the
-   chip it is what the menu already frames. */
-.combo > .branch-options {
-  padding: 4px;
-  border: 1px solid var(--border-control);
-  border-radius: var(--radius);
-  background: var(--bg-deep);
-}
-
+/* The chip is the form's field as much as the drawer's control, so it stands
+   the height of the selects beside it — and drops its chevron where a select
+   drops one. */
+.combo .branch-menu summary { height: 36px; }
+.combo .branch-menu summary .icon:last-child { margin-left: auto; }
 .branch-menu summary { text-transform: none; letter-spacing: 0; font-weight: 500; }
+/* A pasted sha is forty characters and a chip is not. Clipped rather than
+   shortened: what it says is what the card is on. */
+.branch-menu summary .name {
+  overflow: hidden;
+  max-width: 22ch;
+  text-overflow: ellipsis;
+}
+.branch-menu summary.invalid { border-color: var(--del-line); color: var(--del); }
 .branch-menu .menu { min-width: 220px; gap: 4px; }
 
 /* ---- directory autocomplete ---- */

@@ -88,6 +88,76 @@ document.addEventListener("click", (event) => {
   input.dispatchEvent(new Event("input", { bubbles: true }));
 });
 
+// ---- the base picker --------------------------------------------------------
+// The rows come from the server and commit themselves. These are the two
+// gestures no row can be: typing a revision git knows and pressing Enter, and
+// stepping into a remote.
+
+// A remote is somewhere to look rather than a base to pick, so taking one types
+// its prefix into the search box and lets that re-render the list.
+//
+// NB: the same gesture as `.completions button[data-path]` above, and kept
+// apart from it because the two fragments find their input differently — the
+// picker can be on the page twice over, so it has to be the nearest one.
+document.addEventListener("click", (event) => {
+  const button = event.target.closest?.(".branch-options button[data-fill]");
+  if (!button) return;
+
+  event.preventDefault();
+  const search = button.closest(".branch-menu").querySelector(".search");
+  search.value = button.dataset.fill;
+  search.focus();
+  search.dispatchEvent(new Event("input", { bubbles: true }));
+});
+
+/** What the form currently holds, which a refused commit has to keep. */
+const picked = (search) => search.closest(".branch-menu").querySelector("#base-branch").value;
+
+// Enter commits whatever has been typed — a pasted sha above all, which is a
+// revision nobody wants to go hunting for in a list.
+//
+// NB: the typed value, not the row the server offered for it. That row arrives
+// 120ms after the last keystroke, and paste-then-Enter is faster than that.
+// Sending the text means the server is still the only thing that decides
+// whether it resolves.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+
+  const search = event.target.closest?.(".branch-menu .search");
+  if (!search) return;
+  // Swallowed either way: the box is in a form on the card page, and Enter in
+  // it is a commit rather than a submit.
+  event.preventDefault();
+
+  const base_branch = search.value.trim();
+  if (!base_branch) return;
+  const url = search.dataset.commitUrl;
+
+  // A card takes the new base as a write and answers with the whole page; a
+  // refusal is that page with the reason on it. The form has nothing to write
+  // to yet, so it asks the picker back with the value as the base — and gets
+  // the old one back, with the status line saying why, if git disagrees.
+  if (search.hasAttribute("data-commit-post")) {
+    htmx.ajax("POST", url, {
+      values: { base_branch },
+      target: "body",
+      swap: "outerMorph",
+      // NB: the string, not the boolean. htmx normalizes `'true'` to the URL
+      // the response came back from; anything else it pushes verbatim, and a
+      // bare `true` lands the address bar on `/cards/true`.
+      source: search,
+      push: "true",
+    });
+  } else {
+    htmx.ajax("GET", url, {
+      values: { base_branch, chosen: picked(search) },
+      target: "#branch-picker",
+      swap: "outerHTML",
+      source: search,
+    });
+  }
+});
+
 // ---- review comments --------------------------------------------------------
 // A box and the comments under it are one block against one line, asked for and
 // swapped on its own. Clicking away is what saves it as a draft; an empty box
@@ -171,8 +241,18 @@ document.addEventListener("focusout", (event) => {
   else form.querySelector("[data-cancel-comment]")?.click();
 });
 
-// The box is server-rendered, so it has to be focused once it arrives.
+// A field the server drew has to be focused once it arrives: the comment box,
+// and the base search when a refusal reopened the menu around it.
 document.addEventListener("htmx:after:settle", () => {
-  const textarea = document.querySelector(".compose textarea[data-autofocus]");
-  if (textarea && document.activeElement !== textarea) textarea.focus();
+  const field = document.querySelector(
+    ".branch-menu[open] .search[data-autofocus], .compose textarea[data-autofocus]",
+  );
+  if (!field) return;
+  if (document.activeElement !== field) field.focus();
+
+  // NB: the search box outlives the response that asked for it — the menu
+  // stays open and re-filters in place — so the ask has to be spent, or every
+  // later settle drags the cursor back out of whatever it moved to. The
+  // compose box arrives and leaves with the block around it.
+  if (field.matches(".search")) field.removeAttribute("data-autofocus");
 });

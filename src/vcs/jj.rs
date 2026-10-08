@@ -56,11 +56,13 @@ pub async fn create(
         bail!("{} already exists", path.display());
     }
 
-    // A bookmark in a colocated repo *is* a branch, so the existing typed
-    // helper resolves it and the refusal for a name that is not one is shared.
-    let base_sha = git::rev_parse(repo, Rev::Branch(base_branch))
+    // As generously as `git::create_worktree` reads it: a base is anything git
+    // resolves, so a card started on a tag or a pasted sha must not be one jj
+    // alone turns down. A bookmark in a colocated repo is a branch, and so
+    // resolves here like any other.
+    let base_sha = git::rev_parse(repo, Rev::Ref(base_branch))
         .await
-        .with_context(|| format!("{base_branch} does not name a branch"))?;
+        .with_context(|| format!("{base_branch} does not name a revision"))?;
 
     // NB: the ref first, for the reason `git::create_worktree` gives: the
     // workspace appearing is what tells the rest of the app the card has one,

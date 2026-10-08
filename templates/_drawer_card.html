@@ -25,24 +25,8 @@
 
     <h2>{{ card.title or card.task }}</h2>
     {# The lane menu's shape, because it is the same gesture: a chip that says
-       what the card is on, and a list that moves it. Each option posts itself,
-       so nothing here needs a line of script. #}
-    <details class="branch-menu"
-             hx-on:toggle="if (this.open) this.querySelector('.search').focus()">
-      <summary class="chip mono" title="Change the base branch">
-        {{ icon("git-branch") }}{{ card.base_branch }}{{ icon("chevron-down") }}
-      </summary>
-      <div class="menu">
-        <input class="mono search" type="search" name="q" form="not-a-form"
-               placeholder="Search branches…" autocomplete="off" spellcheck="false"
-               aria-label="Search branches"
-               hx-get="/projects/{{ project.id }}/branches?card={{ card.id }}"
-               hx-trigger="input changed delay:120ms"
-               hx-target="#branch-menu" hx-swap="outerHTML" hx-sync="this:replace" />
-        {% set post_to = "/cards/" ~ card.id ~ "/base" %}
-        {% include "_branch_menu.html" %}
-      </div>
-    </details>
+       what the card is on, and a list that moves it. #}
+    {% include "_branch_picker.html" %}
 
     <span class="spacer"></span>
 
