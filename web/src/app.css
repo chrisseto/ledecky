@@ -476,6 +476,17 @@ header.top {
   z-index: 2;
 }
 .drawer-head form { display: contents; }
+.drawer-head form.split { display: flex; }
+.split .btn { border-radius: var(--radius) 0 0 var(--radius); }
+.split select {
+  width: auto;
+  height: 30px;
+  border-left: 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: transparent;
+  font-size: 12.5px;
+  font-weight: 600;
+}
 .drawer-head h2 {
   font-size: 15px;
   min-width: 0;
@@ -660,6 +671,16 @@ header.top {
 }
 .modal-card { width: min(620px, calc(100vw - 32px)); }
 .modal-project { width: min(480px, calc(100vw - 32px)); }
+.modal-settings { width: min(720px, calc(100vw - 32px)); }
+.settings-tabs { margin: 14px 20px 0; }
+.settings-blurb { margin: 12px 20px 0; font-size: 12.5px; line-height: 1.5; }
+.settings-blurb a { color: var(--accent-text); }
+.settings-pick { display: flex; gap: 8px; padding: 14px 20px 0; }
+.settings-pick form:first-child { flex: 1; }
+.settings-pick .btn { height: 36px; }
+.modal-settings .settings-pick form { padding: 0; }
+label.check { flex-direction: row; align-items: center; }
+label.check input { width: auto; height: auto; }
 
 .modal form { display: flex; flex-direction: column; gap: 14px; padding: 18px 20px; }
 .modal .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }

@@ -12,6 +12,7 @@ import {
   jj,
   jjRepoGit,
   openCard,
+  runAction,
   openReview,
   moveCard,
   worktreeOf,
@@ -135,7 +136,7 @@ test("merging moves the bookmark and retires the card", async ({ page }) => {
   const before = jjRepoGit("rev-parse", "main");
 
   await openCard(page, cardId);
-  await page.getByRole("button", { name: "Merge" }).click();
+  await runAction(page, "Merge");
 
   // The bookmark reaching `refs/heads` is the whole point: the fake agent moves
   // it from the main repository, because moved from the workspace it would stay

@@ -21,7 +21,9 @@ import {
   lane,
   moveCard,
   openAgent,
+  actionId,
   openCard,
+  runAction,
   pollsOfPath,
   refreshDiff,
   removeInWorktree,
@@ -869,7 +871,7 @@ test("a comment left on an older turn stays there", async ({ page }) => {
 test("a rebase keeps upstream commits out of the card's diff", async ({ page }) => {
   const started = baseRef(cardId);
 
-  // Step one of the merge prompt: a rebase needs a clean worktree, and the fake
+  // Step one of the Merge action: a rebase needs a clean worktree, and the fake
   // agent only ever commits when asked to merge.
   worktreeGit(cardId, "add", "-A");
   worktreeGit(cardId, "commit", "-qm", "card work");
@@ -969,7 +971,7 @@ test("uncommitted work is not offered against a turn from before a rebase", asyn
   await expect(fileSection(page, "after-rebase.txt")).toHaveCount(0);
 });
 
-test("re-pointing a live card aims the merge elsewhere, not the worktree", async ({ page }) => {
+test("re-pointing a live card moves the base, not the worktree", async ({ page }) => {
   const rooted = baseRef(cardId);
   const head = worktreeGit(cardId, "rev-parse", "HEAD");
 
@@ -986,9 +988,6 @@ test("re-pointing a live card aims the merge elsewhere, not the worktree", async
   expect(baseRef(cardId)).toBe(rooted);
   await expect(fileSection(page, "upstream.txt")).toHaveCount(0);
 
-  // What does move is where the work is asked to land.
-  await expect(page.getByRole("button", { name: "Merge" })).toHaveAttribute("title", /release/);
-
   await chip.click();
   await page.locator(".branch-menu").getByRole("button", { name: "main", exact: true }).click();
   await expect(chip).toContainText("main");
@@ -999,7 +998,7 @@ test("merging lands the work on the base branch and retires the card", async ({ 
   const before = git("rev-parse", "main");
 
   await openCard(page, cardId);
-  await page.getByRole("button", { name: "Merge" }).click();
+  await runAction(page, "Merge");
 
   await expect.poll(() => git("rev-parse", "main")).not.toBe(before);
 
@@ -1059,9 +1058,14 @@ test("collecting the garbage reclaims what the finished card still held", async 
 
   // And a merge posted at it is turned away on its lane rather than rebuilding
   // the worktree this just reclaimed to look for commits that left with it.
-  // Needing a running agent used to turn it away by itself. 404 rather than the
-  // 409 a live card gets: a collected one has no page to answer with either.
-  expect((await page.request.post(`/cards/${cardId}/merge`)).status()).toBe(404);
+  // 404 rather than the 409 a live card gets: a collected one has no page to
+  // answer with either.
+  await page.goto("/settings/actions");
+  const action = await page
+    .locator(".modal-settings select option", { hasText: "Merge" })
+    .getAttribute("value");
+  const merge = await page.request.post(`/cards/${cardId}/action`, { form: { action } });
+  expect(merge.status()).toBe(404);
   expect(existsSync(worktreeOf(cardId))).toBe(false);
 });
 
@@ -1078,7 +1082,9 @@ test("a merge already out refuses a change of base", async ({ page }) => {
 
   // The request is recorded before the agent is told, so it is set by the time
   // this answers — and the branch it named is what will be watched for the work.
-  expect((await page.request.post(`/cards/${id}/merge`)).status()).toBe(200);
+  await openCard(page, id);
+  const action = await actionId(page, "Merge");
+  expect((await page.request.post(`/cards/${id}/action`, { form: { action } })).status()).toBe(200);
 
   const refused = await page.request.post(`/cards/${id}/base`, { form: { base_branch: "main" } });
   expect(refused.status()).toBe(409);

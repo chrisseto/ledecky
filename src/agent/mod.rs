@@ -19,7 +19,7 @@ pub fn routes() -> Vec<rocket::Route> {
         terminal::start,
         terminal::stop,
         terminal::resize,
-        terminal::merge,
+        terminal::action,
         terminal::socket,
     ]
 }

@@ -55,13 +55,13 @@
       </label>
     </div>
 
-    {% if card.lane == "in_review" %}
-      <form method="post" action="/cards/{{ card.id }}/merge"
-            hx-post="/cards/{{ card.id }}/merge" hx-target="body" hx-swap="outerMorph" hx-push-url="true">
-        <button class="btn" type="submit"
-                title="Ask the agent to apply its commits onto {{ card.base_branch }}">
-          {{ icon("git-merge") }} Merge
-        </button>
+    {% if card.lane == "in_review" and actions %}
+      <form class="split" method="post" action="/cards/{{ card.id }}/action"
+            hx-post="/cards/{{ card.id }}/action" hx-target="body" hx-swap="outerMorph">
+        <button class="btn" type="submit" title="Send the action to the agent">{{ icon("send") }} Run</button>
+        <select name="action" aria-label="Action">
+          {% for action in actions %}<option value="{{ action.id }}">{{ action.name }}</option>{% endfor %}
+        </select>
       </form>
     {% endif %}
 

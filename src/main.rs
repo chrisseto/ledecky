@@ -16,6 +16,7 @@ mod gzip;
 mod hooks;
 mod listener;
 mod project;
+mod prompt;
 mod review;
 mod tmpl;
 mod vcs;
@@ -135,6 +136,7 @@ async fn rocket(
         .mount("/static", assets::routes())
         .mount("/", rocket::routes![events::stream])
         .mount("/", project::routes())
+        .mount("/", prompt::routes())
         .mount("/", agent::routes())
         .mount("/", review::routes())
         .mount("/", agent::webhooks::routes())

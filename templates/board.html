@@ -40,6 +40,13 @@
           {{ project.name }}
         </a>
       {% endif %}
+
+      <span class="spacer"></span>
+      {% set settings_href %}/settings/templates{% if project %}?board={{ project.id }}{% endif %}{% endset %}
+      <a class="btn icon-only" href="{{ settings_href }}"
+         hx-get="{{ settings_href }}" hx-target="#overlay"
+         hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true"
+         title="Settings" aria-label="Settings">{{ icon("settings") }}</a>
     </header>
 
     {% if project %}

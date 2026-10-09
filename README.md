@@ -136,7 +136,7 @@ says so above the batch, which stays drafts.
 the user's own prompt and the session names itself from it; the client holds it
 behind the workspace-trust dialog and submits it once that is answered.
 
-Everything later — a review batch, a merge request — goes to a running session
+Everything later — a review batch, an action — goes to a running session
 by being typed at its terminal, the same way the user's own paste is: bracketed,
 then a bare `\r`, because the TUI reads a newline as submit. Nothing is sent
 blind. The session has to have reported in, the input box has to be empty, and
@@ -161,7 +161,7 @@ dialog, a box with something already in it, a write nothing acknowledged, and a
 write something else was acknowledged in place of — and each says which on the
 pane it came from, leaving the batch as drafts. A refused review answers `409`
 *with the pane*: htmx swaps a failed response into the target like any other, so
-a status with no body took the batch away with it. A refused merge answers the
+a status with no body took the batch away with it. A refused action answers the
 card the same way.
 
 A session still says when it is up, through a `SessionStart` hook: that event is
@@ -218,8 +218,10 @@ terminal carries `hx-morph-skip` because xterm builds that subtree on the client
 and the server knows nothing about it. Responses still carry an `ETag` over
 their own bytes, which now saves the bytes rather than the redraw.
 
-**Merge.** Available in In Review. The server asks the agent to land its commits
-on the base branch and never rewrites branches itself. On the next turn it
+**Actions.** In In Review, Run sends the selected action to the agent. Templates
+and actions are Jinja prompts edited in Settings. An action with *lands* set,
+such as the seeded Merge, asks the agent to put its commits on the base branch;
+the server never rewrites branches itself. On the next turn it
 checks that the branch moved *and* that its tree matches the latest snapshot
 before marking the card Done and pruning the worktree. Turn refs are kept; the
 `working` ref goes with the worktree it described.

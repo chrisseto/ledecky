@@ -17,6 +17,18 @@
         hx-post="{% if editing %}/cards/{{ card.id }}{% else %}/projects/{{ project.id }}/cards{% endif %}" hx-target="body" hx-swap="outerHTML" hx-push-url="true">
     {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
 
+    {% if templates %}
+      <label>
+        <span>Template</span>
+        <select name="template">
+          <option value="">None</option>
+          {% for t in templates %}
+            <option value="{{ t.id }}" {% if t.id == template %}selected{% endif %}>{{ t.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    {% endif %}
+
     <label>
       <span>Task</span>
       <textarea name="task" rows="5" autofocus

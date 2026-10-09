@@ -196,18 +196,6 @@ pub async fn head(vcs: VCS, path: &Path) -> Option<String> {
     }
 }
 
-/// What the agent is asked to do when a review is approved.
-///
-/// The server never moves the user's branches itself: conflicts are exactly what
-/// an agent is good at, and a failed rebase run from here would leave a mess for
-/// someone else to unpick.
-pub fn merge_prompt(vcs: VCS, branch: &str, repo: &Path) -> String {
-    match vcs {
-        VCS::Git => git::merge_prompt(branch, repo),
-        VCS::JJ => jj::merge_prompt(branch, repo),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,23 +262,6 @@ mod tests {
         let jj_work = Worktree::new(VCS::JJ, repo, path);
         assert_eq!(jj_work.path(), path);
         assert_eq!(jj_work.git_dir(), Some(repo.join(".git")));
-    }
-
-    /// The jj prompt has to send the agent to the main repository, or the
-    /// bookmark moves without reaching `refs/heads` and the merge never reads
-    /// as landed.
-    #[test]
-    fn the_jj_merge_prompt_moves_the_bookmark_at_the_root() {
-        let prompt = merge_prompt(VCS::JJ, "main", Path::new("/srv/project"));
-        assert!(prompt.contains("jj -R /srv/project bookmark set main"));
-        assert!(prompt.contains("jj commit"));
-        // And says nothing about git's refusal to move a checked-out branch,
-        // which is not a rule jj has.
-        assert!(!prompt.contains("cannot be"));
-
-        // The git prompt is unchanged, including that refusal.
-        let git = merge_prompt(VCS::Git, "main", Path::new("/srv/project"));
-        assert!(git.contains("git -C /srv/project merge --ff-only"));
     }
 
     // ---- against a real jj ---------------------------------------------------

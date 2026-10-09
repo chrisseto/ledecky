@@ -664,23 +664,6 @@ pub async fn head(worktree: &Path) -> Option<String> {
     rev_parse(worktree, Rev::Head).await
 }
 
-/// NB: the base branch is almost always checked out in the main worktree, and
-/// git refuses to move a branch that another worktree holds. Saying so up front
-/// saves the agent a failed `git branch -f` and a round of guessing.
-pub fn merge_prompt(branch: &str, repo: &Path) -> String {
-    format!(
-        "The reviewer approved this work. Land it on `{branch}`:\n\n\
-         1. Commit anything still outstanding in this worktree.\n\
-         2. `{branch}` is checked out in the main repository at `{repo}`, so it cannot be \
-            moved from here. Apply your commits there instead — \
-            `git -C {repo} merge --ff-only <sha>`, or rebase onto `{branch}` first if it has \
-            moved ahead.\n\
-         3. Report the final SHA of `{branch}`.\n\n\
-         Do not push.",
-        repo = repo.display(),
-    )
-}
-
 /// Lines added and removed between two revisions.
 ///
 /// `--numstat` is one cheap git call with no highlighting behind it, which is

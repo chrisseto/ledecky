@@ -35,7 +35,7 @@
 //     the pane is expected to answer with nothing.
 //
 // Each submitted prompt appends a line to main.rs so turn snapshots have
-// something to capture, and the merge prompt is understood well enough to move
+// something to capture, and the seeded Merge action is understood well enough to move
 // the base branch for real.
 
 import { execFileSync, execSync } from "node:child_process";
@@ -233,7 +233,7 @@ const git = (cwd, ...args) =>
 const jj = (cwd, ...args) => execFileSync("jj", args, { cwd, encoding: "utf8" }).trim();
 
 /**
- * Applies the merge prompt: commit here, then move the base branch.
+ * Applies the seeded Merge action: commit here, then move the base branch.
  *
  * Which VCS made this workspace is read off the disk rather than out of the
  * prompt. A colocated jj workspace could be merged with git — the objects are

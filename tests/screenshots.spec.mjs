@@ -56,6 +56,11 @@ test("capture the whole flow @shots", async ({ page }) => {
   cardId = await cardIn(page, "todo", "Add a build banner").getAttribute("data-card-id");
   await shot(page, "05-board");
 
+  await page.goto(`/settings/actions?board=${projectUrl.split("/").pop()}`);
+  await expect(page.locator(".modal-settings").getByLabel("Name")).toHaveValue("Merge");
+  await shot(page, "05b-settings");
+  await page.goto(projectUrl);
+
   await page.getByTitle("Switch project").click();
   await expect(page.locator(".drawer-projects")).toBeVisible();
   await shot(page, "06-projects");

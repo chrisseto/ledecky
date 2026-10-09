@@ -10,8 +10,8 @@ const OUT = join(ROOT, "static", "icons");
 
 const ICONS = [
   "alert-triangle", "check", "chevron-down", "chevron-right", "chevron-up",
-  "folder", "folder-git-2", "git-branch", "git-merge", "panel-left-open", "pause", "pencil", "play",
-  "plus", "refresh-cw", "send", "trash-2", "unfold-vertical", "x",
+  "folder", "folder-git-2", "git-branch", "panel-left-open", "pause", "pencil", "play",
+  "plus", "refresh-cw", "send", "settings", "trash-2", "unfold-vertical", "x",
 ];
 
 await rm(OUT, { recursive: true, force: true });

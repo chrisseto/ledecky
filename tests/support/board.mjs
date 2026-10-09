@@ -98,9 +98,10 @@ export async function addProject(page, repo = REPO) {
 export async function addCard(
   page,
   projectUrl,
-  { title, description, base = "main", permissions, model, vcs },
+  { title, description, base = "main", permissions, model, vcs, template },
 ) {
   await page.goto(`${projectUrl}/cards/new`);
+  if (template) await page.getByLabel("Template").selectOption({ label: template });
   await page.getByLabel("Task").fill(description ? `${title}\n\n${description}` : title);
   await pickBranch(page, base);
   if (permissions) await page.getByLabel("Permissions").selectOption(permissions);
@@ -136,6 +137,22 @@ export const cardIn = (page, key, title) =>
 export async function openCard(page, cardId) {
   await page.goto(`/cards/${cardId}`);
   await expect(page.locator(".drawer-card")).toBeVisible();
+}
+
+/** Sends the named action from the open drawer. */
+export async function runAction(page, name) {
+  const drawer = page.locator(".drawer-card");
+  await drawer.getByLabel("Action").selectOption({ label: name });
+  await drawer.getByRole("button", { name: "Run" }).click();
+}
+
+/** The id of the named action, read from the open drawer. */
+export async function actionId(page, name) {
+  return page
+    .locator(".drawer-card")
+    .getByLabel("Action")
+    .locator("option", { hasText: name })
+    .getAttribute("value");
 }
 
 /**

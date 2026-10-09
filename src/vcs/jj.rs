@@ -176,26 +176,3 @@ pub async fn head(path: &Path) -> Option<String> {
     .filter(|sha| !sha.is_empty())
 }
 
-/// NB: the bookmark is moved from the main repository, not from the workspace.
-/// jj would allow either, but a bookmark moved in a secondary workspace is not
-/// exported to `refs/heads` until some later jj command runs at the colocated
-/// root — and `refs/heads` is what tells us the merge landed. Run at the root it
-/// exports immediately.
-///
-/// `jj commit` for the same reason: what is measured is the bookmark's tree
-/// against the snapshot taken at the end of the turn, and `@` is not something a
-/// bookmark can point at.
-pub fn merge_prompt(branch: &str, repo: &Path) -> String {
-    format!(
-        "The reviewer approved this work. Land it on `{branch}`:\n\n\
-         1. `jj commit` anything still described only in the working copy, so all of it is \
-            in `@-`.\n\
-         2. Rebase onto `{branch}` if it has moved ahead.\n\
-         3. Move the bookmark from the main repository, which is what publishes it to git — \
-            `jj -R {repo} bookmark set {branch} -r <commit>`. Moving it from this workspace \
-            leaves it unexported.\n\
-         4. Report the final commit id of `{branch}`.\n\n\
-         Do not push.",
-        repo = repo.display(),
-    )
-}

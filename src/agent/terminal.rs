@@ -15,6 +15,7 @@ use crate::db::DB;
 use crate::project::Card;
 use crate::project::board;
 use crate::project::lifecycle;
+use crate::prompt::{self, Prompt};
 use crate::review::DiffCache;
 use crate::tmpl::Tmpl;
 use crate::watch::Worktrees;
@@ -80,27 +81,45 @@ pub async fn stop(manager: &State<Arc<AgentManager>>, id: i64) -> Redirect {
 }
 
 /// NB: a refusal answers with the card rather than a bare status. This posts
-/// with the whole page as its target, so a `409` carrying no body was swapped
-/// in like any other response and took the board with it.
-#[post("/cards/<id>/merge")]
-pub async fn merge(
+/// with the whole page as its target, and a `409` with no body would replace
+/// the board.
+#[derive(rocket::FromForm)]
+pub struct ActionForm {
+    action: i64,
+}
+
+#[post("/cards/<id>/action", data = "<form>")]
+pub async fn action(
     db: &State<DB>,
     manager: &State<Arc<AgentManager>>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     worktrees: &State<Worktrees>,
     id: i64,
+    form: Form<ActionForm>,
 ) -> Result<Result<Redirect, (Status, Tmpl)>, Status> {
-    if let Err(err) = manager.request_merge(worktrees, id).await {
-        warn!("card {id}: merge request failed: {err:#}");
+    let refused = async |status: Status, error: String| {
+        let page = board::card_view(db, manager, settings, cache, id, None, Some(&error)).await?;
+        Ok(Err((status, page)))
+    };
 
-        let error = "The merge request could not be delivered. The agent may be \
-                     waiting on you — answer what is on its terminal, then try again.";
-        let page = board::card_view(db, manager, settings, cache, id, None, Some(error)).await?;
-        return Ok(Err((Status::Conflict, page)));
+    let action = Prompt::find(db, prompt::Kind::Action, form.action)
+        .await
+        .map_err(|err| {
+            error!("card {id}: finding action {}: {err}", form.action);
+            Status::InternalServerError
+        })?;
+    let Some(action) = action else {
+        return refused(Status::NotFound, "That action no longer exists.".into()).await;
+    };
+
+    match manager.run_action(worktrees, id, &action).await {
+        Ok(()) => Ok(Ok(Redirect::to(format!("/cards/{id}")))),
+        Err(err) => {
+            warn!("card {id}: {err:#}");
+            refused(Status::Conflict, format!("{err:#}")).await
+        }
     }
-
-    Ok(Ok(Redirect::to(format!("/cards/{id}"))))
 }
 
 #[derive(rocket::FromForm)]
@@ -121,7 +140,7 @@ pub async fn resize(manager: &State<Arc<AgentManager>>, id: i64, form: Form<Resi
 }
 
 /// Raw pty bytes in both directions, and the only thing that writes to the pty
-/// at all — a keystroke here is the user's. Everything else — resize, merge, a
+/// at all — a keystroke here is the user's. Everything else — resize, an action, a
 /// review — goes over ordinary HTTP so this socket stays a dumb pipe. The
 /// screen's size is the one exception: the replay ahead of the stream is
 /// rendered at the pty's width, so it has to be the client's before the first

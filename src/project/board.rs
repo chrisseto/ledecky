@@ -15,6 +15,7 @@ use crate::db::DB;
 use crate::events::{Changes, Kind};
 use crate::project::lifecycle;
 use crate::project::{Card, CardEdit, Lane, NewCard, Project};
+use crate::prompt::{self, Prompt};
 use crate::review::{self, DiffCache, Turn};
 use crate::tmpl::Tmpl;
 use crate::vcs::git;
@@ -37,6 +38,8 @@ pub const MODELS: &[(&str, &str)] = &[
 
 const EMPTY_TASK: &str = "A card needs a task for the agent.";
 
+const NO_TEMPLATE: &str = "That template no longer exists.";
+
 /// Said when the base does not resolve. The picker will not offer one that
 /// does not, so this is a base that went away while the form was open, or a
 /// post that never came from the form at all.
@@ -56,6 +59,7 @@ pub const CARD: &str = "card";
 pub const NEW_CARD: &str = "newcard";
 pub const EDIT_CARD: &str = "editcard";
 pub const ADD_PROJECT: &str = "addproject";
+pub const SETTINGS: &str = "settings";
 
 /// Renders the board with an overlay over it.
 pub struct Shell<'a> {
@@ -207,15 +211,21 @@ pub async fn switcher(
     .await
 }
 
-#[get("/projects/<id>/cards/new")]
+/// `template` keeps the choice across "Create more".
+#[get("/projects/<id>/cards/new?<template>")]
 pub async fn new_card(
     db: &State<DB>,
     settings: &State<Settings>,
     cache: &State<DiffCache>,
     id: i64,
+    template: Option<i64>,
 ) -> Result<Tmpl, Status> {
     let project = Project::find(db, id).await.ok_or(Status::NotFound)?;
-    let form = form_context(&project, None, Fields::default(), None).await;
+    let fields = Fields {
+        template,
+        ..Fields::default()
+    };
+    let form = form_context(db, &project, None, fields, None).await?;
 
     Ok(Shell {
         db,
@@ -243,7 +253,7 @@ pub async fn edit_card(
         return Err(Status::Conflict);
     }
 
-    let form = form_context(&project, Some(&card), Fields::of(&card), None).await;
+    let form = form_context(db, &project, Some(&card), Fields::of(&card), None).await?;
     Ok(Shell {
         db,
         settings,
@@ -278,6 +288,10 @@ pub async fn card_view(
     // The chip's menu opens on what the page already holds, so there is nothing
     // to wait for; the search box re-renders it from there.
     let picker = picker(&project, "", &card.base_branch, Some(id)).await;
+    let actions = Prompt::all(db, prompt::Kind::Action).await.map_err(|err| {
+        error!("card {id}: listing actions: {err}");
+        Status::InternalServerError
+    })?;
 
     Ok(Shell {
         db,
@@ -287,7 +301,7 @@ pub async fn card_view(
     .render(
         Some(project),
         CARD,
-        context! { live, picker, error, editable => card.editable(), ..review },
+        context! { live, picker, error, actions, editable => card.editable(), ..review },
     )
     .await)
 }
@@ -301,6 +315,7 @@ pub struct CardForm {
     /// Absent when the project offers only one, in which case the form renders
     /// no chooser at all.
     vcs: Option<String>,
+    template: Option<i64>,
     /// Set by the second submit button, which keeps the form open for the next
     /// card rather than returning to the board.
     more: Option<String>,
@@ -314,6 +329,7 @@ struct Fields {
     permission_mode: String,
     model: String,
     vcs: VCS,
+    template: Option<i64>,
 }
 
 impl Default for Fields {
@@ -324,6 +340,7 @@ impl Default for Fields {
             permission_mode: "plan".into(),
             model: String::new(),
             vcs: VCS::Git,
+            template: None,
         }
     }
 }
@@ -336,6 +353,7 @@ impl Fields {
             permission_mode: card.permission_mode.clone(),
             model: card.model.clone().unwrap_or_default(),
             vcs: card.vcs,
+            template: None,
         }
     }
 
@@ -346,6 +364,7 @@ impl Fields {
             permission_mode: form.permission_mode.clone(),
             model: form.model.clone(),
             vcs: form.vcs.as_deref().map_or(VCS::Git, VCS::parse),
+            template: form.template,
         }
     }
 }
@@ -591,11 +610,12 @@ pub async fn branch_picker(
 /// Everything `_modal_card.html` renders from. `card` is what makes it an edit
 /// rather than a new card.
 async fn form_context(
+    db: &DB,
     project: &Project,
     card: Option<&Card>,
     fields: Fields,
     error: Option<&str>,
-) -> minijinja::Value {
+) -> Result<minijinja::Value, Status> {
     // `branches` puts the checked-out one first, which is what makes it the
     // default a new card opens on.
     let base_branch = match fields.base_branch.is_empty() {
@@ -620,8 +640,18 @@ async fn form_context(
         false => VCS::Git,
     };
 
-    context! {
-        card, error, vcs_options,
+    // NB: a new card only. A card keeps no link to the template it came from.
+    let templates = match card {
+        Some(_) => Vec::new(),
+        None => Prompt::all(db, prompt::Kind::Template).await.map_err(|err| {
+            error!("listing templates: {err}");
+            Status::InternalServerError
+        })?,
+    };
+
+    Ok(context! {
+        card, error, vcs_options, templates,
+        template => fields.template,
         picker => picker(project, "", &base_branch, None).await,
         task => fields.task,
         permission_mode => fields.permission_mode,
@@ -629,7 +659,7 @@ async fn form_context(
         vcs => vcs.as_str(),
         permission_modes => PERMISSION_MODES,
         models => MODELS,
-    }
+    })
 }
 
 /// Only a VCS the project actually has is accepted.
@@ -655,7 +685,7 @@ pub async fn create_card(
     changes: &State<Changes>,
     id: i64,
     form: Form<CardForm>,
-) -> Result<Redirect, Tmpl> {
+) -> Result<Result<Redirect, Tmpl>, Status> {
     create(db, settings, cache, changes, id, form.into_inner()).await
 }
 
@@ -666,34 +696,40 @@ async fn create(
     changes: &Changes,
     id: i64,
     form: CardForm,
-) -> Result<Redirect, Tmpl> {
+) -> Result<Result<Redirect, Tmpl>, Status> {
     let project = match Project::find(db, id).await {
         Some(project) => project,
-        None => return Ok(Redirect::to("/")),
+        None => return Ok(Ok(Redirect::to("/"))),
     };
 
-    let task = form.task.trim();
-    let base_branch = form.base_branch.trim();
-    // Validate, then mutate. A base nothing resolves is a card that can never
-    // be started, and `relane` answers 204 whether or not the worktree it then
-    // asks for could be made — so refused here is the only place it is said.
-    let complaint = match task.is_empty() {
-        true => Some(EMPTY_TASK),
-        false => match git::resolve(&project.repo(), base_branch).await {
-            Some(_) => None,
-            None => Some(BAD_BASE),
-        },
-    };
-
-    if let Some(complaint) = complaint {
-        let context = form_context(&project, None, Fields::submitted(&form), Some(complaint)).await;
-        return Err(Shell {
+    let refuse = async |complaint: &str| {
+        let context =
+            form_context(db, &project, None, Fields::submitted(&form), Some(complaint)).await?;
+        Ok(Err(Shell {
             db,
             settings,
             cache,
         }
-        .render(Some(project), NEW_CARD, context)
-        .await);
+        .render(Some(project.clone()), NEW_CARD, context)
+        .await))
+    };
+
+    let base_branch = form.base_branch.trim();
+    let vcs = chosen_vcs(&project, form.vcs.as_deref());
+    let task = match templated(db, &project, &form, base_branch, vcs).await? {
+        Ok(task) => task,
+        Err(complaint) => return refuse(&complaint).await,
+    };
+    let task = task.trim();
+
+    // Validate, then mutate. A base nothing resolves is a card that can never
+    // be started, and `relane` answers 204 whether or not the worktree it then
+    // asks for could be made — so refused here is the only place it is said.
+    if task.is_empty() {
+        return refuse(EMPTY_TASK).await;
+    }
+    if git::resolve(&project.repo(), base_branch).await.is_none() {
+        return refuse(BAD_BASE).await;
     }
 
     let created = Card::create(
@@ -704,21 +740,49 @@ async fn create(
             base_branch,
             permission_mode: permission_mode(&form.permission_mode),
             model: Some(form.model.trim()).filter(|m| !m.is_empty()),
-            vcs: chosen_vcs(&project, form.vcs.as_deref()),
+            vcs,
         },
     )
     .await;
 
     if created.is_err() {
-        return Ok(Redirect::to(format!("/projects/{id}")));
+        return Ok(Ok(Redirect::to(format!("/projects/{id}"))));
     }
 
     changes.project(id, Kind::Board);
 
-    Ok(match form.more {
-        Some(_) => Redirect::to(format!("/projects/{id}/cards/new")),
+    Ok(Ok(match form.more {
+        Some(_) => Redirect::to(match form.template {
+            Some(template) => format!("/projects/{id}/cards/new?template={template}"),
+            None => format!("/projects/{id}/cards/new"),
+        }),
         None => Redirect::to(format!("/projects/{id}")),
-    })
+    }))
+}
+
+/// The task a new card gets: the typed text, or the chosen template rendered
+/// with it. `Ok(Err(_))` is a complaint for the form.
+async fn templated(
+    db: &DB,
+    project: &Project,
+    form: &CardForm,
+    base_branch: &str,
+    vcs: VCS,
+) -> Result<Result<String, String>, Status> {
+    let Some(id) = form.template else {
+        return Ok(Ok(form.task.clone()));
+    };
+    let template = Prompt::find(db, prompt::Kind::Template, id).await.map_err(|err| {
+        error!("finding template {id}: {err}");
+        Status::InternalServerError
+    })?;
+    let Some(template) = template else {
+        return Ok(Err(NO_TEMPLATE.to_owned()));
+    };
+
+    let vars = prompt::Vars::new(project, form.task.trim(), base_branch, vcs);
+    Ok(prompt::render(&template.body, &vars)
+        .map_err(|err| format!("{} did not render: {err}", template.name)))
 }
 
 /// Rewrites a card that has not been started. Everything the form sets is only
@@ -760,12 +824,13 @@ async fn update(
 
     if let Some(complaint) = complaint {
         let context = form_context(
+            db,
             &project,
             Some(&card),
             Fields::submitted(&form),
             Some(complaint),
         )
-        .await;
+        .await?;
         return Ok(Err(Shell {
             db,
             settings,

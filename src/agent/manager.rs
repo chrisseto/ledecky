@@ -25,6 +25,7 @@ use crate::db::DB;
 use crate::events::{Changes, Kind};
 use crate::hooks::HookAuth;
 use crate::project::{lifecycle, AgentState, Card, Lane, Project};
+use crate::prompt::{self, Prompt};
 use crate::vcs::git;
 use crate::watch::Worktrees;
 
@@ -375,15 +376,14 @@ impl AgentManager {
             .unwrap_or(0)
     }
 
-    /// Asks the agent to land its work on the base branch.
-    ///
-    /// The server never rewrites the user's branches itself — conflicts are exactly
-    /// the situation an agent is good at, and a failed rebase run by the server
-    /// would just leave a mess for someone else to unpick.
-    pub async fn request_merge(
+    /// Renders an action and sends it to the card's agent. An action that
+    /// `lands` arms the check that moves the card to Done when its work reaches
+    /// the base.
+    pub async fn run_action(
         self: &Arc<Self>,
         worktrees: &Worktrees,
         card_id: i64,
+        action: &Prompt,
     ) -> Result<()> {
         let card = Card::find(&self.db, card_id)
             .await
@@ -392,33 +392,45 @@ impl AgentManager {
             .await
             .context("no such project")?;
 
-        // NB: the lane, not the agent. Requiring a running one used to turn this
-        // away by itself; now that a stopped card starts one, a merge posted at
-        // a card that has been retired would build its worktree back and look
+        // NB: the lane, not the agent. A stopped card starts an agent to take
+        // the message, so a retired card would build its worktree back and look
         // for commits that left with it.
+        anyhow::ensure!(card.lane == Lane::InReview, "only a card in review takes an action");
+        // NB: a second message can reach the agent mid-merge, and a second
+        // `lands` action replaces the base the first one is measured against.
         anyhow::ensure!(
-            card.lane == Lane::InReview,
-            "a merge is only asked for from In Review"
+            !card.merge_requested,
+            "this card is already waiting to land on {}",
+            card.base_branch
         );
 
-        let repo = project.repo();
-        let base_sha = git::run(&repo, &["rev-parse", &card.base_branch])
-            .await
-            .with_context(|| format!("resolving {}", card.base_branch))?;
+        let vars = prompt::Vars::new(&project, &card.task, &card.base_branch, card.vcs);
+        let message = prompt::render(&action.body, &vars)
+            .with_context(|| format!("rendering {}", action.name))?;
 
-        // Recorded before the message goes out: the agent can land the merge and
-        // fire its `Stop` hook while we are still here, and a hook that arrives
-        // without this reads the turn as ordinary work.
-        Card::request_merge(&self.db, card_id, &base_sha).await;
+        if action.lands {
+            let base_sha = git::run(&project.repo(), &["rev-parse", &card.base_branch])
+                .await
+                .with_context(|| format!("resolving {}", card.base_branch))?;
 
-        // The prompt is the backend's: git and jj land work differently.
-        let prompt = crate::vcs::merge_prompt(card.vcs, &card.base_branch, &repo);
-        if !lifecycle::deliver(self, &self.settings, worktrees, card_id, &prompt)
+            // NB: recorded before the message goes out. The agent can complete
+            // the merge and fire its `Stop` hook before this returns, and a hook
+            // that arrives without the record reads the turn as ordinary work.
+            Card::request_merge(&self.db, card_id, &base_sha).await;
+        }
+
+        if !lifecycle::deliver(self, &self.settings, worktrees, card_id, &message)
             .await
             .landed()
         {
-            Card::clear_merge_request(&self.db, card_id).await;
-            bail!("the merge request could not be delivered");
+            if action.lands {
+                Card::clear_merge_request(&self.db, card_id).await;
+            }
+            bail!(
+                "{} could not be delivered. The agent may be waiting on you — \
+                 answer what is on its terminal, then try again.",
+                action.name
+            );
         }
 
         self.changes.card(&self.db, card_id, Kind::Board).await;
@@ -577,9 +589,9 @@ fn lane_for(state: AgentState, lane: Lane, merge_requested: bool) -> Option<Lane
         AgentState::AwaitingUser | AgentState::Idle if lane == Lane::InProgress => {
             Some(Lane::InReview)
         }
-        // NB: a merge is asked for and finished in review, the only lane
-        // offering the button. The merge prompt fires `UserPromptSubmit` like
-        // any other, and moving the card would take that button away mid-merge.
+        // NB: a merge is asked for and finished in review, the only lane that
+        // offers actions. An action fires `UserPromptSubmit` like any other
+        // prompt, and a lane change would remove the Run button mid-merge.
         AgentState::Running if lane == Lane::InReview && !merge_requested => Some(Lane::InProgress),
         _ => None,
     }
@@ -621,9 +633,8 @@ mod tests {
         );
     }
 
-    /// The merge button only exists in review, and the merge prompt fires
-    /// `UserPromptSubmit` like any other — so moving the card would take the
-    /// button away halfway through.
+    /// Only review offers actions, and an action fires `UserPromptSubmit` like
+    /// any other prompt. A lane change would remove the Run button mid-merge.
     #[test]
     fn a_card_mid_merge_keeps_its_lane() {
         assert_eq!(lane_for(AgentState::Running, Lane::InReview, true), None);
@@ -737,8 +748,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_outstanding_merge_keeps_the_card_in_review() {
-        // The merge prompt fires `UserPromptSubmit` like any other, and In Review
-        // is the only lane offering the button.
+        // A `lands` action fires `UserPromptSubmit` like any other prompt, and
+        // only In Review offers actions.
         let db = memory_db().await;
         let card = card_in(&db, Lane::InReview, AgentState::Idle).await;
         Card::request_merge(&db, card, "abc123").await;
@@ -819,20 +830,6 @@ mod tests {
 
     use rocket::figment::providers::Serialized;
     use std::process::Command;
-
-    // ---- the merge prompt ----
-
-    #[test]
-    fn the_merge_prompt_points_at_the_main_checkout() {
-        let prompt = crate::vcs::merge_prompt(VCS::Git, "main", Path::new("/srv/repo"));
-
-        assert!(prompt.starts_with("The reviewer approved this work."));
-        // The agent has to be told where the branch actually lives, or it will
-        // try `git branch -f` from a worktree and be refused.
-        assert!(prompt.contains("checked out in the main repository at `/srv/repo`"));
-        assert!(prompt.contains("git -C /srv/repo merge --ff-only"));
-        assert!(prompt.contains("Do not push."));
-    }
 
     // ---- the startup sweep ----
 

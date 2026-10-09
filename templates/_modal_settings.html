@@ -1,0 +1,88 @@
+{% set jinja = "https://jinja.palletsprojects.com/en/stable/templates/" %}
+{% set back %}{% if project %}/projects/{{ project.id }}{% else %}/{% endif %}{% endset %}
+<div class="modal modal-settings" role="dialog" aria-label="Settings">
+  <div class="modal-head">
+    <h2>Settings</h2>
+    <span class="spacer"></span>
+    <a class="btn icon-only" href="{{ back }}" aria-label="Close" data-close-overlay
+       hx-get="{{ back }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true">{{ icon("x") }}</a>
+  </div>
+
+  <nav class="modes settings-tabs" aria-label="Settings sections">
+    {% for tab in tabs %}
+      <a class="mode {% if tab.on %}on{% endif %}" href="{{ tab.href }}"
+         {% if tab.on %}aria-current="page"{% endif %}
+         hx-get="{{ tab.href }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerHTML" hx-push-url="true">{{ tab.label }}</a>
+    {% endfor %}
+  </nav>
+
+  <p class="settings-blurb dim">
+    {% if kind == "template" %}
+      A template makes the task of a new card. Select one in the New card form.
+      Later edits to the template do not change the card.
+      <code>task</code> is the text you type in the form.
+    {% else %}
+      An action sends a message to the agent of a card in review. Select one
+      beside Run in the card drawer. <code>task</code> is the task of the card.
+    {% endif %}
+    Both kinds can also use <code>branch</code>, <code>repo</code>,
+    <code>project</code>, <code>vcs</code> (<code>git</code> or <code>jj</code>),
+    and the booleans <code>git</code> and <code>jujutsu</code>.
+    <a href="{{ jinja }}" target="_blank" rel="noopener">Jinja syntax</a>
+  </p>
+
+  {# NB: `outerHTML`, not a morph. Two prompts can have the same name and body
+     (two new ones do), and a morph then keeps the unsaved text. #}
+  <div class="settings-pick">
+    {% if prompts %}
+      <form method="get" action="{{ base }}"
+            hx-get="{{ base }}" hx-trigger="change" hx-target="#overlay" hx-select="#overlay" hx-swap="outerHTML" hx-replace-url="true">
+        {% if board %}<input type="hidden" name="board" value="{{ board }}" />{% endif %}
+        <select id="prompt-pick" name="id" aria-label="{{ label }}">
+          {% for p in prompts %}
+            <option value="{{ p.id }}" {% if prompt and p.id == prompt.id %}selected{% endif %}>{{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </form>
+    {% endif %}
+    <form method="post" action="{{ new_href }}"
+          hx-post="{{ new_href }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerHTML" hx-push-url="true">
+      <button class="btn" type="submit">{{ icon("plus") }} New</button>
+    </form>
+  </div>
+
+  {% if prompt %}
+    <form id="prompt-delete" method="post" action="{{ delete_href }}" hidden
+          hx-post="{{ delete_href }}" hx-confirm="Delete {{ prompt.name }}?" hx-target="#overlay" hx-select="#overlay" hx-swap="outerHTML" hx-push-url="true"></form>
+
+    <form method="post" action="{{ save_href }}" data-submit-shortcuts
+          hx-post="{{ save_href }}" hx-target="#overlay" hx-select="#overlay" hx-swap="outerHTML" hx-push-url="true" hx-status:4xx="push:false">
+      {% if error %}<p class="error">{{ icon("alert-triangle") }} {{ error }}</p>{% endif %}
+
+      <label>
+        <span>Name</span>
+        <input name="name" value="{{ prompt.name }}" autocomplete="off" />
+      </label>
+
+      <label>
+        <span>Body</span>
+        <textarea name="body" rows="14" class="mono" spellcheck="false">{{ prompt.body }}</textarea>
+      </label>
+
+      {% if kind == "action" %}
+        <label class="check">
+          <input type="checkbox" name="lands" value="true" {% if prompt.lands %}checked{% endif %} />
+          <span>Move the card to Done when its work reaches the base</span>
+        </label>
+      {% endif %}
+
+      <footer>
+        <button class="btn" type="submit" form="prompt-delete">{{ icon("trash-2") }} Delete</button>
+        <span class="spacer"></span>
+        <button class="btn accent" type="submit">
+          {{ icon("check") }} Save <kbd class="mono" aria-hidden="true">⌘↵</kbd>
+        </button>
+      </footer>
+    </form>
+  {% endif %}
+</div>

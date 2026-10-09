@@ -39,7 +39,8 @@ document.addEventListener("keydown", (event) => {
   if (!form) return;
   event.preventDefault();
 
-  const buttons = form.querySelectorAll('button[type="submit"]');
+  // NB: a button that submits another form (`form=`) is not a shortcut target.
+  const buttons = form.querySelectorAll('button[type="submit"]:not([form])');
   (event.shiftKey ? buttons[0] : buttons[buttons.length - 1]).click();
 });
 

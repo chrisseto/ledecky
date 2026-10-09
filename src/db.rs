@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/006_awaiting_user.sql"),
     include_str!("../migrations/007_turn_base.sql"),
     include_str!("../migrations/008_card_vcs.sql"),
+    include_str!("../migrations/009_prompts.sql"),
 ];
 
 /// One connection, behind a pool.
@@ -153,6 +154,7 @@ pub mod tests {
             "comments",
             "events",
             "review_viewed",
+            "prompts",
         ] {
             let count: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
