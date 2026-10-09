@@ -253,29 +253,26 @@ header.top {
   align-items: center;
   gap: 16px;
   height: 56px;
-  padding: 0 20px;
+  padding: 0 20px 0 12px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-raised);
 }
-
-header.top .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; color: var(--fg-strong); }
 
 .switcher {
   display: flex;
   align-items: center;
   gap: 8px;
   height: 34px;
-  padding: 0 12px 0 10px;
-  border: 1px solid var(--border-control);
+  padding: 0 12px 0 8px;
   border-radius: var(--radius);
-  background: var(--bg-card);
   color: var(--fg);
   font-size: 13.5px;
   font-weight: 600;
 }
 .switcher:hover { background: var(--bg-card-hover); }
 .switcher .dot { width: 8px; height: 8px; border-radius: 2px; }
-.switcher .icon { color: var(--fg-dim); width: 12px; height: 12px; }
+.switcher .icon { color: var(--fg-dim); width: 16px; height: 16px; }
+.switcher:hover .icon { color: var(--fg); }
 
 /* ---- board ---- */
 

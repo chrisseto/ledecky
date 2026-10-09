@@ -30,16 +30,14 @@
   <body {% if project %}hx-sse:connect="/events?project={{ project.id }}"{% endif %}
         hx-on::after:process="for (const h of event.target.querySelectorAll?.('.hunks') ?? []) h.style.setProperty('--rows', h.querySelectorAll('.line').length)">
     <header class="top">
-      <span class="brand">ledecky</span>
-
       {% if project %}
         <a class="switcher" href="/projects?board={{ project.id }}"
            hx-get="/projects?board={{ project.id }}" hx-target="#overlay"
            hx-select="#overlay" hx-swap="outerMorph" hx-push-url="true"
            title="Switch project">
+          {{ icon("panel-left-open") }}
           <span class="dot hue-{{ project.id % 4 }}"></span>
           {{ project.name }}
-          {{ icon("chevron-down") }}
         </a>
       {% endif %}
     </header>
