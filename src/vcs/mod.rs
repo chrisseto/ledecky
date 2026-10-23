@@ -15,7 +15,7 @@ mod jj;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use rocket::serde::Serialize;
 
 use crate::config::Settings;
@@ -196,6 +196,24 @@ pub async fn head(vcs: VCS, path: &Path) -> Option<String> {
     }
 }
 
+/// Writes the workspace's current state to a tree object in the repository.
+///
+/// `index` is scratch space for a git worktree. A jj workspace does not use it.
+async fn stage(work: &Worktree, index: &Path) -> Result<String> {
+    match work {
+        Worktree::Git(_) => git::stage_tree(work, index).await,
+        // NB: not `add -A`. A scratch index starts empty, so git sees no file
+        // as tracked and drops each one that the ignore rules match. jj knows
+        // what it tracks.
+        Worktree::JJ { path, repo } => {
+            let sha = jj::snapshot(path).await?;
+            git::tree_of(repo, &sha)
+                .await
+                .with_context(|| format!("{sha} has no tree in {}", repo.display()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,8 +389,7 @@ mod tests {
         let work = Worktree::new(VCS::JJ, &repo, &path);
         std::fs::write(path.join("a.txt"), "two\n").unwrap();
         std::fs::write(path.join("b.txt"), "new\n").unwrap();
-        // Build output, to prove the repo's own rules still apply through the
-        // project's gitdir.
+        // Build output, to prove the repo's own rules still apply.
         std::fs::create_dir_all(path.join("target")).unwrap();
         std::fs::write(path.join("target/out.o"), "junk").unwrap();
 
@@ -386,14 +403,51 @@ mod tests {
             .unwrap();
         let paths: Vec<&str> = listed.lines().collect();
         assert_eq!(paths, [".gitignore", "a.txt", "b.txt"]);
-        // jj's own bookkeeping is not work to review, and `add -A` has no
-        // instinct for `.jj` the way it has for `.git`.
+        // jj's own bookkeeping is not work to review.
         assert!(!listed.contains(".jj"));
-        // And the repo's rules reach the workspace through the shared gitdir.
+        // And the repo's rules reach the workspace.
         assert!(!listed.contains("target/"));
 
         // Uncommitted work is visible, which is the point of staging at all.
         assert_eq!(git::diff_stat(&repo, &base, &once).await, Some((2, 1)));
+    }
+
+    /// A file that the repo tracks is work, even when its rules ignore it. A
+    /// staged tree without it reads as a deletion.
+    #[tokio::test]
+    async fn a_tracked_file_under_an_ignored_path_stays_in_a_jj_workspace() {
+        let (settings, repo) = jj_scratch("tracked-ignored").await;
+        std::fs::create_dir_all(repo.join("target")).unwrap();
+        std::fs::write(repo.join("target/kept.txt"), "tracked anyway\n").unwrap();
+        git::run(&repo, &["add", "-f", "target/kept.txt"])
+            .await
+            .unwrap();
+        git::run(&repo, &["commit", "-qm", "a tracked file under an ignored path"])
+            .await
+            .unwrap();
+
+        let path = settings.worktree_path(1);
+        let base = create(&settings, VCS::JJ, &repo, &path, "main", 1)
+            .await
+            .unwrap();
+        let work = Worktree::new(VCS::JJ, &repo, &path);
+
+        let clean = git::working_tree(&settings, &repo, &work, 1).await.unwrap();
+        assert_eq!(git::diff_stat(&repo, &base, &clean).await, Some((0, 0)));
+
+        std::fs::write(path.join("target/kept.txt"), "edited\n").unwrap();
+        let edited = git::working_tree(&settings, &repo, &work, 1).await.unwrap();
+        assert_eq!(git::diff_stat(&repo, &base, &edited).await, Some((1, 1)));
+
+        // A turn snapshot stages the same way: the file is there when the
+        // workspace matches the base, so there is nothing to record.
+        std::fs::write(path.join("target/kept.txt"), "tracked anyway\n").unwrap();
+        assert_eq!(
+            git::snapshot_turn(&settings, &repo, &work, 1, 2, &base)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// `@-` rather than `@`: an untouched workspace reports the base, so

@@ -3,8 +3,9 @@
 //! Only reached for a card whose project is a *colocated* jj repo, which is
 //! what keeps this small: the objects, `refs/heads` and the base ref are all
 //! git's and are handled by [`super::git`]. What is here is making a workspace,
-//! taking it away, and the one read git cannot answer for a checkout that has
-//! no `.git` — where the agent's commits have got to.
+//! taking it away, and the two reads git cannot answer for a checkout that has
+//! no `.git`: where the agent's commits have got to, and which files the
+//! workspace holds.
 
 use std::path::Path;
 
@@ -74,28 +75,24 @@ pub async fn create(
     )
     .await?;
 
-    // NB: both steps below can leave a workspace on disk, so they share one
-    // cleanup. A half-made one is not inert: `super::exists` would read it as
-    // live and the next start would skip creating it, and one whose `.jj` is not
-    // excluded puts jj's own state in every diff the card ever shows.
-    let made = async {
-        // NB: no `--ignore-working-copy`. `workspace add` refuses it outright —
-        // it has to check the files out.
-        run(
-            repo,
-            &[
-                "workspace",
-                "add",
-                "--name",
-                &settings.workspace_name(card_id),
-                "-r",
-                &base_sha,
-                &path.to_string_lossy(),
-            ],
-        )
-        .await?;
-        exclude_own_state(path)
-    }
+    // NB: a failed add can leave a workspace on disk. A half-made one is not
+    // inert: `super::exists` would read it as live and the next start would
+    // skip creating it.
+    //
+    // NB: no `--ignore-working-copy`. `workspace add` refuses it outright — it
+    // has to check the files out.
+    let made = run(
+        repo,
+        &[
+            "workspace",
+            "add",
+            "--name",
+            &settings.workspace_name(card_id),
+            "-r",
+            &base_sha,
+            &path.to_string_lossy(),
+        ],
+    )
     .await;
 
     if let Err(err) = made {
@@ -106,19 +103,13 @@ pub async fn create(
     Ok(base_sha)
 }
 
-/// Keeps jj's own state out of every diff.
+/// Snapshots the workspace and returns `@`, the commit that holds its files.
 ///
-/// Staging a workspace runs `git add -A`, which has no instinct for `.jj` the
-/// way it has for `.git` — so without this each turn snapshot and working tree
-/// would carry `.jj/working_copy` and the review pane would show it.
-///
-/// A `.gitignore` *inside* `.jj` rather than `info/exclude`: that file is the
-/// user's own and shared by every worktree of the repo. This one is jj's own
-/// move — it writes the same thing when it colocates — and goes away with the
-/// workspace it belongs to.
-fn exclude_own_state(path: &Path) -> Result<()> {
-    std::fs::write(path.join(".jj/.gitignore"), "/*\n")
-        .context("excluding .jj from the staged tree")
+/// jj decides what the snapshot holds, so the files jj tracks are exactly the
+/// files a review shows. This includes a file that the ignore rules match but
+/// that is tracked, and excludes `.jj`.
+pub async fn snapshot(path: &Path) -> Result<String> {
+    run(path, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]).await
 }
 
 /// Forgets the workspace and reclaims its directory. Best-effort.
@@ -157,8 +148,8 @@ pub async fn head(path: &Path) -> Option<String> {
     // malformed one.
     //
     // NB: `--ignore-working-copy` is not a speedup either. Without it every read
-    // snapshots the working copy, which rewrites `.jj` — waking the worktree
-    // watcher — and races the agent's own jj commands.
+    // snapshots the working copy and records a new operation beside the
+    // agent's own. Only [`snapshot`] needs one.
     run(
         path,
         &[

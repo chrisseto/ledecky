@@ -500,7 +500,7 @@ pub async fn reconcile_base(
 /// `index.lock`, and leave our staging behind for its next `git status` to
 /// report. An index kept *inside* the tree would additionally be swept up by
 /// its own `add -A`.
-async fn stage_tree(work: &Worktree, index: &Path) -> Result<String> {
+pub(super) async fn stage_tree(work: &Worktree, index: &Path) -> Result<String> {
     std::fs::create_dir_all(index.parent().unwrap())?;
 
     let index_env: &[(&str, &str)] = &[("GIT_INDEX_FILE", &index.to_string_lossy())];
@@ -528,7 +528,7 @@ pub async fn working_tree(
     // snapshot's. It is rewritten on every poll, and git's stat cache is the
     // only thing keeping `add -A` off a full re-hash of the tree each time.
     let index = settings.card_dir(card_id).join("working.index");
-    let tree = stage_tree(work, &index).await?;
+    let tree = super::stage(work, &index).await?;
 
     run(repo, &["update-ref", &settings.working_ref(card_id), &tree]).await?;
     Ok(tree)
@@ -622,7 +622,7 @@ pub async fn snapshot_turn(
 ) -> Result<Option<String>> {
     let index = settings.card_dir(card_id).join("snapshot.index");
     let _ = std::fs::remove_file(&index);
-    let tree = stage_tree(work, &index).await?;
+    let tree = super::stage(work, &index).await?;
     let _ = std::fs::remove_file(&index);
 
     // NB: in the repository, not the work tree. Both of these are pure object

@@ -469,9 +469,7 @@ async fn walk(work: &Worktree, roots: &[&Path], keep: &mut impl FnMut(&[PathBuf]
                 // always worth skipping: jj rewrites its working copy on every
                 // command.
                 //
-                // NB: not left to `check-ignore`. The `.jj/.gitignore` written
-                // at creation hides what is *inside* `.jj`, but not `.jj`
-                // itself, so the walk would still descend into it.
+                // NB: not left to `check-ignore`. No ignore rule matches `.jj`.
                 if !matches!(
                     path.file_name().and_then(OsStr::to_str),
                     Some(".git" | ".jj")
