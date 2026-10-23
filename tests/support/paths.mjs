@@ -42,3 +42,6 @@ export const JJ_REPO = join(ROOT, "jj-repo");
 
 /** Where jj reads its configuration, so a run never reads the developer's. */
 export const JJ_CONFIG = join(ROOT, "jj.toml");
+
+/** Claude Code's config file, where the server writes workspace trust. */
+export const CLAUDE_CONFIG = join(ROOT, "claude", ".claude.json");

@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,6 +14,9 @@ export const PROJECT = join(dirname(fileURLToPath(import.meta.url)), "..", "..")
 /// to set it. `paths.mjs` exports the same path for the workers, which load
 /// after it exists.
 const jjConfig = (root) => join(root, "jj.toml");
+
+/// Where a run's Claude Code configuration lives, for the same reason.
+const claudeConfigDir = (root) => join(root, "claude");
 
 const git = (cwd, ...args) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
@@ -99,6 +102,14 @@ export function provision(root) {
   git(jjRepo, "add", "-A");
   git(jjRepo, "commit", "-qm", "init");
   jj(jjRepo, "git", "init", "--colocate");
+
+  // The jj project is trusted, so its cards have trust to inherit. Keyed by the
+  // real path, as Claude Code keys it.
+  mkdirSync(claudeConfigDir(root), { recursive: true });
+  writeFileSync(
+    join(claudeConfigDir(root), ".claude.json"),
+    JSON.stringify({ projects: { [realpathSync(jjRepo)]: { hasTrustDialogAccepted: true } } }),
+  );
 }
 
 /** Starts a server on a port of its own choosing and reports where it landed. */
@@ -124,6 +135,8 @@ export async function boot({ root, agentBin } = {}) {
       // The server is what spawns `jj`, so this is where that isolation has to
       // land. `provision` writes the file.
       JJ_CONFIG: jjConfig(root),
+      // The server writes workspace trust here, so never the developer's own.
+      CLAUDE_CONFIG_DIR: claudeConfigDir(root),
       LEDECKY_AGENT_BIN:
         agentBin ?? process.env.LEDECKY_AGENT_BIN ?? join(PROJECT, "tests/fake-agent.mjs"),
       ...AGENT_TIMINGS,

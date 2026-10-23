@@ -19,6 +19,7 @@ use rocket::tokio::sync::mpsc;
 use rocket::{Orbit, Rocket};
 
 use crate::agent::agent::{self, Watcher};
+use crate::agent::trust;
 use crate::agent::Agent;
 use crate::config::{Settings, Timings};
 use crate::db::DB;
@@ -26,7 +27,7 @@ use crate::events::{Changes, Kind};
 use crate::hooks::HookAuth;
 use crate::project::{lifecycle, AgentState, Card, Lane, Project};
 use crate::prompt::{self, Prompt};
-use crate::vcs::git;
+use crate::vcs::{git, VCS};
 use crate::watch::Worktrees;
 
 /// How often a starting session is re-checked while it proves itself.
@@ -134,6 +135,9 @@ impl AgentManager {
             self.evict(card.id);
         }
 
+        if card.vcs == VCS::JJ {
+            self.inherit_trust(card.id, worktree, repo);
+        }
         let cmd = self.command(card, worktree, repo, prompt);
         let (agent, reader) = Agent::attach(cmd, self.settings.timings())?;
 
@@ -145,6 +149,19 @@ impl AgentManager {
         rocket::tokio::spawn(agent::pump(reader, agent.clone(), watcher, card.id));
 
         Ok(agent)
+    }
+
+    /// Gives a jj workspace the Claude Code trust that its project has.
+    ///
+    /// A failure is not fatal: the agent shows the trust dialog and
+    /// `watch_startup` tells the user.
+    fn inherit_trust(&self, card_id: i64, worktree: &Path, repo: &Path) {
+        let Some(config) = trust::config_path(&self.settings.agent_env) else {
+            return;
+        };
+        if let Err(err) = trust::inherit(&config, repo, worktree) {
+            warn!("card {card_id}: could not trust its workspace: {err:#}");
+        }
     }
 
     /// The command line for a card's agent.

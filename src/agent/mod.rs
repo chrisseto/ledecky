@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod manager;
 pub mod terminal;
+mod trust;
 pub mod webhooks;
 
 pub use agent::Agent;

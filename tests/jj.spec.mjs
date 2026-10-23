@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
 import { expect, test } from "./support/fixtures.mjs";
@@ -17,7 +17,7 @@ import {
   moveCard,
   worktreeOf,
 } from "./support/board.mjs";
-import { JJ_REPO } from "./support/paths.mjs";
+import { CLAUDE_CONFIG, JJ_REPO } from "./support/paths.mjs";
 
 test.describe.configure({ mode: "serial" });
 
@@ -87,6 +87,11 @@ test("a jj card gets a jj workspace, and git is never asked for one", async ({ p
   expect(jj(JJ_REPO, "--ignore-working-copy", "workspace", "list")).toContain(
     `ledecky-${cardId}`,
   );
+
+  // Claude Code cannot trace a jj workspace back to its project, so the server
+  // gives the workspace the trust that the project has.
+  const projects = JSON.parse(readFileSync(CLAUDE_CONFIG, "utf8")).projects;
+  expect(projects[realpathSync(workspace)]?.hasTrustDialogAccepted).toBe(true);
 
   // And the card's diffs have somewhere to be measured from.
   expect(
